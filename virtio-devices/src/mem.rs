@@ -524,7 +524,11 @@ impl MemEpollHandler {
         let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
         let mut used_count = 0;
         let mem = self.mem.memory();
-        for avail_desc in self.queue.iter(&mem) {
+
+        let queue = &mut self.queue;
+        let mut queue = std::mem::replace(queue, Queue::new(0));
+
+        for avail_desc in queue.iter(&mem) {
             let len = match Request::parse(&avail_desc, &mem) {
                 Err(e) => {
                     error!("failed parse VirtioMemReq: {:?}", e);
@@ -614,6 +618,8 @@ impl MemEpollHandler {
             used_desc_heads[used_count] = (avail_desc.index, len);
             used_count += 1;
         }
+
+        let _ = std::mem::replace(&mut self.queue, queue);
 
         for &(desc_index, len) in &used_desc_heads[..used_count] {
             self.queue.add_used(&mem, desc_index, len);
