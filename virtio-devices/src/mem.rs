@@ -316,16 +316,14 @@ struct MemEpollHandler {
     hugepages: bool,
 }
 
-struct StateChangeRequest<'a> {
+struct StateChangeRequest {
     config: VirtioMemConfig,
     addr: u64,
     size: u64,
     nb_blocks: u16,
-    mem_state: &'a mut Vec<bool>,
     host_addr: u64,
     host_fd: Option<RawFd>,
     plug: bool,
-    hugepages: &'a mut bool,
 }
 
 impl MemEpollHandler {
@@ -353,13 +351,13 @@ impl MemEpollHandler {
         true
     }
 
-    fn virtio_mem_check_bitmap(
-        bit_index: usize,
-        nb_blocks: u16,
-        mem_state: &[bool],
-        plug: bool,
-    ) -> bool {
-        for state in mem_state.iter().skip(bit_index).take(nb_blocks as usize) {
+    fn virtio_mem_check_bitmap(&mut self, bit_index: usize, nb_blocks: u16, plug: bool) -> bool {
+        for state in self
+            .mem_state
+            .iter()
+            .skip(bit_index)
+            .take(nb_blocks as usize)
+        {
             if *state != plug {
                 return false;
             }
@@ -367,13 +365,9 @@ impl MemEpollHandler {
         true
     }
 
-    fn virtio_mem_set_bitmap(
-        bit_index: usize,
-        nb_blocks: u16,
-        mem_state: &mut Vec<bool>,
-        plug: bool,
-    ) {
-        for state in mem_state
+    fn virtio_mem_set_bitmap(&mut self, bit_index: usize, nb_blocks: u16, plug: bool) {
+        for state in self
+            .mem_state
             .iter_mut()
             .skip(bit_index)
             .take(nb_blocks as usize)
@@ -382,7 +376,7 @@ impl MemEpollHandler {
         }
     }
 
-    fn virtio_mem_state_change_request(r: StateChangeRequest) -> u16 {
+    fn virtio_mem_state_change_request(&mut self, r: StateChangeRequest) -> u16 {
         if r.plug && (r.config.plugged_size + r.size > r.config.requested_size) {
             return VIRTIO_MEM_RESP_NACK;
         }
@@ -393,12 +387,12 @@ impl MemEpollHandler {
         let offset = r.addr - r.config.addr;
 
         let bit_index = (offset / r.config.block_size as u64) as usize;
-        if !MemEpollHandler::virtio_mem_check_bitmap(bit_index, r.nb_blocks, r.mem_state, !r.plug) {
+        if !self.virtio_mem_check_bitmap(bit_index, r.nb_blocks, !r.plug) {
             return VIRTIO_MEM_RESP_ERROR;
         }
 
         if !r.plug {
-            if !*r.hugepages {
+            if !self.hugepages {
                 let res = unsafe {
                     libc::madvise(
                         (r.host_addr + offset) as *mut libc::c_void,
@@ -413,14 +407,14 @@ impl MemEpollHandler {
                         errno = raw_os_err;
                     }
                     if errno == EINVAL {
-                        *r.hugepages = true;
+                        self.hugepages = true;
                     } else {
                         error!("madvise get error {}", e);
                         return VIRTIO_MEM_RESP_ERROR;
                     }
                 }
             }
-            if *r.hugepages {
+            if self.hugepages {
                 if let Some(fd) = r.host_fd {
                     let res = unsafe {
                         libc::fallocate64(
@@ -441,36 +435,32 @@ impl MemEpollHandler {
             }
         }
 
-        MemEpollHandler::virtio_mem_set_bitmap(bit_index, r.nb_blocks, r.mem_state, r.plug);
+        self.virtio_mem_set_bitmap(bit_index, r.nb_blocks, r.plug);
 
         VIRTIO_MEM_RESP_ACK
     }
 
     fn virtio_mem_unplug_all(
+        &mut self,
         config: VirtioMemConfig,
-        mem_state: &mut Vec<bool>,
         host_addr: u64,
         host_fd: Option<RawFd>,
-        hugepages: &mut bool,
     ) -> u16 {
         for x in 0..(config.region_size / config.block_size as u64) as usize {
-            if mem_state[x] {
-                let resp_type =
-                    MemEpollHandler::virtio_mem_state_change_request(StateChangeRequest {
-                        config,
-                        addr: config.addr + x as u64 * config.block_size as u64,
-                        size: config.block_size as u64,
-                        nb_blocks: 1,
-                        mem_state,
-                        host_addr,
-                        host_fd,
-                        plug: false,
-                        hugepages,
-                    });
+            if self.mem_state[x] {
+                let resp_type = self.virtio_mem_state_change_request(StateChangeRequest {
+                    config,
+                    addr: config.addr + x as u64 * config.block_size as u64,
+                    size: config.block_size as u64,
+                    nb_blocks: 1,
+                    host_addr,
+                    host_fd,
+                    plug: false,
+                });
                 if resp_type != VIRTIO_MEM_RESP_ACK {
                     return resp_type;
                 }
-                mem_state[x] = false;
+                self.mem_state[x] = false;
             }
         }
 
@@ -478,10 +468,10 @@ impl MemEpollHandler {
     }
 
     fn virtio_mem_state_request(
+        &mut self,
         config: VirtioMemConfig,
         addr: u64,
         nb_blocks: u16,
-        mem_state: &mut Vec<bool>,
     ) -> (u16, u16) {
         let size: u64 = nb_blocks as u64 * config.block_size as u64;
         let resp_type = if MemEpollHandler::virtio_mem_valid_range(&config, addr, size) {
@@ -492,16 +482,13 @@ impl MemEpollHandler {
 
         let offset = addr - config.addr;
         let bit_index = (offset / config.block_size as u64) as usize;
-        let resp_state =
-            if MemEpollHandler::virtio_mem_check_bitmap(bit_index, nb_blocks, mem_state, true) {
-                VIRTIO_MEM_STATE_PLUGGED
-            } else if MemEpollHandler::virtio_mem_check_bitmap(
-                bit_index, nb_blocks, mem_state, false,
-            ) {
-                VIRTIO_MEM_STATE_UNPLUGGED
-            } else {
-                VIRTIO_MEM_STATE_MIXED
-            };
+        let resp_state = if self.virtio_mem_check_bitmap(bit_index, nb_blocks, true) {
+            VIRTIO_MEM_STATE_PLUGGED
+        } else if self.virtio_mem_check_bitmap(bit_index, nb_blocks, false) {
+            VIRTIO_MEM_STATE_UNPLUGGED
+        } else {
+            VIRTIO_MEM_STATE_MIXED
+        };
 
         (resp_type, resp_state)
     }
@@ -548,19 +535,16 @@ impl MemEpollHandler {
                     match r.req.req_type {
                         VIRTIO_MEM_REQ_PLUG => {
                             let size: u64 = r.req.nb_blocks as u64 * config.block_size as u64;
-                            let resp_type = MemEpollHandler::virtio_mem_state_change_request(
-                                StateChangeRequest {
+                            let resp_type =
+                                self.virtio_mem_state_change_request(StateChangeRequest {
                                     config: *config,
                                     addr: r.req.addr,
                                     size,
                                     nb_blocks: r.req.nb_blocks,
-                                    mem_state: &mut self.mem_state,
                                     host_addr: self.host_addr,
                                     host_fd: self.host_fd,
                                     plug: true,
-                                    hugepages: &mut self.hugepages,
-                                },
-                            );
+                                });
                             if resp_type == VIRTIO_MEM_RESP_ACK {
                                 config.plugged_size += size;
                             }
@@ -573,19 +557,16 @@ impl MemEpollHandler {
                         }
                         VIRTIO_MEM_REQ_UNPLUG => {
                             let size: u64 = r.req.nb_blocks as u64 * config.block_size as u64;
-                            let resp_type = MemEpollHandler::virtio_mem_state_change_request(
-                                StateChangeRequest {
+                            let resp_type =
+                                self.virtio_mem_state_change_request(StateChangeRequest {
                                     config: *config,
                                     addr: r.req.addr,
                                     size,
                                     nb_blocks: r.req.nb_blocks,
-                                    mem_state: &mut self.mem_state,
                                     host_addr: self.host_addr,
                                     host_fd: self.host_fd,
                                     plug: false,
-                                    hugepages: &mut self.hugepages,
-                                },
-                            );
+                                });
                             if resp_type == VIRTIO_MEM_RESP_ACK {
                                 config.plugged_size -= size;
                             }
@@ -597,13 +578,8 @@ impl MemEpollHandler {
                             )
                         }
                         VIRTIO_MEM_REQ_UNPLUG_ALL => {
-                            let resp_type = MemEpollHandler::virtio_mem_unplug_all(
-                                *config,
-                                &mut self.mem_state,
-                                self.host_addr,
-                                self.host_fd,
-                                &mut self.hugepages,
-                            );
+                            let resp_type =
+                                self.virtio_mem_unplug_all(*config, self.host_addr, self.host_fd);
                             if resp_type == VIRTIO_MEM_RESP_ACK {
                                 config.plugged_size = 0;
                                 config.usable_region_size = cmp::min(
@@ -619,12 +595,8 @@ impl MemEpollHandler {
                             )
                         }
                         VIRTIO_MEM_REQ_STATE => {
-                            let (resp_type, resp_state) = MemEpollHandler::virtio_mem_state_request(
-                                *config,
-                                r.req.addr,
-                                r.req.nb_blocks,
-                                &mut self.mem_state,
-                            );
+                            let (resp_type, resp_state) =
+                                self.virtio_mem_state_request(*config, r.req.addr, r.req.nb_blocks);
                             MemEpollHandler::virtio_mem_send_response(
                                 &mem,
                                 resp_type,
