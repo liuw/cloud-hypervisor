@@ -10,11 +10,10 @@ kvm = ["vfio-ioctls/kvm"]
 mshv = ["vfio-ioctls/mshv"]
 
 [dependencies]
-anyhow = "1.0.58"
+anyhow = "1.0.60"
 hypervisor = { path = "../hypervisor" }
-thiserror = "1.0.31"
-serde = { version = "1.0.140", features = ["rc", "derive"] }
-serde_json = "1.0.82"
+thiserror = "1.0.32"
+serde = { version = "1.0.142", features = ["rc", "derive"] }
 vfio-ioctls = { git = "https://github.com/rust-vmm/vfio", branch = "main", default-features = false }
 vm-memory = { version = "0.8.0", features = ["backend-mmap"] }
 vmm-sys-util = "0.10.0"
