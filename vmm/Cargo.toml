@@ -17,32 +17,33 @@ tdx = ["arch/tdx", "hypervisor/tdx"]
 
 [dependencies]
 acpi_tables = { path = "../acpi_tables" }
-anyhow = "1.0.59"
+anyhow = "1.0.64"
 arc-swap = "1.5.1"
 arch = { path = "../arch" }
 bitflags = "1.3.2"
 block_util = { path = "../block_util" }
-clap = "3.2.16"
+clap = "3.2.20"
 devices = { path = "../devices" }
 epoll = "4.3.1"
 event_monitor = { path = "../event_monitor" }
-gdbstub = { version = "0.6.2", optional = true }
-gdbstub_arch = { version = "0.2.3", optional = true }
+gdbstub = { version = "0.6.3", optional = true }
+gdbstub_arch = { version = "0.2.4", optional = true }
 hypervisor = { path = "../hypervisor" }
-libc = "0.2.127"
+libc = "0.2.132"
 linux-loader = { version = "0.4.0", features = ["elf", "bzimage", "pe"] }
 log = "0.4.17"
 micro_http = { git = "https://github.com/firecracker-microvm/micro-http", branch = "main" }
 net_util = { path = "../net_util" }
-once_cell = "1.13.0"
+once_cell = "1.14.0"
 option_parser = { path = "../option_parser" }
 pci = { path = "../pci" }
 qcow = { path = "../qcow" }
 seccompiler = "0.2.0"
-serde = { version = "1.0.142", features = ["rc", "derive"] }
-serde_json = "1.0.83"
+serde = { version = "1.0.144", features = ["rc", "derive"] }
+serde_json = "1.0.85"
+serial_buffer = { path = "../serial_buffer" }
 signal-hook = "0.3.14"
-thiserror = "1.0.32"
+thiserror = "1.0.33"
 uuid = "1.1.2"
 versionize = "0.1.6"
 versionize_derive = "0.1.4"
