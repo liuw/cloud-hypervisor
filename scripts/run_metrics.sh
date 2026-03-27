@@ -96,7 +96,6 @@ if [[ "${BUILD_TARGET}" == "${TEST_ARCH}-unknown-linux-musl" ]]; then
     CFLAGS="-I /usr/include/${TEST_ARCH}-linux-musl/ -idirafter /usr/include/"
 fi
 
-cargo build --features mshv --all --release --target "$BUILD_TARGET"
 
 # setup hugepages
 HUGEPAGESIZE=$(grep Hugepagesize /proc/meminfo | awk '{print $2}')
@@ -104,13 +103,34 @@ PAGE_NUM=$((12288 * 1024 / HUGEPAGESIZE))
 echo "$PAGE_NUM" | sudo tee /proc/sys/vm/nr_hugepages
 sudo chmod a+rwX /dev/hugepages
 
+# Build nextest filter expression from test_filter and test_exclude
+nextest_filter=""
 if [ -n "$test_filter" ]; then
-    test_binary_args+=("--test-filter $test_filter")
+    nextest_filter="test(~$test_filter)"
+fi
+if [ -n "$test_exclude" ]; then
+    exclude_expr="not test(~$test_exclude)"
+    if [ -n "$nextest_filter" ]; then
+        nextest_filter="$nextest_filter and $exclude_expr"
+    else
+        nextest_filter="$exclude_expr"
+    fi
 fi
 
-if [ -n "$test_exclude" ]; then
-    test_binary_args+=("--test-exclude $test_exclude")
+nextest_args=()
+if [ -n "$nextest_filter" ]; then
+    nextest_args+=(-E "$nextest_filter")
 fi
+
+# Extract --report-file from positional args (after the -- separator)
+report_file=""
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+    if [[ "${args[i]}" == "--report-file" ]]; then
+        report_file="${args[$((i+1))]}"
+        break
+    fi
+done
 
 # Ensure that git commands can be run in this directory (for metrics report)
 git config --global --add safe.directory "$PWD"
@@ -121,8 +141,34 @@ if [ -z "$RUST_BACKTRACE_VALUE" ]; then
 else
     echo "RUST_BACKTRACE is set to: $RUST_BACKTRACE_VALUE"
 fi
-# shellcheck disable=SC2048,SC2086
-time target/"$BUILD_TARGET"/release/performance-metrics ${test_binary_args[*]}
+
+# Per-test results directory for the nextest workflow
+METRICS_RESULTS_DIR=$(mktemp -d)
+export METRICS_RESULTS_DIR
+
+time cargo nextest run \
+    --release \
+    --target "$BUILD_TARGET" \
+    -p performance-metrics \
+    --test metrics \
+    --no-fail-fast \
+    --test-threads 1 \
+    "${nextest_args[@]}"
 RES=$?
 
+if [ $RES -ne 0 ]; then
+    rm -rf "$METRICS_RESULTS_DIR"
+    exit $RES
+fi
+
+# Aggregate per-test results into the final report
+aggregate_args=(--aggregate-dir "$METRICS_RESULTS_DIR")
+if [ -n "$report_file" ]; then
+    aggregate_args+=(--report-file "$report_file")
+fi
+
+target/"$BUILD_TARGET"/release/performance-metrics "${aggregate_args[@]}"
+RES=$?
+
+rm -rf "$METRICS_RESULTS_DIR"
 exit $RES
