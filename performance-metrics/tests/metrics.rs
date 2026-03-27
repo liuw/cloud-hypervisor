@@ -15,15 +15,16 @@
 #![cfg(any(devcli_testenv, clippy))]
 #![allow(non_snake_case)]
 
-use performance_metrics::{PerformanceTestOverrides, run_test_by_name};
+use performance_metrics::{overrides_from_env, run_test_by_name, save_test_result};
 
 macro_rules! perf_tests {
     ($($name:ident),* $(,)?) => {
         $(
             #[test]
             fn $name() {
-                let overrides = PerformanceTestOverrides::default();
-                run_test_by_name(stringify!($name), &overrides).unwrap();
+                let overrides = overrides_from_env();
+                let result = run_test_by_name(stringify!($name), &overrides).unwrap();
+                save_test_result(&result).expect("failed to save test result");
             }
         )*
     };
@@ -116,6 +117,7 @@ perf_tests! {
 #[cfg(not(target_arch = "aarch64"))]
 #[test]
 fn virtio_net_latency_us() {
-    let overrides = PerformanceTestOverrides::default();
-    run_test_by_name("virtio_net_latency_us", &overrides).unwrap();
+    let overrides = overrides_from_env();
+    let result = run_test_by_name("virtio_net_latency_us", &overrides).unwrap();
+    save_test_result(&result).expect("failed to save test result");
 }

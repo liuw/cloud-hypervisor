@@ -9,11 +9,12 @@ mod performance_tests;
 mod util;
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::channel;
 use std::time::Duration;
-use std::{env, fmt, thread};
+use std::{env, fmt, fs, thread};
 
 use clap::{Arg, ArgAction, Command as ClapCommand};
 use performance_tests::*;
@@ -1385,6 +1386,64 @@ pub fn write_report<W: Write>(writer: &mut W, metrics_report: &MetricsReport) ->
     )
 }
 
+/// Build `PerformanceTestOverrides` from environment variables.
+///
+/// Recognised variables:
+/// - `PERF_METRICS_ITERATIONS` – override test iterations
+/// - `PERF_METRICS_TIMEOUT`    – override test timeout (seconds)
+/// - `PERF_METRICS_IMAGE_FORMAT` – override block image format
+pub fn overrides_from_env() -> PerformanceTestOverrides {
+    PerformanceTestOverrides {
+        test_iterations: env::var("PERF_METRICS_ITERATIONS")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        test_timeout: env::var("PERF_METRICS_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        test_image_format: env::var("PERF_METRICS_IMAGE_FORMAT")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+    }
+}
+
+/// Write a single test result as JSON into `METRICS_RESULTS_DIR/<name>.json`.
+///
+/// Does nothing if the `METRICS_RESULTS_DIR` environment variable is unset.
+pub fn save_test_result(result: &PerformanceTestResult) -> io::Result<()> {
+    if let Ok(dir) = env::var("METRICS_RESULTS_DIR") {
+        let dir = Path::new(&dir);
+        fs::create_dir_all(dir)?;
+        let path = dir.join(format!("{}.json", result.name));
+        let json = serde_json::to_string_pretty(result).map_err(io::Error::other)?;
+        fs::write(path, json)?;
+    }
+    Ok(())
+}
+
+/// Aggregate per-test result files from a directory into a `MetricsReport`.
+///
+/// Each file in `results_dir` is expected to contain a JSON-serialised
+/// `PerformanceTestResult`.  The report's git metadata is populated from
+/// the current repository, matching the behaviour of the original runner.
+pub fn aggregate_results(results_dir: &Path) -> io::Result<MetricsReport> {
+    let mut report = MetricsReport::default();
+
+    let mut entries: Vec<_> = fs::read_dir(results_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let data = fs::read_to_string(entry.path())?;
+        let result: PerformanceTestResult = serde_json::from_str(&data)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        report.results.push(result);
+    }
+
+    Ok(report)
+}
+
 pub fn run_cli() {
     let cmd_arguments = ClapCommand::new("performance-metrics")
         .version(env!("CARGO_PKG_VERSION"))
@@ -1439,7 +1498,47 @@ pub fn run_cli() {
                 )
                 .num_args(1),
         )
+        .arg(
+            Arg::new("aggregate-dir")
+                .long("aggregate-dir")
+                .help(
+                    "Aggregate per-test result files from this directory into a single report. \
+                     Skips running any tests.",
+                )
+                .num_args(1),
+        )
         .get_matches();
+
+    // Aggregation mode: gather per-test result files into a single report.
+    if let Some(dir) = cmd_arguments.get_one::<String>("aggregate-dir") {
+        let metrics_report = aggregate_results(Path::new(dir)).unwrap_or_else(|e| {
+            eprintln!("Error aggregating results from {dir}: {e}");
+            std::process::exit(1);
+        });
+
+        let mut report_file: Box<dyn std::io::Write + Send> =
+            if let Some(file) = cmd_arguments.get_one::<String>("report-file") {
+                Box::new(
+                    fs::File::create(Path::new(file))
+                        .map_err(|e| {
+                            eprintln!("Error opening report file: {file}: {e}");
+                            std::process::exit(1);
+                        })
+                        .unwrap(),
+                )
+            } else {
+                Box::new(std::io::stdout())
+            };
+
+        write_report(&mut report_file, &metrics_report)
+            .map_err(|e| {
+                eprintln!("Error writing report file: {e}");
+                std::process::exit(1);
+            })
+            .unwrap();
+
+        return;
+    }
 
     let test_filter: Vec<&str> = cmd_arguments
         .get_many::<String>("test-filter")
