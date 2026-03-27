@@ -10,6 +10,11 @@ fairly large container image.
 
 ## Run the Performance Tests
 
+The performance tests are implemented as standard Rust integration tests
+and are executed via [cargo-nextest](https://nexte.st/).  The `dev_cli.sh`
+script handles the full workflow: building, running each test, collecting
+per-test results, and aggregating them into a single JSON report.
+
 To generate metrics data for all available performance tests (including
 boot time, block I/O throughput, and network throughput & latency) and
 output the result into a json file:
@@ -27,13 +32,21 @@ $ ./scripts/dev_cli.sh tests --metrics -- -- --list-tests
 To generate metrics data for selected performance tests, e.g. boot time only:
 
 ```
-$ ./scripts/dev_cli.sh tests --metrics -- -- --report-file /tmp/metrics.json --test-filter boot_time
+$ ./scripts/dev_cli.sh tests --metrics -- --test-filter boot_time -- --report-file /tmp/metrics.json
 ```
 
-To set custom timeout or test iterations for all performance tests:
+To exclude specific tests, e.g. micro benchmarks:
 
 ```
-$ ./scripts/dev_cli.sh tests --metrics -- -- --timeout 5 --iterations 10
+$ ./scripts/dev_cli.sh tests --metrics -- --test-exclude micro_ -- --report-file /tmp/metrics.json
+```
+
+To set custom timeout or test iterations for all performance tests, use
+the `PERF_METRICS_TIMEOUT` and `PERF_METRICS_ITERATIONS` environment
+variables:
+
+```
+$ PERF_METRICS_TIMEOUT=5 PERF_METRICS_ITERATIONS=10 ./scripts/dev_cli.sh tests --metrics -- -- --report-file /tmp/metrics.json
 ```
 
 ## Performance Tests Details
@@ -92,7 +105,7 @@ Here is an example of generating metrics data for the boot time using
 `pmem`:
 
 ```bash
-$ ./scripts/dev_cli.sh tests --metrics -- -- --test-filter boot_time_pmem_ms
+$ ./scripts/dev_cli.sh tests --metrics -- --test-filter boot_time_pmem_ms -- --report-file /tmp/metrics.json
 ```
 
 Here is a sample output:
