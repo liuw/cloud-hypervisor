@@ -34,9 +34,12 @@
 //! `&mut self`. Errors are returned as [`BlockResult`].
 
 use std::fmt::Debug;
+#[cfg(unix)]
 use std::io;
 
+#[cfg(unix)]
 use crate::async_io::{self, AsyncIo, BorrowedDiskFd};
+#[cfg(unix)]
 use crate::error::{BlockError, BlockErrorKind};
 use crate::{BlockResult, DiskTopology};
 
@@ -53,6 +56,7 @@ pub trait PhysicalSize: Send + Debug {
 }
 
 /// Backing file descriptor access for disk images backed by a file.
+#[cfg(unix)]
 pub trait DiskFd: Send + Debug {
     /// Borrows the underlying file descriptor.
     fn fd(&self) -> BorrowedDiskFd<'_>;
@@ -106,16 +110,19 @@ pub trait DiskFile: DiskSize + Geometry + Sync {}
 /// file descriptor access, physical size, sparse operations, and resize.
 /// Used by consumers that need feature negotiation without async I/O
 /// (e.g. vhost user block).
+#[cfg(unix)]
 pub trait FullDiskFile: DiskFile + PhysicalSize + DiskFd + SparseCapable + Resizable {}
 
 /// Blanket implementation: any type implementing all constituent traits
 /// automatically satisfies [`FullDiskFile`].
+#[cfg(unix)]
 impl<T: DiskFile + PhysicalSize + DiskFd + SparseCapable + Resizable> FullDiskFile for T {}
 
 /// Extended disk file trait for virtio queue workers.
 ///
 /// Adds cloning and async I/O construction on top of [`DiskFile`].
 /// `Unpin` is required so trait objects can be moved freely.
+#[cfg(unix)]
 pub trait AsyncDiskFile: DiskFile + Unpin {
     /// Creates an independent handle for a queue worker.
     ///
@@ -153,14 +160,17 @@ pub trait AsyncDiskFile: DiskFile + Unpin {
 /// clones only serve as data plane handles for queue workers, while
 /// the original `AsyncFullDiskFile` handle remains the control plane
 /// for feature negotiation and configuration.
+#[cfg(unix)]
 pub trait AsyncFullDiskFile: FullDiskFile + AsyncDiskFile {}
 
 /// Blanket implementation: any type implementing both [`FullDiskFile`]
 /// and [`AsyncDiskFile`] automatically satisfies [`AsyncFullDiskFile`].
+#[cfg(unix)]
 impl<T: FullDiskFile + AsyncDiskFile> AsyncFullDiskFile for T {}
 
 /// A disk backend that dispatches to either the existing [`async_io::DiskFile`]
 /// trait or the next-generation [`AsyncFullDiskFile`] trait.
+#[cfg(unix)]
 pub enum DiskBackend {
     /// Existing disk file backend (raw, vhd, vhdx, etc.).
     Legacy(Box<dyn async_io::DiskFile>),
@@ -168,6 +178,7 @@ pub enum DiskBackend {
     Next(Box<dyn AsyncFullDiskFile>),
 }
 
+#[cfg(unix)]
 impl DiskBackend {
     pub fn logical_size(&mut self) -> BlockResult<u64> {
         match self {

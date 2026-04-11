@@ -2,13 +2,19 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+#[cfg(unix)]
 use std::marker::PhantomData;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use thiserror::Error;
+#[cfg(unix)]
 use platform::EventFd;
 
-use crate::{BatchRequest, DiskTopology, SECTOR_SIZE};
+#[cfg(unix)]
+use crate::BatchRequest;
+#[cfg(unix)]
+use crate::{DiskTopology, SECTOR_SIZE};
 
 #[derive(Error, Debug)]
 pub enum DiskFileError {
@@ -37,12 +43,14 @@ pub type DiskFileResult<T> = std::result::Result<T, DiskFileError>;
 /// in an `Arc<Mutex<T>>`, making the use of [`BorrowedFd`] impossible.
 ///
 /// [`BorrowedFd`]: std::os::fd::BorrowedFd
+#[cfg(unix)]
 #[derive(Copy, Clone, Debug)]
 pub struct BorrowedDiskFd<'fd> {
     raw_fd: RawFd,
     _lifetime: PhantomData<&'fd OwnedFd>,
 }
 
+#[cfg(unix)]
 impl BorrowedDiskFd<'_> {
     pub(super) fn new(raw_fd: RawFd) -> Self {
         Self {
@@ -52,6 +60,7 @@ impl BorrowedDiskFd<'_> {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for BorrowedDiskFd<'_> {
     fn as_raw_fd(&self) -> RawFd {
         self.raw_fd
@@ -63,6 +72,7 @@ impl AsRawFd for BorrowedDiskFd<'_> {
 ///
 /// This allows abstracting over raw image formats as well as structured
 /// image formats.
+#[cfg(unix)]
 pub trait DiskFile: Send {
     /// Returns the logical disk size a guest will see.
     ///
@@ -123,6 +133,7 @@ pub enum AsyncIoError {
 
 pub type AsyncIoResult<T> = std::result::Result<T, AsyncIoError>;
 
+#[cfg(unix)]
 pub trait AsyncIo: Send {
     fn notifier(&self) -> &EventFd;
     fn read_vectored(

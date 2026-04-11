@@ -32,8 +32,10 @@ vm-memory = { workspace = true, features = [
 
 ] }
 vm-virtio = { path = "../vm-virtio" }
-vmm-sys-util = { workspace = true }
 zstd = "0.13"
+
+[target.'cfg(unix)'.dependencies]
+vmm-sys-util = { workspace = true }
 
 [lints]
 workspace = true

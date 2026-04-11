@@ -11,46 +11,72 @@
 pub mod async_io;
 pub mod disk_file;
 pub mod error;
+#[cfg(unix)]
 pub mod fcntl;
+#[cfg(unix)]
 pub mod fixed_vhd;
 #[cfg(feature = "io_uring")]
 /// Enabled with the `"io_uring"` feature
 pub mod fixed_vhd_async;
+#[cfg(unix)]
 pub mod fixed_vhd_sync;
+#[cfg(unix)]
 pub mod qcow;
+#[cfg(unix)]
 pub mod qcow_sync;
 #[cfg(feature = "io_uring")]
 /// Async primitives based on `io-uring`
 ///
 /// Enabled with the `"io_uring"` feature
 pub mod raw_async;
+#[cfg(unix)]
 pub mod raw_async_aio;
-#[cfg(test)]
+#[cfg(all(unix, test))]
 mod raw_async_io_tests;
+#[cfg(unix)]
 pub mod raw_sync;
+#[cfg(unix)]
 pub mod vhd;
+#[cfg(unix)]
 pub mod vhdx;
+#[cfg(unix)]
 pub mod vhdx_sync;
 
-use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::alloc::Layout;
+#[cfg(unix)]
+use std::alloc::{alloc_zeroed, dealloc};
+#[cfg(unix)]
 use std::collections::VecDeque;
 use std::fmt::{self, Debug};
 use std::fs::{File, OpenOptions};
+#[cfg(unix)]
 use std::io::{self, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
+#[cfg(not(unix))]
+use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
+#[cfg(unix)]
 use std::{cmp, mem, result};
+#[cfg(not(unix))]
+use std::{result};
 
 #[cfg(feature = "io_uring")]
 use io_uring::{IoUring, Probe, opcode};
+#[cfg(unix)]
 use libc::{
     FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, S_IFBLK, S_IFMT, ioctl,
 };
+#[cfg(unix)]
 use log::{debug, error, info, warn};
+#[cfg(not(unix))]
+use log::error;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -58,14 +84,19 @@ use virtio_bindings::virtio_blk::*;
 use virtio_queue::DescriptorChain;
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryLoadGuard,
+    ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryLoadGuard,
 };
 use vm_virtio::{AccessPlatform, Translatable};
+#[cfg(unix)]
 use platform::EventFd;
+#[cfg(unix)]
 use vmm_sys_util::{aio, ioctl_io_nr, ioctl_ior_nr};
 
-use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};
+#[cfg(unix)]
+use crate::async_io::{AsyncIo, AsyncIoResult};
+use crate::async_io::AsyncIoError;
 use crate::error::{BlockError, BlockErrorKind, BlockResult, ErrorOp};
+#[cfg(unix)]
 use crate::vhdx::VhdxError;
 
 const SECTOR_SHIFT: u8 = 9;
@@ -75,12 +106,17 @@ pub const SECTOR_SIZE: u64 = 0x01 << SECTOR_SHIFT;
 pub const MAX_DISCARD_WRITE_ZEROES_SEG: u32 = 1;
 
 /// Size and field offsets within `struct virtio_blk_discard_write_zeroes`.
+#[cfg(unix)]
 const DISCARD_WZ_SEG_SIZE: u32 = mem::size_of::<virtio_blk_discard_write_zeroes>() as u32;
+#[cfg(unix)]
 const DISCARD_WZ_MAX_PAYLOAD: u32 = DISCARD_WZ_SEG_SIZE * MAX_DISCARD_WRITE_ZEROES_SEG;
+#[cfg(unix)]
 const DISCARD_WZ_SECTOR_OFFSET: u64 =
     mem::offset_of!(virtio_blk_discard_write_zeroes, sector) as u64;
+#[cfg(unix)]
 const DISCARD_WZ_NUM_SECTORS_OFFSET: u64 =
     mem::offset_of!(virtio_blk_discard_write_zeroes, num_sectors) as u64;
+#[cfg(unix)]
 const DISCARD_WZ_FLAGS_OFFSET: u64 = mem::offset_of!(virtio_blk_discard_write_zeroes, flags) as u64;
 
 #[derive(Error, Debug)]
@@ -105,6 +141,7 @@ pub enum Error {
     GetFileMetadata(#[source] std::io::Error),
     #[error("The requested operation would cause a seek beyond disk end")]
     InvalidOffset,
+    #[cfg(unix)]
     #[error("Failure in qcow")]
     QcowError(#[source] qcow::Error),
     #[error("Failure in raw file")]
@@ -113,10 +150,12 @@ pub enum Error {
     TooManyDescriptors,
     #[error("Request contains too many segments ({0}, max {MAX_DISCARD_WRITE_ZEROES_SEG})")]
     TooManySegments(u32),
+    #[cfg(unix)]
     #[error("Failure in vhdx")]
     VhdxError(#[source] VhdxError),
 }
 
+#[cfg(target_os = "linux")]
 fn build_device_id(disk_path: &Path) -> result::Result<String, Error> {
     let blk_metadata = match disk_path.metadata() {
         Err(e) => return Err(Error::GetFileMetadata(e)),
@@ -132,6 +171,7 @@ fn build_device_id(disk_path: &Path) -> result::Result<String, Error> {
     Ok(device_id)
 }
 
+#[cfg(target_os = "linux")]
 pub fn build_serial(disk_path: &Path) -> Vec<u8> {
     let mut default_serial = vec![0; VIRTIO_BLK_ID_BYTES as usize];
     match build_device_id(disk_path) {
@@ -258,6 +298,7 @@ fn sector<B: Bitmap + 'static>(
 const DEFAULT_DESCRIPTOR_VEC_SIZE: usize = 32;
 
 #[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub struct AlignedOperation {
     origin_ptr: u64,
     aligned_ptr: u64,
@@ -265,6 +306,7 @@ pub struct AlignedOperation {
     layout: Layout,
 }
 
+#[cfg(unix)]
 pub struct BatchRequest {
     pub offset: libc::off_t,
     pub iovecs: SmallVec<[libc::iovec; DEFAULT_DESCRIPTOR_VEC_SIZE]>,
@@ -272,6 +314,7 @@ pub struct BatchRequest {
     pub request_type: RequestType,
 }
 
+#[cfg(unix)]
 pub struct ExecuteAsync {
     // `true` if the execution will complete asynchronously
     pub async_complete: bool,
@@ -449,6 +492,7 @@ impl Request {
         Ok(len)
     }
 
+    #[cfg(unix)]
     pub fn execute_async<B: Bitmap + 'static>(
         &mut self,
         mem: &vm_memory::GuestMemoryMmap<B>,
@@ -738,6 +782,7 @@ impl Request {
         Ok(ret)
     }
 
+    #[cfg(unix)]
     pub fn complete_async(&mut self) -> result::Result<(), Error> {
         for aligned_operation in self.aligned_operations.drain(..) {
             // We need to perform the copy after the data has been read inside
@@ -810,12 +855,14 @@ unsafe impl ByteValued for VirtioBlockConfig {}
 unsafe impl ByteValued for VirtioBlockGeometry {}
 
 /// Check if aio can be used on the current system.
+#[cfg(unix)]
 pub fn block_aio_is_supported() -> bool {
     aio::IoContext::new(1).is_ok()
 }
 
 /// Check if io_uring for block device can be used on the current system, as
 /// it correctly supports the expected io_uring features.
+#[cfg(unix)]
 pub fn block_io_uring_is_supported() -> bool {
     #[cfg(not(feature = "io_uring"))]
     {
@@ -873,6 +920,7 @@ pub fn block_io_uring_is_supported() -> bool {
 }
 
 /// Probe whether the file/device supports punch hole and zero range
+#[cfg(unix)]
 pub fn probe_sparse_support(file: &File) -> bool {
     let fd = file.as_raw_fd();
 
@@ -899,6 +947,7 @@ pub fn probe_sparse_support(file: &File) -> bool {
 }
 
 /// Probe sparse support for a regular file using fallocate().
+#[cfg(unix)]
 fn probe_file_sparse_support(fd: libc::c_int) -> bool {
     // SAFETY: FFI call with valid fd
     let file_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
@@ -951,6 +1000,7 @@ fn probe_file_sparse_support(fd: libc::c_int) -> bool {
 ///
 /// There is no non destructive read only ioctl to query block device discard
 /// or write zeroes capabilities.
+#[cfg(unix)]
 fn probe_block_device_sparse_support(_fd: libc::c_int) -> bool {
     info!("Block device: assuming sparse support");
     true
@@ -962,6 +1012,7 @@ fn probe_block_device_sparse_support(_fd: libc::c_int) -> bool {
 /// availability and reducing fragmentation. Allocating all blocks upfront is
 /// more likely to place them contiguously than allocating on demand during
 /// random writes.
+#[cfg(unix)]
 pub fn preallocate_disk<P: AsRef<Path>>(file: &File, path: P) {
     let size = match file.metadata() {
         Ok(m) => m.len(),
@@ -992,6 +1043,7 @@ pub fn preallocate_disk<P: AsRef<Path>>(file: &File, path: P) {
     }
 }
 
+#[cfg(unix)]
 pub trait AsyncAdaptor {
     fn read_vectored_sync(
         &mut self,
@@ -1136,10 +1188,13 @@ impl FromStr for ImageType {
     }
 }
 
+#[cfg(unix)]
 const QCOW_MAGIC: u32 = 0x5146_49fb;
+#[cfg(unix)]
 const VHDX_SIGN: u64 = 0x656C_6966_7864_6876;
 
 /// Read a block into memory aligned by the source block size (needed for O_DIRECT)
+#[cfg(unix)]
 pub fn read_aligned_block_size(f: &mut File) -> std::io::Result<Vec<u8>> {
     let blocksize = DiskTopology::probe(f)?.logical_block_size as usize;
     // SAFETY: We are allocating memory that is naturally aligned (size = alignment) and we meet
@@ -1167,6 +1222,7 @@ pub fn open_disk_image(path: &Path, options: &OpenOptions) -> BlockResult<File> 
 }
 
 /// Determine image type through file parsing.
+#[cfg(unix)]
 pub fn detect_image_type(f: &mut File) -> BlockResult<ImageType> {
     let block = read_aligned_block_size(f)
         .map_err(|e| BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::DetectImageType))?;
@@ -1217,10 +1273,15 @@ impl Default for DiskTopology {
     }
 }
 
+#[cfg(unix)]
 ioctl_io_nr!(BLKSSZGET, 0x12, 104);
+#[cfg(unix)]
 ioctl_io_nr!(BLKPBSZGET, 0x12, 123);
+#[cfg(unix)]
 ioctl_io_nr!(BLKIOMIN, 0x12, 120);
+#[cfg(unix)]
 ioctl_io_nr!(BLKIOOPT, 0x12, 121);
+#[cfg(unix)]
 ioctl_ior_nr!(BLKGETSIZE64, 0x12, 114, u64);
 
 /// Returns `(logical_size, physical_size)` in bytes for regular files and block devices.
@@ -1228,6 +1289,7 @@ ioctl_ior_nr!(BLKGETSIZE64, 0x12, 114, u64);
 /// For regular files, logical size is `st_size` and physical size is
 /// `st_blocks * 512` (actual host allocation). For block devices both
 /// values equal the `BLKGETSIZE64` result.
+#[cfg(target_os = "linux")]
 pub fn query_device_size(file: &File) -> io::Result<(u64, u64)> {
     let m = file.metadata()?;
     if m.is_file() {
@@ -1252,6 +1314,7 @@ pub fn query_device_size(file: &File) -> io::Result<(u64, u64)> {
     }
 }
 
+#[cfg(unix)]
 #[derive(Copy, Clone)]
 enum BlockSize {
     LogicalBlock,
@@ -1260,6 +1323,7 @@ enum BlockSize {
     OptimalIo,
 }
 
+#[cfg(unix)]
 impl DiskTopology {
     fn is_block_device(f: &File) -> std::io::Result<bool> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -1376,7 +1440,7 @@ impl DiskTopology {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 mod unit_tests {
     use std::alloc::{Layout, alloc_zeroed, dealloc};
     use std::fs::OpenOptions;
