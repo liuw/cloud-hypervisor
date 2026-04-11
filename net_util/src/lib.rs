@@ -5,40 +5,59 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+#[cfg(unix)]
 mod ctrl_queue;
 mod mac;
+#[cfg(unix)]
 mod open_tap;
+#[cfg(unix)]
 mod queue_pair;
+#[cfg(unix)]
 mod tap;
 
+#[cfg(unix)]
 use std::io::Error as IoError;
+#[cfg(unix)]
 use std::net::IpAddr;
+#[cfg(unix)]
 use std::os::raw::c_uint;
+#[cfg(unix)]
 use std::os::unix::io::{FromRawFd, RawFd};
+#[cfg(unix)]
 use std::{io, mem, net};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+#[cfg(unix)]
 use virtio_bindings::virtio_net::{
-    VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MAX, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN, VIRTIO_NET_F_GUEST_CSUM,
-    VIRTIO_NET_F_GUEST_ECN, VIRTIO_NET_F_GUEST_TSO4, VIRTIO_NET_F_GUEST_TSO6,
-    VIRTIO_NET_F_GUEST_UFO, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MQ, virtio_net_hdr_v1,
+    VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_GUEST_ECN, VIRTIO_NET_F_GUEST_TSO4,
+    VIRTIO_NET_F_GUEST_TSO6, VIRTIO_NET_F_GUEST_UFO,
+};
+use virtio_bindings::virtio_net::{
+    VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MAX, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN, VIRTIO_NET_F_MAC,
+    VIRTIO_NET_F_MQ, virtio_net_hdr_v1,
 };
 use vm_memory::ByteValued;
+#[cfg(unix)]
 use vm_memory::bitmap::AtomicBitmap;
 
+#[cfg(unix)]
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 
+#[cfg(unix)]
 pub use ctrl_queue::{CtrlQueue, Error as CtrlQueueError};
 pub use mac::{MAC_ADDR_LEN, MacAddr};
+#[cfg(unix)]
 pub use open_tap::{Error as OpenTapError, open_tap};
+#[cfg(unix)]
 pub use queue_pair::{NetCounters, NetQueuePair, NetQueuePairError, RxVirtio, TxVirtio};
+#[cfg(unix)]
 pub use tap::{Error as TapError, Tap};
 
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Failed to create a socket")]
-    CreateSocket(#[source] IoError),
+    CreateSocket(#[source] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -59,6 +78,7 @@ unsafe impl ByteValued for VirtioNetConfig {}
 
 /// Create a sockaddr_in from an IPv4 address, and expose it as
 /// an opaque sockaddr suitable for usage by socket ioctls.
+#[cfg(unix)]
 fn create_sockaddr(ip_addr: net::Ipv4Addr) -> libc::sockaddr {
     let addr_in = libc::sockaddr_in {
         sin_family: libc::AF_INET as u16,
@@ -74,6 +94,7 @@ fn create_sockaddr(ip_addr: net::Ipv4Addr) -> libc::sockaddr {
     unsafe { mem::transmute(addr_in) }
 }
 
+#[cfg(unix)]
 fn create_inet_socket(addr: IpAddr) -> Result<net::UdpSocket> {
     let domain = match addr {
         IpAddr::V4(_) => libc::AF_INET,
@@ -90,6 +111,7 @@ fn create_inet_socket(addr: IpAddr) -> Result<net::UdpSocket> {
     Ok(unsafe { net::UdpSocket::from_raw_fd(sock) })
 }
 
+#[cfg(unix)]
 fn create_unix_socket() -> Result<net::UdpSocket> {
     // SAFETY: we check the return value.
     let sock = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
@@ -101,10 +123,12 @@ fn create_unix_socket() -> Result<net::UdpSocket> {
     Ok(unsafe { net::UdpSocket::from_raw_fd(sock) })
 }
 
+#[cfg(unix)]
 fn vnet_hdr_len() -> usize {
     std::mem::size_of::<virtio_net_hdr_v1>()
 }
 
+#[cfg(unix)]
 pub fn register_listener(
     epoll_fd: RawFd,
     fd: RawFd,
@@ -119,6 +143,7 @@ pub fn register_listener(
     )
 }
 
+#[cfg(unix)]
 pub fn unregister_listener(
     epoll_fd: RawFd,
     fd: RawFd,
@@ -164,6 +189,7 @@ pub fn build_net_config_space_with_mq(
     }
 }
 
+#[cfg(unix)]
 pub fn virtio_features_to_tap_offload(features: u64) -> c_uint {
     let mut tap_offloads: c_uint = 0;
     if features & (1 << VIRTIO_NET_F_GUEST_CSUM) != 0 {

@@ -6,11 +6,8 @@ rust-version.workspace = true
 version = "0.1.0"
 
 [dependencies]
-epoll = { workspace = true }
 getrandom = "0.4.2"
-libc = { workspace = true }
 log = { workspace = true }
-rate_limiter = { path = "../rate_limiter" }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 virtio-bindings = { workspace = true }
@@ -22,6 +19,11 @@ vm-memory = { workspace = true, features = [
 
 ] }
 vm-virtio = { path = "../vm-virtio" }
+
+[target.'cfg(unix)'.dependencies]
+epoll = { workspace = true }
+libc = { workspace = true }
+rate_limiter = { path = "../rate_limiter" }
 vmm-sys-util = { workspace = true }
 
 [dev-dependencies]

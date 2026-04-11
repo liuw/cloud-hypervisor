@@ -8,6 +8,8 @@ version = "0.1.0"
 
 [dependencies]
 thiserror = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
 vmm-sys-util = { workspace = true }
 
 [lints]

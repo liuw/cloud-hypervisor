@@ -3,16 +3,20 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 
 use thiserror::Error;
+#[cfg(unix)]
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Error writing to or reading from HTTP socket")]
     Socket(#[source] std::io::Error),
+    #[cfg(unix)]
     #[error("Error sending file descriptors")]
     SocketSendFds(#[source] vmm_sys_util::errno::Error),
     #[error("Error parsing HTTP status code")]
@@ -73,12 +77,14 @@ impl StatusCode {
     }
 }
 
+#[cfg(unix)]
 fn get_header<'a>(res: &'a str, header: &'a str) -> Option<&'a str> {
     let header_str = format!("{header}: ");
     res.find(&header_str)
         .map(|o| &res[o + header_str.len()..o + res[o..].find('\r').unwrap()])
 }
 
+#[cfg(unix)]
 fn get_status_code(res: &str) -> Result<StatusCode, Error> {
     if let Some(o) = res.find("HTTP/1.1") {
         Ok(StatusCode::parse(
@@ -89,6 +95,7 @@ fn get_status_code(res: &str) -> Result<StatusCode, Error> {
     }
 }
 
+#[cfg(unix)]
 fn parse_http_response(socket: &mut dyn Read) -> Result<Option<String>, Error> {
     let mut res = String::new();
     let mut body_offset = None;
@@ -137,6 +144,7 @@ fn parse_http_response(socket: &mut dyn Read) -> Result<Option<String>, Error> {
 
 /// Make an API request using the fully qualified command name.
 /// For example, full_command could be "vm.create" or "vmm.ping".
+#[cfg(unix)]
 pub fn simple_api_full_command_with_fds_and_response<T: Read + Write + ScmSocket>(
     socket: &mut T,
     method: &str,
@@ -173,6 +181,7 @@ pub fn simple_api_full_command_with_fds_and_response<T: Read + Write + ScmSocket
     parse_http_response(socket)
 }
 
+#[cfg(unix)]
 pub fn simple_api_full_command_with_fds<T: Read + Write + ScmSocket>(
     socket: &mut T,
     method: &str,
@@ -195,6 +204,7 @@ pub fn simple_api_full_command_with_fds<T: Read + Write + ScmSocket>(
     Ok(())
 }
 
+#[cfg(unix)]
 pub fn simple_api_full_command<T: Read + Write + ScmSocket>(
     socket: &mut T,
     method: &str,
@@ -204,6 +214,7 @@ pub fn simple_api_full_command<T: Read + Write + ScmSocket>(
     simple_api_full_command_with_fds(socket, method, full_command, request_body, &[])
 }
 
+#[cfg(unix)]
 pub fn simple_api_full_command_and_response<T: Read + Write + ScmSocket>(
     socket: &mut T,
     method: &str,
@@ -213,6 +224,7 @@ pub fn simple_api_full_command_and_response<T: Read + Write + ScmSocket>(
     simple_api_full_command_with_fds_and_response(socket, method, full_command, request_body, &[])
 }
 
+#[cfg(unix)]
 pub fn simple_api_command_with_fds<T: Read + Write + ScmSocket>(
     socket: &mut T,
     method: &str,
@@ -227,6 +239,7 @@ pub fn simple_api_command_with_fds<T: Read + Write + ScmSocket>(
     simple_api_full_command_with_fds(socket, method, &full_command, request_body, request_fds)
 }
 
+#[cfg(unix)]
 pub fn simple_api_command<T: Read + Write + ScmSocket>(
     socket: &mut T,
     method: &str,
