@@ -65,6 +65,11 @@ fn run_whp_demo() -> anyhow::Result<()> {
         0xEE,             // out dx, al
         0xB0, b'\n',      // mov al, '\n'
         0xEE,             // out dx, al
+        // Shutdown: write 0x34 to port 0x501 (QEMU debug exit)
+        0xBA, 0x01, 0x05, // mov dx, 0x501
+        0xB0, 0x34,       // mov al, 0x34
+        0xEE,             // out dx, al
+        0xFA,             // cli
         0xF4,             // hlt
     ];
 
@@ -106,6 +111,11 @@ fn run_whp_demo() -> anyhow::Result<()> {
                 if ch.is_ascii() {
                     print!("{}", ch as char);
                 }
+            } else if port == 0x501 {
+                // Debug exit port — signal shutdown
+                println!();
+                println!("--- Guest requested shutdown ---");
+                std::process::exit(0);
             }
             Ok(())
         }

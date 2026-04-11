@@ -125,6 +125,28 @@ impl hypervisor::Hypervisor for WhpHypervisor {
             ))
         })?;
 
+        // Enable extended VM exits for HLT instruction so the host can
+        // detect when the guest is idle or shutting down.
+        let extended_exits = WHV_EXTENDED_VM_EXITS {
+            Anonymous: WHV_EXTENDED_VM_EXITS_0 {
+                _bitfield: 1, // Bit 0 = HltExitEnabled
+            },
+        };
+        // SAFETY: Setting a partition property with valid data.
+        unsafe {
+            WHvSetPartitionProperty(
+                partition,
+                WHvPartitionPropertyCodeExtendedVmExits,
+                &raw const extended_exits as *const std::ffi::c_void,
+                std::mem::size_of::<WHV_EXTENDED_VM_EXITS>() as u32,
+            )
+            .map_err(|e| {
+                hypervisor::HypervisorError::VmSetup(anyhow!(
+                    "Failed to set extended VM exits: {e}"
+                ))
+            })?;
+        }
+
         // NOTE: WHvSetupPartition is deferred until the first vCPU is created,
         // because WHP requires ProcessorCount to be set before setup.
         // We track setup state in WhpVm.
