@@ -18,6 +18,7 @@ use std::sync::Mutex;
 #[cfg(feature = "sev_snp")]
 use igvm_defs::IGVM_VHS_SNP_ID_BLOCK;
 use thiserror::Error;
+#[cfg(unix)]
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(target_arch = "x86_64")]
@@ -318,8 +319,10 @@ pub trait Vm: Send + Sync + Any {
     /// Creates an in-kernel interrupt controller.
     fn create_irq_chip(&self) -> Result<()>;
     /// Registers an event that will, when signaled, trigger the `gsi` IRQ.
+    #[cfg(unix)]
     fn register_irqfd(&self, fd: &EventFd, gsi: u32) -> Result<()>;
     /// Unregister an event that will, when signaled, trigger the `gsi` IRQ.
+    #[cfg(unix)]
     fn unregister_irqfd(&self, fd: &EventFd, gsi: u32) -> Result<()>;
     /// Creates a new KVM vCPU file descriptor and maps the memory corresponding
     fn create_vcpu(&self, id: u32, vm_ops: Option<Arc<dyn VmOps>>) -> Result<Box<dyn Vcpu>>;
@@ -329,6 +332,7 @@ pub trait Vm: Send + Sync + Any {
     fn create_vaia(&self, config: &VaiaConfig) -> Result<Arc<Mutex<dyn Vaia>>>;
 
     /// Registers an event to be signaled whenever a certain address is written to.
+    #[cfg(unix)]
     fn register_ioevent(
         &self,
         fd: &EventFd,
@@ -336,6 +340,7 @@ pub trait Vm: Send + Sync + Any {
         datamatch: Option<DataMatch>,
     ) -> Result<()>;
     /// Unregister an event from a certain address it has been previously registered to.
+    #[cfg(unix)]
     fn unregister_ioevent(&self, fd: &EventFd, addr: &IoEventAddress) -> Result<()>;
     // Construct a routing entry
     fn make_routing_entry(&self, gsi: u32, config: &InterruptSourceConfig) -> IrqRoutingEntry;
@@ -383,6 +388,7 @@ pub trait Vm: Send + Sync + Any {
     #[cfg(target_arch = "x86_64")]
     fn set_clock(&self, data: &ClockData) -> Result<()>;
     /// Create a device that is used for passthrough
+    #[cfg(unix)]
     fn create_passthrough_device(&self) -> Result<vfio_ioctls::VfioDeviceFd>;
     /// Start logging dirty pages
     fn start_dirty_log(&self) -> Result<()>;

@@ -369,6 +369,7 @@ const ARCH_XCOMP_TILEDATA: usize = 18;
 /// Checks whether the host supports AMX.
 ///
 /// Returns `Ok` if AMX is supported on the host and `Err` otherwise.
+#[cfg(target_os = "linux")]
 pub(crate) fn amx_supported(cpu_vendor: CpuVendor) -> Result<(), AmxGuestSupportError> {
     if !matches!(cpu_vendor, CpuVendor::Intel) {
         return Err(AmxGuestSupportError::VendorDoesNotSupportAmx);
@@ -394,6 +395,7 @@ pub(crate) fn amx_supported(cpu_vendor: CpuVendor) -> Result<(), AmxGuestSupport
 }
 
 /// Asks the kernel to provide AMX support for guests.
+#[cfg(target_os = "linux")]
 pub(crate) fn request_guest_amx_support() -> Result<(), AmxGuestSupportError> {
     // Make a syscall to request permission for guests to use the TILECFG
     // and TILEDATA state components. Note that as per the kernel

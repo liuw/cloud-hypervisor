@@ -12,6 +12,7 @@ mshv = ["mshv-bindings", "mshv-ioctls", "mshv_emulator", "vfio-ioctls/mshv"]
 mshv_emulator = ["iced-x86", "mshv-bindings"]
 sev_snp = ["igvm", "igvm_defs"]
 tdx = []
+whp = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -38,14 +39,21 @@ serde_with = { workspace = true, default-features = false, features = [
   "macros",
 ] }
 thiserror = { workspace = true }
-vfio-ioctls = { workspace = true, default-features = false }
 vm-memory = { workspace = true, features = [
   "backend-atomic",
   "backend-bitmap",
   "backend-mmap",
 ] }
-vmm-sys-util = { workspace = true, features = ["with-serde"] }
 zerocopy = { workspace = true, features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+vfio-ioctls = { workspace = true, default-features = false }
+vmm-sys-util = { workspace = true, features = ["with-serde"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_System_Hypervisor",
+] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies.iced-x86]
 default-features = false

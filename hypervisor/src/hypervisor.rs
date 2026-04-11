@@ -93,7 +93,7 @@ pub enum HypervisorError {
     ///
     /// The attempt to enable AMX tile state components failed
     ///
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     #[error("Failed to enable AMX tile state components")]
     CouldNotEnableAmxStateComponents(#[source] crate::arch::x86::AmxGuestSupportError),
 }
@@ -181,7 +181,7 @@ pub trait Hypervisor: Send + Sync {
     /// AMX uses a concept of tiles which are small 2D blocks of data stored in registers on the CPU,
     /// where the TILECFG state component defines the shape and size of each tile (rows and columns),
     /// and the TILEDATA state component holds the actual elements of these tiles used by matrix operations.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn enable_amx_state_components(&self) -> Result<()> {
         let cpu_vendor = self.get_cpu_vendor();
         crate::arch::x86::amx_supported(cpu_vendor)
