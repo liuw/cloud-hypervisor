@@ -74,9 +74,10 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     // ── Create vCPU ──────────────────────────────────────────────────────
-    let vm_ops: Arc<dyn VmOps> = Arc::new(SerialVmOps);
+    let vm_ops = Arc::new(SerialVmOps::new());
+    let vm_ops_clone: Arc<dyn VmOps> = vm_ops.clone();
     let mut vcpu = vm
-        .create_vcpu(0, Some(vm_ops))
+        .create_vcpu(0, Some(vm_ops_clone))
         .context("Failed to create vCPU")?;
 
     // Set initial register state
@@ -84,6 +85,22 @@ pub fn run() -> anyhow::Result<()> {
 
     println!("vCPU 0 ready, RIP={entry_point:#x}. Running...");
     println!("--- Guest serial output ---");
+
+    // Start a stdin reader thread that feeds input to the serial port
+    let vm_ops_for_stdin = vm_ops.clone();
+    std::thread::Builder::new()
+        .name("stdin-reader".to_string())
+        .spawn(move || {
+            use std::io::Read;
+            let stdin = std::io::stdin();
+            let mut buf = [0u8; 1];
+            loop {
+                if stdin.lock().read(&mut buf).unwrap_or(0) > 0 {
+                    vm_ops_for_stdin.feed_input(&buf);
+                }
+            }
+        })
+        .context("Failed to spawn stdin reader")?;
 
     // ── Run loop ─────────────────────────────────────────────────────────
     let mut exit_count = 0u64;
@@ -119,22 +136,76 @@ pub fn run() -> anyhow::Result<()> {
 // ── Demo payload (no kernel) ─────────────────────────────────────────────────
 
 fn load_demo_payload(host_mem: *mut u8) -> u64 {
-    // Real-mode payload: print "Hi!" to serial, then shutdown.
+    // Real-mode payload: interactive serial echo loop.
+    // Prints a greeting, then reads characters from serial and echos them.
+    // Press Ctrl+C (0x03) to exit.
+    //
+    // Pseudocode:
+    //   print "Hi! Type something (Ctrl+C to quit):\n"
+    //   loop:
+    //     wait for serial RX ready (LSR bit 0)
+    //     read character from 0x3F8
+    //     if char == 0x03 (Ctrl+C): shutdown
+    //     write character to 0x3F8 (echo)
+    //     if char == '\r': also write '\n'
+    //     goto loop
+    //
     let payload: &[u8] = &[
-        0xBA, 0xF8, 0x03, // mov dx, 0x3F8
-        0xB0, b'H',       // mov al, 'H'
-        0xEE,             // out dx, al
-        0xB0, b'i',       // mov al, 'i'
-        0xEE,             // out dx, al
-        0xB0, b'!',       // mov al, '!'
-        0xEE,             // out dx, al
-        0xB0, b'\n',      // mov al, '\n'
-        0xEE,             // out dx, al
-        0xBA, 0x01, 0x05, // mov dx, 0x501
-        0xB0, 0x34,       // mov al, 0x34
-        0xEE,             // out dx, al
-        0xFA,             // cli
-        0xF4,             // hlt
+        // Print greeting
+        0xBA, 0xF8, 0x03,       // mov dx, 0x3F8     ; serial data port
+        0xB0, b'H', 0xEE,       // mov al,'H'; out dx,al
+        0xB0, b'i', 0xEE,       // mov al,'i'; out dx,al
+        0xB0, b'!', 0xEE,       // mov al,'!'; out dx,al
+        0xB0, b' ', 0xEE,       // mov al,' '; out dx,al
+        0xB0, b'T', 0xEE,       // mov al,'T'; out dx,al
+        0xB0, b'y', 0xEE,       // mov al,'y'; out dx,al
+        0xB0, b'p', 0xEE,       // mov al,'p'; out dx,al
+        0xB0, b'e', 0xEE,       // mov al,'e'; out dx,al
+        0xB0, b' ', 0xEE,       // mov al,' '; out dx,al
+        0xB0, b's', 0xEE,       // mov al,'s'; out dx,al
+        0xB0, b'o', 0xEE,       // mov al,'o'; out dx,al
+        0xB0, b'm', 0xEE,       // mov al,'m'; out dx,al
+        0xB0, b'e', 0xEE,       // mov al,'e'; out dx,al
+        0xB0, b't', 0xEE,       // mov al,'t'; out dx,al
+        0xB0, b'h', 0xEE,       // mov al,'h'; out dx,al
+        0xB0, b'i', 0xEE,       // mov al,'i'; out dx,al
+        0xB0, b'n', 0xEE,       // mov al,'n'; out dx,al
+        0xB0, b'g', 0xEE,       // mov al,'g'; out dx,al
+        0xB0, b'>', 0xEE,       // mov al,'>'; out dx,al
+        0xB0, b' ', 0xEE,       // mov al,' '; out dx,al
+
+        // offset = 60 bytes (0x3C) — echo loop starts here
+        // Echo loop:
+        //   wait for LSR bit 0 (data ready)
+        0xBA, 0xFD, 0x03,       // mov dx, 0x3FD     ; LSR port
+        0xEC,                   // in al, dx          ; read LSR
+        0xA8, 0x01,             // test al, 1         ; bit 0 = data ready?
+        0x74, 0xFA,             // jz -6              ; loop back to "in al, dx"
+
+        //   read character
+        0xBA, 0xF8, 0x03,       // mov dx, 0x3F8     ; data port
+        0xEC,                   // in al, dx          ; read character
+
+        //   check for Ctrl+C
+        0x3C, 0x03,             // cmp al, 0x03
+        0x74, 0x0C,             // je shutdown (12 bytes forward)
+
+        //   echo character
+        0xEE,                   // out dx, al
+
+        //   if CR, also send LF
+        0x3C, 0x0D,             // cmp al, 0x0D ('\r')
+        0x75, 0xEB,             // jne loop (-21 = back to "mov dx, 0x3FD")
+        0xB0, 0x0A,             // mov al, 0x0A ('\n')
+        0xEE,                   // out dx, al
+        0xEB, 0xE6,             // jmp loop (-26)
+
+        // shutdown:
+        0xBA, 0x01, 0x05,       // mov dx, 0x501
+        0xB0, 0x34,             // mov al, 0x34
+        0xEE,                   // out dx, al
+        0xFA,                   // cli
+        0xF4,                   // hlt
     ];
 
     let addr = 0x1000_usize;
@@ -142,7 +213,7 @@ fn load_demo_payload(host_mem: *mut u8) -> u64 {
     unsafe {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), host_mem.add(addr), payload.len());
     }
-    println!("Loaded demo payload ({} bytes) at GPA {addr:#X}", payload.len());
+    println!("Loaded interactive demo ({} bytes) at GPA {addr:#X}", payload.len());
     addr as u64
 }
 
@@ -358,7 +429,32 @@ fn setup_regs(vcpu: &mut dyn hypervisor::Vcpu, entry: u64) -> anyhow::Result<()>
 
 // ── VmOps: serial I/O handler ────────────────────────────────────────────────
 
-struct SerialVmOps;
+struct SerialVmOps {
+    input: std::sync::Mutex<std::collections::VecDeque<u8>>,
+}
+
+impl SerialVmOps {
+    fn new() -> Self {
+        SerialVmOps {
+            input: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    fn feed_input(&self, data: &[u8]) {
+        let mut buf = self.input.lock().unwrap();
+        buf.extend(data);
+    }
+
+    fn has_input(&self) -> bool {
+        let buf = self.input.lock().unwrap();
+        !buf.is_empty()
+    }
+
+    fn read_input(&self) -> Option<u8> {
+        let mut buf = self.input.lock().unwrap();
+        buf.pop_front()
+    }
+}
 
 impl VmOps for SerialVmOps {
     fn guest_mem_write(&self, _gpa: u64, _buf: &[u8]) -> Result<usize, HypervisorVmError> {
@@ -376,8 +472,18 @@ impl VmOps for SerialVmOps {
     }
     fn pio_read(&self, port: u64, data: &mut [u8]) -> Result<(), HypervisorVmError> {
         match port {
-            // Serial Line Status Register: TX empty + TX holding empty
-            0x3FD => data[0] = 0x60,
+            // Serial data register — return next input byte
+            0x3F8 => {
+                data[0] = self.read_input().unwrap_or(0);
+            }
+            // Serial Line Status Register
+            0x3FD => {
+                let mut lsr = 0x60; // THR empty + Transmitter idle
+                if self.has_input() {
+                    lsr |= 0x01; // Data ready
+                }
+                data[0] = lsr;
+            }
             _ => data.fill(0xFF),
         }
         Ok(())
@@ -388,6 +494,8 @@ impl VmOps for SerialVmOps {
             if ch.is_ascii() {
                 print!("{}", ch as char);
             }
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
         } else if port == DEBUG_EXIT_PORT {
             println!();
             println!("--- Guest requested shutdown ---");
