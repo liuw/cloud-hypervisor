@@ -22,8 +22,14 @@ log = { workspace = true }
 serde = { workspace = true, features = ["derive", "rc"] }
 thiserror = { workspace = true }
 uuid = { workspace = true }
-vm-memory = { workspace = true, features = ["backend-bitmap", "backend-mmap", "rawfd"] }
+vm-memory = { workspace = true, features = ["backend-bitmap", "backend-mmap",
+] }
 vmm-sys-util = { workspace = true, features = ["with-serde"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_System_SystemInformation",
+] }
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 fdt_parser = { version = "0.1.5", package = "fdt" }

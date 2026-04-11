@@ -128,3 +128,10 @@ unnecessary_semicolon = "deny"
 [workspace.lints.rust]
 # `level = warn` is irrelevant here but mandatory for rustc/cargo
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(devcli_testenv)'] }
+
+[patch.crates-io]
+# Patched vm-memory to allow rawfd feature on Windows (no-op instead of
+# compile_error). This is needed because third-party crates like virtio-queue
+# enable rawfd via default features, and Cargo unifies features across the
+# workspace.
+vm-memory = { path = "vm-memory-patch" }

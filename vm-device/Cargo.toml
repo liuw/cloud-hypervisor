@@ -16,7 +16,8 @@ platform = { path = "../platform" }
 serde = { workspace = true, features = ["derive", "rc"] }
 thiserror = { workspace = true }
 vfio-ioctls = { workspace = true, default-features = false }
-vm-memory = { workspace = true, features = ["backend-mmap", "rawfd"] }
+vm-memory = { workspace = true, features = ["backend-mmap",
+] }
 vmm-sys-util = { workspace = true }
 
 [lints]

@@ -104,12 +104,25 @@ pub use x86_64::{
     initramfs_load_addr, layout, layout::CMDLINE_MAX_SIZE, layout::CMDLINE_START, regs,
 };
 
-/// Safe wrapper for `sysconf(_SC_PAGESIZE)`.
+/// Safe wrapper for getting the system page size.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn pagesize() -> usize {
-    // SAFETY: Trivially safe
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    #[cfg(unix)]
+    {
+        // SAFETY: Trivially safe
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+    #[cfg(windows)]
+    {
+        use std::mem::MaybeUninit;
+        // SAFETY: GetSystemInfo is always safe with a valid pointer.
+        unsafe {
+            let mut info = MaybeUninit::zeroed();
+            windows::Win32::System::SystemInformation::GetSystemInfo(info.as_mut_ptr());
+            info.assume_init().dwPageSize as usize
+        }
+    }
 }
 
 #[derive(Clone, Default)]
