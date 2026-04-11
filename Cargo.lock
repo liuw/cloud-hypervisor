@@ -442,6 +442,7 @@ dependencies = [
  "event_monitor",
  "hypervisor",
  "libc",
+ "linux-loader",
  "log",
  "net_util",
  "option_parser",

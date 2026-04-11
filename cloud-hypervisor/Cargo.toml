@@ -27,13 +27,14 @@ dhat = { workspace = true, optional = true }
 env_logger = { workspace = true }
 hypervisor = { path = "../hypervisor" }
 libc = { workspace = true }
+linux-loader = { workspace = true, features = ["bzimage", "elf", "pe"] }
 log = { workspace = true, features = ["std"] }
 option_parser = { path = "../option_parser" }
 platform = { path = "../platform" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracer = { path = "../tracer" }
-vm-memory = { workspace = true }
+vm-memory = { workspace = true, features = ["backend-mmap"] }
 vmm = { path = "../vmm" }
 
 [target.'cfg(unix)'.dependencies]
