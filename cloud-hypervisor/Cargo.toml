@@ -1,5 +1,6 @@
 [package]
 authors = ["The Cloud Hypervisor Authors"]
+autobins = false
 build = "build.rs"
 default-run = "cloud-hypervisor"
 description = "Open source Virtual Machine Monitor (VMM) that runs on top of KVM & MSHV"
@@ -10,27 +11,38 @@ name = "cloud-hypervisor"
 rust-version.workspace = true
 version = "51.0.0"
 
+[[bin]]
+name = "cloud-hypervisor"
+path = "src/main.rs"
+
+[[bin]]
+name = "ch-remote"
+path = "src/bin/ch-remote.rs"
+required-features = ["kvm"]
+
 [dependencies]
 anyhow = { workspace = true }
-api_client = { path = "../api_client" }
 clap = { workspace = true, features = ["string"] }
 dhat = { workspace = true, optional = true }
 env_logger = { workspace = true }
-epoll = { workspace = true }
-event_monitor = { path = "../event_monitor" }
 hypervisor = { path = "../hypervisor" }
 libc = { workspace = true }
 log = { workspace = true, features = ["std"] }
 option_parser = { path = "../option_parser" }
 platform = { path = "../platform" }
-seccompiler = { workspace = true }
 serde_json = { workspace = true }
-signal-hook = { workspace = true }
 thiserror = { workspace = true }
-tpm = { path = "../tpm" }
 tracer = { path = "../tracer" }
 vm-memory = { workspace = true }
 vmm = { path = "../vmm" }
+
+[target.'cfg(unix)'.dependencies]
+api_client = { path = "../api_client" }
+epoll = { workspace = true }
+event_monitor = { path = "../event_monitor" }
+seccompiler = { workspace = true }
+signal-hook = { workspace = true }
+tpm = { path = "../tpm" }
 vmm-sys-util = { workspace = true }
 zbus = { version = "5.14.0", optional = true }
 

@@ -17,44 +17,73 @@ use thiserror::Error;
 
 #[macro_use]
 mod device;
+#[cfg(unix)]
 pub mod balloon;
+#[cfg(unix)]
 pub mod block;
+#[cfg(unix)]
 mod console;
+#[cfg(unix)]
 pub mod epoll_helper;
+#[cfg(unix)]
 mod iommu;
+#[cfg(unix)]
 pub mod mem;
+#[cfg(unix)]
 pub mod net;
+#[cfg(unix)]
 mod pmem;
+#[cfg(unix)]
 mod rng;
+#[cfg(unix)]
 pub mod seccomp_filters;
+#[cfg(unix)]
 mod thread_helper;
+#[cfg(unix)]
 pub mod transport;
+#[cfg(unix)]
 pub mod vdpa;
+#[cfg(unix)]
 pub mod vhost_user;
+#[cfg(unix)]
 pub mod vsock;
+#[cfg(unix)]
 pub mod watchdog;
 
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{GuestAddress, GuestMemory};
+#[cfg(unix)]
 use vm_virtio::VirtioDeviceType;
 
+#[cfg(unix)]
 pub use self::balloon::Balloon;
+#[cfg(unix)]
 pub use self::block::{Block, BlockState};
+#[cfg(unix)]
 pub use self::console::{Console, ConsoleResizer, Endpoint};
 pub use self::device::{
     ActivationContext, DmaRemapping, VirtioCommon, VirtioDevice, VirtioInterrupt,
     VirtioInterruptType, VirtioSharedMemoryList,
 };
+#[cfg(unix)]
 pub use self::epoll_helper::{
     EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
 };
+#[cfg(unix)]
 pub use self::iommu::{AccessPlatformMapping, Iommu, IommuMapping};
+#[cfg(unix)]
 pub use self::mem::{BlocksState, Mem, VIRTIO_MEM_ALIGN_SIZE, VirtioMemMappingSource};
+#[cfg(unix)]
 pub use self::net::{Net, NetCtrlEpollHandler};
+#[cfg(unix)]
 pub use self::pmem::Pmem;
+#[cfg(unix)]
 pub use self::rng::Rng;
+#[cfg(unix)]
 pub use self::vdpa::{Vdpa, VdpaDmaMapping};
+#[cfg(unix)]
 pub use self::vsock::Vsock;
+#[cfg(unix)]
 pub use self::watchdog::Watchdog;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
@@ -87,14 +116,18 @@ pub enum ActivateError {
     CloneExitEventFd(#[source] std::io::Error),
     #[error("Failed to spawn thread")]
     ThreadSpawn(#[source] std::io::Error),
+    #[cfg(unix)]
     #[error("Failed to setup vhost-user-fs daemon")]
     VhostUserFsSetup(#[source] vhost_user::Error),
+    #[cfg(unix)]
     #[error("Failed to setup vhost-user daemon")]
     VhostUserSetup(#[source] vhost_user::Error),
+    #[cfg(unix)]
     #[error("Failed to create seccomp filter")]
     CreateSeccompFilter(#[source] seccompiler::Error),
     #[error("Failed to create rate limiter")]
     CreateRateLimiter(#[source] std::io::Error),
+    #[cfg(unix)]
     #[error("Failed to activate the vDPA device")]
     ActivateVdpa(#[source] vdpa::Error),
 }
@@ -109,12 +142,15 @@ pub enum Error {
     FailedSignalingUsedQueue(#[source] io::Error),
     #[error("I/O Error")]
     IoError(#[source] io::Error),
+    #[cfg(unix)]
     #[error("Failed to update memory vhost-user")]
     VhostUserUpdateMemory(#[source] vhost_user::Error),
+    #[cfg(unix)]
     #[error("Failed to add memory region vhost-user")]
     VhostUserAddMemoryRegion(#[source] vhost_user::Error),
     #[error("Failed to set shared memory region")]
     SetShmRegionsNotSupported,
+    #[cfg(unix)]
     #[error("Failed to process net queue")]
     NetQueuePair(#[source] ::net_util::NetQueuePairError),
     #[error("Failed to ")]

@@ -15,7 +15,6 @@ sev_snp = ["mshv-ioctls"]
 anyhow = { workspace = true }
 block = { path = "../block" }
 byteorder = { workspace = true }
-epoll = { workspace = true }
 event_monitor = { path = "../event_monitor" }
 hypervisor = { path = "../hypervisor" }
 libc = { workspace = true }
@@ -25,19 +24,12 @@ net_util = { path = "../net_util" }
 pci = { path = "../pci" }
 platform = { path = "../platform" }
 rate_limiter = { path = "../rate_limiter" }
-seccompiler = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_with = { workspace = true, default-features = false, features = [
   "macros",
 ] }
 serial_buffer = { path = "../serial_buffer" }
 thiserror = { workspace = true }
-vhost = { workspace = true, features = [
-  "vhost-kern",
-  "vhost-user-backend",
-  "vhost-user-frontend",
-  "vhost-vdpa",
-] }
 virtio-bindings = { workspace = true }
 virtio-queue = { workspace = true }
 vm-allocator = { path = "../vm-allocator" }
@@ -50,6 +42,16 @@ vm-memory = { workspace = true, features = [
 ] }
 vm-migration = { path = "../vm-migration" }
 vm-virtio = { path = "../vm-virtio" }
+
+[target.'cfg(unix)'.dependencies]
+epoll = { workspace = true }
+seccompiler = { workspace = true }
+vhost = { workspace = true, features = [
+  "vhost-kern",
+  "vhost-user-backend",
+  "vhost-user-frontend",
+  "vhost-vdpa",
+] }
 vmm-sys-util = { workspace = true }
 
 [lints]

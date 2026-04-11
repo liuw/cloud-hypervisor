@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use vm_device::Resource;
 use vm_migration::Migratable;
 
+#[cfg(unix)]
 use crate::device_manager::PciDeviceHandle;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -22,6 +23,7 @@ pub struct DeviceNode {
     pub migratable: Option<Arc<Mutex<dyn Migratable>>>,
     pub pci_bdf: Option<PciBdf>,
     #[serde(skip)]
+    #[cfg(unix)]
     pub pci_device_handle: Option<PciDeviceHandle>,
 }
 
@@ -34,6 +36,7 @@ impl DeviceNode {
             children: Vec::new(),
             migratable,
             pci_bdf: None,
+            #[cfg(unix)]
             pci_device_handle: None,
         }
     }
@@ -80,6 +83,7 @@ impl DeviceTree {
     pub fn breadth_first_traversal(&self) -> BftIter<'_> {
         BftIter::new(&self.0)
     }
+    #[cfg(unix)]
     pub fn pci_devices(&self) -> Vec<&DeviceNode> {
         self.0
             .values()

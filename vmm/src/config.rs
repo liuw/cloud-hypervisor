@@ -21,12 +21,26 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
 use virtio_bindings::virtio_ids::*;
+#[cfg(unix)]
 use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
+#[cfg(unix)]
 use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
 
+#[cfg(unix)]
 use crate::landlock::LandlockAccess;
 use crate::vm_config::*;
+
+
+// Provide fallback values for constants from Unix-only modules
+#[cfg(not(unix))]
+const MINIMUM_BLOCK_QUEUE_SIZE: u16 = 1;
+#[cfg(not(unix))]
+const VIRTIO_FS_TAG_LEN: usize = 36;
+#[cfg(not(unix))]
+const MIN_MTU: u16 = 1280;
+#[cfg(unix)]
+use virtio_devices::net::MIN_MTU;
 
 const MAX_NUM_PCI_SEGMENTS: u16 = 96;
 const MAX_IOMMU_ADDRESS_WIDTH_BITS: u8 = 64;
@@ -1673,7 +1687,7 @@ impl NetConfig {
         }
 
         if let Some(mtu) = self.mtu
-            && mtu < virtio_devices::net::MIN_MTU
+            && mtu < MIN_MTU
         {
             return Err(ValidationError::InvalidMtu(mtu));
         }
@@ -1910,7 +1924,7 @@ impl FsConfig {
         parser.parse(fs).map_err(Error::ParseFileSystem)?;
 
         let tag = parser.get("tag").ok_or(Error::ParseFsTagMissing)?;
-        if tag.len() > virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN {
+        if tag.len() > VIRTIO_FS_TAG_LEN {
             return Err(Error::ParseFsTagTooLong);
         }
         let socket = PathBuf::from(parser.get("socket").ok_or(Error::ParseFsSockMissing)?);
@@ -2820,6 +2834,7 @@ impl LandlockConfig {
         if !self.path.exists() {
             return Err(ValidationError::LandlockPathDoesNotExist(self.path.clone()));
         }
+        #[cfg(unix)]
         LandlockAccess::try_from(self.access.as_str())
             .map_err(|e| ValidationError::InvalidLandlockAccess(e.to_string()))?;
         Ok(())

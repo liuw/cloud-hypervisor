@@ -9,19 +9,50 @@ use std::str::FromStr;
 use std::{fs, result};
 
 use block::ImageType;
+#[cfg(unix)]
 pub use block::fcntl::LockGranularityChoice;
+
+#[cfg(not(unix))]
+mod lock_granularity_stub {
+    use std::str::FromStr;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+    pub enum LockGranularityChoice {
+        #[default]
+        ByteRange,
+        Full,
+    }
+
+    impl FromStr for LockGranularityChoice {
+        type Err = String;
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "byte-range" => Ok(LockGranularityChoice::ByteRange),
+                "full" => Ok(LockGranularityChoice::Full),
+                _ => Err(format!("Invalid lock granularity value: {s}")),
+            }
+        }
+    }
+}
+#[cfg(not(unix))]
+pub use self::lock_granularity_stub::LockGranularityChoice;
 use log::{debug, warn};
 use net_util::MacAddr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_devices::RateLimiterConfig;
 
+#[cfg(unix)]
 use crate::Landlock;
+#[cfg(unix)]
 use crate::landlock::LandlockError;
 
+#[cfg(unix)]
 pub type LandlockResult<T> = result::Result<T, LandlockError>;
 
 /// Trait to apply Landlock on VmConfig elements
+#[cfg(unix)]
 pub(crate) trait ApplyLandlock {
     /// Apply Landlock rules to file paths
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()>;
@@ -181,6 +212,7 @@ pub struct MemoryZoneConfig {
     pub prefault: bool,
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for MemoryZoneConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         if let Some(file) = &self.file {
@@ -315,6 +347,7 @@ pub struct DiskConfig {
     pub lock_granularity: LockGranularityChoice,
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for DiskConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         if let Some(path) = &self.path {
@@ -442,6 +475,7 @@ impl Default for RngConfig {
     }
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for RngConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         // Rng Path only need read access
@@ -487,6 +521,7 @@ pub fn default_fsconfig_queue_size() -> u16 {
     1024
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for FsConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         landlock.add_rule_with_access(&self.socket, "rw")?;
@@ -505,6 +540,7 @@ pub struct GenericVhostUserConfig {
     pub device_type: u32,
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for GenericVhostUserConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         landlock.add_rule_with_access(&self.socket, "rw")?;
@@ -527,6 +563,7 @@ pub struct PmemConfig {
     pub pci_segment: u16,
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for PmemConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         let access = if self.discard_writes { "r" } else { "rw" };
@@ -559,6 +596,7 @@ pub fn default_consoleconfig_file() -> Option<PathBuf> {
     None
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for ConsoleConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         if self.mode == ConsoleOutputMode::Pty {
@@ -596,6 +634,7 @@ impl Default for DebugConsoleConfig {
     }
 }
 #[cfg(target_arch = "x86_64")]
+#[cfg(unix)]
 impl ApplyLandlock for DebugConsoleConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         if self.mode == ConsoleOutputMode::Pty {
@@ -622,6 +661,7 @@ pub struct DeviceConfig {
     pub x_nv_gpudirect_clique: Option<u8>,
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for DeviceConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         let device_path = fs::read_link(self.path.as_path()).map_err(LandlockError::OpenPath)?;
@@ -648,6 +688,7 @@ pub struct UserDeviceConfig {
     pub pci_segment: u16,
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for UserDeviceConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         landlock.add_rule_with_access(&self.socket, "rw")?;
@@ -672,6 +713,7 @@ pub fn default_vdpaconfig_num_queues() -> usize {
     1
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for VdpaConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         landlock.add_rule_with_access(&self.path, "rw")?;
@@ -691,6 +733,7 @@ pub struct VsockConfig {
     pub pci_segment: u16,
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for VsockConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         if let Some(parent) = self.socket.parent() {
@@ -892,6 +935,7 @@ impl PayloadConfig {
     }
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for PayloadConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         // Payload only needs read access
@@ -939,6 +983,7 @@ pub struct TpmConfig {
     pub socket: PathBuf,
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for TpmConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         landlock.add_rule_with_access(&self.socket, "rw")?;
@@ -952,6 +997,7 @@ pub struct LandlockConfig {
     pub access: String,
 }
 
+#[cfg(unix)]
 impl ApplyLandlock for LandlockConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         landlock.add_rule_with_access(&self.path, self.access.clone().as_str())?;
@@ -1020,6 +1066,7 @@ pub struct VmConfig {
 }
 
 impl VmConfig {
+    #[cfg(unix)]
     pub(crate) fn apply_landlock(&self) -> LandlockResult<()> {
         let mut landlock = Landlock::new()?;
 

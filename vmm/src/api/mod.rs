@@ -31,35 +31,51 @@
 
 #[cfg(feature = "dbus_api")]
 pub mod dbus;
+#[cfg(unix)]
 pub mod http;
 
+#[cfg(unix)]
 use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::str::FromStr;
+#[cfg(unix)]
 use std::sync::mpsc::{RecvError, SendError, Sender, channel};
 use std::time::Duration;
 
+#[cfg(unix)]
 use log::info;
+#[cfg(unix)]
 use micro_http::Body;
 use option_parser::{OptionParser, OptionParserError, Toggle};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use thiserror::Error;
+#[cfg(unix)]
 use vm_migration::MigratableError;
+#[cfg(unix)]
 use platform::EventFd;
 
 #[cfg(feature = "dbus_api")]
 pub use self::dbus::start_dbus_thread;
+#[cfg(unix)]
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
+#[cfg(unix)]
 use crate::Error as VmmError;
+#[cfg(unix)]
 use crate::config::RestoreConfig;
+#[cfg(unix)]
 use crate::device_tree::DeviceTree;
+#[cfg(unix)]
 use crate::migration_transport::MAX_MIGRATION_CONNECTIONS;
+#[cfg(unix)]
 use crate::vm::{Error as VmError, VmState};
+#[cfg(unix)]
 use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
     UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 
+#[cfg(unix)]
 /// API errors are sent back from the VMM API server through the ApiResponse.
 #[derive(Error, Debug)]
 pub enum ApiError {
@@ -211,8 +227,10 @@ pub enum ApiError {
     #[error("Error triggering NMI")]
     VmNmi(#[source] VmError),
 }
+#[cfg(unix)]
 pub type ApiResult<T> = Result<T, ApiError>;
 
+#[cfg(unix)]
 #[derive(Clone, Deserialize, Serialize)]
 pub struct VmInfoResponse {
     pub config: Box<VmConfig>,
@@ -221,6 +239,7 @@ pub struct VmInfoResponse {
     pub device_tree: Option<DeviceTree>,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Deserialize, Serialize)]
 pub struct VmmPingResponse {
     pub build_version: String,
@@ -229,6 +248,7 @@ pub struct VmmPingResponse {
     pub features: Vec<String>,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmResizeData {
     pub desired_vcpus: Option<u32>,
@@ -236,41 +256,48 @@ pub struct VmResizeData {
     pub desired_balloon: Option<u64>,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmResizeDiskData {
     pub id: String,
     pub desired_size: u64,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmResizeZoneData {
     pub id: String,
     pub desired_ram: u64,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmRemoveDeviceData {
     pub id: String,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmSnapshotConfig {
     /// The snapshot destination URL
     pub destination_url: String,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmCoredumpData {
     /// The coredump destination file
     pub destination_url: String,
 }
 
+#[cfg(unix)]
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmReceiveMigrationData {
     /// URL for the reception of migration state
     pub receiver_url: String,
 }
 
+#[cfg(unix)]
 #[derive(Copy, Clone, Default, Deserialize, Serialize, Debug, PartialEq, Eq)]
 /// The migration timeout strategy.
 ///
@@ -284,6 +311,7 @@ pub enum TimeoutStrategy {
     Ignore,
 }
 
+#[cfg(unix)]
 impl FromStr for TimeoutStrategy {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -295,6 +323,7 @@ impl FromStr for TimeoutStrategy {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Error)]
 pub enum VmSendMigrationConfigError {
     #[error("Error parsing send migration parameters")]
@@ -304,6 +333,7 @@ pub enum VmSendMigrationConfigError {
     ValidationError(String),
 }
 
+#[cfg(unix)]
 /// Configuration for an outgoing migration.
 #[derive(Clone, Deserialize, Serialize, Debug)]
 #[cfg_attr(test, derive(PartialEq))]
@@ -332,6 +362,7 @@ pub struct VmSendMigrationData {
     pub connections: NonZeroU32,
 }
 
+#[cfg(unix)]
 impl VmSendMigrationData {
     pub const SYNTAX: &'static str = "VM send migration parameters \
         \"destination_url=<url>[,local=on|off,\
@@ -487,6 +518,7 @@ impl VmSendMigrationData {
     }
 }
 
+#[cfg(unix)]
 pub enum ApiResponsePayload {
     /// No data is sent on the channel.
     Empty,
@@ -501,9 +533,11 @@ pub enum ApiResponsePayload {
     VmAction(Option<Vec<u8>>),
 }
 
+#[cfg(unix)]
 /// This is the response sent by the VMM API server through the mpsc channel.
 pub type ApiResponse = Result<ApiResponsePayload, ApiError>;
 
+#[cfg(unix)]
 pub trait RequestHandler {
     fn vm_create(&mut self, config: Box<VmConfig>) -> Result<(), VmError>;
 
@@ -586,6 +620,7 @@ pub trait RequestHandler {
     fn vm_nmi(&mut self) -> Result<(), VmError>;
 }
 
+#[cfg(unix)]
 /// It would be nice if we could pass around an object like this:
 ///
 /// ```
@@ -602,6 +637,7 @@ pub trait RequestHandler {
 pub type ApiRequest =
     Box<dyn FnOnce(&mut dyn RequestHandler) -> Result<bool, VmmError> + Send + 'static>;
 
+#[cfg(unix)]
 #[allow(clippy::needless_pass_by_value)]
 fn get_response<Action: ApiAction>(
     action: &Action,
@@ -620,6 +656,7 @@ fn get_response<Action: ApiAction>(
     response_receiver.recv().map_err(ApiError::ResponseRecv)?
 }
 
+#[cfg(unix)]
 fn get_response_body<Action: ApiAction<ResponseBody = Option<Body>>>(
     action: &Action,
     api_evt: EventFd,
@@ -635,6 +672,7 @@ fn get_response_body<Action: ApiAction<ResponseBody = Option<Body>>>(
     Ok(body)
 }
 
+#[cfg(unix)]
 pub trait ApiAction: Send + Sync {
     type RequestBody: Send + Sync + Sized;
     type ResponseBody: Send + Sized;
@@ -649,8 +687,10 @@ pub trait ApiAction: Send + Sync {
     ) -> ApiResult<Self::ResponseBody>;
 }
 
+#[cfg(unix)]
 pub struct VmAddDevice;
 
+#[cfg(unix)]
 impl ApiAction for VmAddDevice {
     type RequestBody = DeviceConfig;
     type ResponseBody = Option<Body>;
@@ -686,8 +726,10 @@ impl ApiAction for VmAddDevice {
     }
 }
 
+#[cfg(unix)]
 pub struct AddDisk;
 
+#[cfg(unix)]
 impl ApiAction for AddDisk {
     type RequestBody = DiskConfig;
     type ResponseBody = Option<Body>;
@@ -723,8 +765,10 @@ impl ApiAction for AddDisk {
     }
 }
 
+#[cfg(unix)]
 pub struct VmAddFs;
 
+#[cfg(unix)]
 impl ApiAction for VmAddFs {
     type RequestBody = FsConfig;
     type ResponseBody = Option<Body>;
@@ -760,8 +804,10 @@ impl ApiAction for VmAddFs {
     }
 }
 
+#[cfg(unix)]
 pub struct VmAddGenericVhostUser;
 
+#[cfg(unix)]
 impl ApiAction for VmAddGenericVhostUser {
     type RequestBody = GenericVhostUserConfig;
     type ResponseBody = Option<Body>;
@@ -797,8 +843,10 @@ impl ApiAction for VmAddGenericVhostUser {
     }
 }
 
+#[cfg(unix)]
 pub struct VmAddPmem;
 
+#[cfg(unix)]
 impl ApiAction for VmAddPmem {
     type RequestBody = PmemConfig;
     type ResponseBody = Option<Body>;
@@ -834,8 +882,10 @@ impl ApiAction for VmAddPmem {
     }
 }
 
+#[cfg(unix)]
 pub struct VmAddNet;
 
+#[cfg(unix)]
 impl ApiAction for VmAddNet {
     type RequestBody = NetConfig;
     type ResponseBody = Option<Body>;
@@ -871,8 +921,10 @@ impl ApiAction for VmAddNet {
     }
 }
 
+#[cfg(unix)]
 pub struct VmAddVdpa;
 
+#[cfg(unix)]
 impl ApiAction for VmAddVdpa {
     type RequestBody = VdpaConfig;
     type ResponseBody = Option<Body>;
@@ -908,8 +960,10 @@ impl ApiAction for VmAddVdpa {
     }
 }
 
+#[cfg(unix)]
 pub struct VmAddVsock;
 
+#[cfg(unix)]
 impl ApiAction for VmAddVsock {
     type RequestBody = VsockConfig;
     type ResponseBody = Option<Body>;
@@ -945,8 +999,10 @@ impl ApiAction for VmAddVsock {
     }
 }
 
+#[cfg(unix)]
 pub struct VmAddUserDevice;
 
+#[cfg(unix)]
 impl ApiAction for VmAddUserDevice {
     type RequestBody = UserDeviceConfig;
     type ResponseBody = Option<Body>;
@@ -982,8 +1038,10 @@ impl ApiAction for VmAddUserDevice {
     }
 }
 
+#[cfg(unix)]
 pub struct VmBoot;
 
+#[cfg(unix)]
 impl ApiAction for VmBoot {
     type RequestBody = ();
     type ResponseBody = Option<Body>;
@@ -1015,10 +1073,12 @@ impl ApiAction for VmBoot {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+#[cfg(all(unix, target_arch = "x86_64", feature = "guest_debug"))]
+#[cfg(unix)]
 pub struct VmCoredump;
 
-#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+#[cfg(all(unix, target_arch = "x86_64", feature = "guest_debug"))]
+#[cfg(unix)]
 impl ApiAction for VmCoredump {
     type RequestBody = VmCoredumpData;
     type ResponseBody = Option<Body>;
@@ -1054,8 +1114,10 @@ impl ApiAction for VmCoredump {
     }
 }
 
+#[cfg(unix)]
 pub struct VmCounters;
 
+#[cfg(unix)]
 impl ApiAction for VmCounters {
     type RequestBody = ();
     type ResponseBody = Option<Body>;
@@ -1087,8 +1149,10 @@ impl ApiAction for VmCounters {
     }
 }
 
+#[cfg(unix)]
 pub struct VmCreate;
 
+#[cfg(unix)]
 impl ApiAction for VmCreate {
     type RequestBody = Box<VmConfig>;
     type ResponseBody = ();
@@ -1126,8 +1190,10 @@ impl ApiAction for VmCreate {
     }
 }
 
+#[cfg(unix)]
 pub struct VmDelete;
 
+#[cfg(unix)]
 impl ApiAction for VmDelete {
     type RequestBody = ();
     type ResponseBody = Option<Body>;
@@ -1159,8 +1225,10 @@ impl ApiAction for VmDelete {
     }
 }
 
+#[cfg(unix)]
 pub struct VmInfo;
 
+#[cfg(unix)]
 impl ApiAction for VmInfo {
     type RequestBody = ();
     type ResponseBody = VmInfoResponse;
@@ -1197,8 +1265,10 @@ impl ApiAction for VmInfo {
     }
 }
 
+#[cfg(unix)]
 pub struct VmPause;
 
+#[cfg(unix)]
 impl ApiAction for VmPause {
     type RequestBody = ();
     type ResponseBody = Option<Body>;
@@ -1230,8 +1300,10 @@ impl ApiAction for VmPause {
     }
 }
 
+#[cfg(unix)]
 pub struct VmPowerButton;
 
+#[cfg(unix)]
 impl ApiAction for VmPowerButton {
     type RequestBody = ();
     type ResponseBody = Option<Body>;
@@ -1263,8 +1335,10 @@ impl ApiAction for VmPowerButton {
     }
 }
 
+#[cfg(unix)]
 pub struct VmReboot;
 
+#[cfg(unix)]
 impl ApiAction for VmReboot {
     type RequestBody = ();
     type ResponseBody = Option<Body>;
@@ -1296,8 +1370,10 @@ impl ApiAction for VmReboot {
     }
 }
 
+#[cfg(unix)]
 pub struct VmReceiveMigration;
 
+#[cfg(unix)]
 impl ApiAction for VmReceiveMigration {
     type RequestBody = VmReceiveMigrationData;
     type ResponseBody = Option<Body>;
@@ -1329,8 +1405,10 @@ impl ApiAction for VmReceiveMigration {
     }
 }
 
+#[cfg(unix)]
 pub struct VmRemoveDevice;
 
+#[cfg(unix)]
 impl ApiAction for VmRemoveDevice {
     type RequestBody = VmRemoveDeviceData;
     type ResponseBody = Option<Body>;
@@ -1366,8 +1444,10 @@ impl ApiAction for VmRemoveDevice {
     }
 }
 
+#[cfg(unix)]
 pub struct VmResize;
 
+#[cfg(unix)]
 impl ApiAction for VmResize {
     type RequestBody = VmResizeData;
     type ResponseBody = Option<Body>;
@@ -1407,8 +1487,10 @@ impl ApiAction for VmResize {
     }
 }
 
+#[cfg(unix)]
 pub struct VmResizeDisk;
 
+#[cfg(unix)]
 impl ApiAction for VmResizeDisk {
     type RequestBody = VmResizeDiskData;
     type ResponseBody = Option<Body>;
@@ -1442,8 +1524,10 @@ impl ApiAction for VmResizeDisk {
     }
 }
 
+#[cfg(unix)]
 pub struct VmResizeZone;
 
+#[cfg(unix)]
 impl ApiAction for VmResizeZone {
     type RequestBody = VmResizeZoneData;
     type ResponseBody = Option<Body>;
@@ -1479,8 +1563,10 @@ impl ApiAction for VmResizeZone {
     }
 }
 
+#[cfg(unix)]
 pub struct VmRestore;
 
+#[cfg(unix)]
 impl ApiAction for VmRestore {
     type RequestBody = RestoreConfig;
     type ResponseBody = Option<Body>;
@@ -1516,8 +1602,10 @@ impl ApiAction for VmRestore {
     }
 }
 
+#[cfg(unix)]
 pub struct VmResume;
 
+#[cfg(unix)]
 impl ApiAction for VmResume {
     type RequestBody = ();
     type ResponseBody = Option<Body>;
@@ -1549,8 +1637,10 @@ impl ApiAction for VmResume {
     }
 }
 
+#[cfg(unix)]
 pub struct VmSendMigration;
 
+#[cfg(unix)]
 impl ApiAction for VmSendMigration {
     type RequestBody = VmSendMigrationData;
     type ResponseBody = Option<Body>;
@@ -1582,8 +1672,10 @@ impl ApiAction for VmSendMigration {
     }
 }
 
+#[cfg(unix)]
 pub struct VmShutdown;
 
+#[cfg(unix)]
 impl ApiAction for VmShutdown {
     type RequestBody = ();
     type ResponseBody = Option<Body>;
@@ -1619,8 +1711,10 @@ impl ApiAction for VmShutdown {
     }
 }
 
+#[cfg(unix)]
 pub struct VmSnapshot;
 
+#[cfg(unix)]
 impl ApiAction for VmSnapshot {
     type RequestBody = VmSnapshotConfig;
     type ResponseBody = Option<Body>;
@@ -1656,8 +1750,10 @@ impl ApiAction for VmSnapshot {
     }
 }
 
+#[cfg(unix)]
 pub struct VmmPing;
 
+#[cfg(unix)]
 impl ApiAction for VmmPing {
     type RequestBody = ();
     type ResponseBody = VmmPingResponse;
@@ -1691,8 +1787,10 @@ impl ApiAction for VmmPing {
     }
 }
 
+#[cfg(unix)]
 pub struct VmmShutdown;
 
+#[cfg(unix)]
 impl ApiAction for VmmShutdown {
     type RequestBody = ();
     type ResponseBody = ();
@@ -1721,8 +1819,10 @@ impl ApiAction for VmmShutdown {
     }
 }
 
+#[cfg(unix)]
 pub struct VmNmi;
 
+#[cfg(unix)]
 impl ApiAction for VmNmi {
     type RequestBody = ();
     type ResponseBody = Option<Body>;
@@ -1754,7 +1854,7 @@ impl ApiAction for VmNmi {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod unit_tests {
     use super::*;
 
