@@ -14,7 +14,6 @@ vm-memory = { workspace = true, features = [
   "backend-atomic",
   "backend-bitmap",
   "backend-mmap",
-  "rawfd",
 ] }
 
 [lints]

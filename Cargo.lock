@@ -2486,6 +2486,7 @@ dependencies = [
  "arch",
  "libc",
  "vm-memory",
+ "windows",
 ]
 
 [[package]]

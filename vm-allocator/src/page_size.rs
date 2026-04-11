@@ -1,12 +1,24 @@
 // Copyright 2023 Arm Limited (or its affiliates). All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use libc::{_SC_PAGESIZE, sysconf};
-
 /// get host page size
 pub fn get_page_size() -> u64 {
-    // SAFETY: FFI call. Trivially safe.
-    unsafe { sysconf(_SC_PAGESIZE) as u64 }
+    #[cfg(unix)]
+    {
+        // SAFETY: FFI call. Trivially safe.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    }
+    #[cfg(windows)]
+    {
+        use std::mem::MaybeUninit;
+        // SAFETY: GetSystemInfo is always safe to call with a valid pointer.
+        let info = unsafe {
+            let mut info = MaybeUninit::zeroed();
+            windows::Win32::System::SystemInformation::GetSystemInfo(info.as_mut_ptr());
+            info.assume_init()
+        };
+        info.dwPageSize as u64
+    }
 }
 
 /// round up address to let it align page size

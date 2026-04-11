@@ -11,7 +11,12 @@ kvm = ["arch/kvm"]
 
 [dependencies]
 libc = { workspace = true }
-vm-memory = { workspace = true, features = ["rawfd"] }
+vm-memory = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_System_SystemInformation",
+] }
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 arch = { path = "../arch" }

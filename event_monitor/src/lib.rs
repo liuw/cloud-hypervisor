@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -51,6 +52,7 @@ struct MonitorHandle {
     start: Instant,
 }
 
+#[cfg(unix)]
 fn set_file_nonblocking(file: &File) -> io::Result<()> {
     let fd = file.as_raw_fd();
 
@@ -75,6 +77,7 @@ pub fn set_monitor(file: Option<File>) -> io::Result<Monitor> {
     assert!(MONITOR.get().is_none());
 
     if let Some(ref file) = file {
+        #[cfg(unix)]
         set_file_nonblocking(file)?;
     }
 
