@@ -20,7 +20,10 @@ Cloud-hypervisor currently supports two hypervisor backends — KVM (Linux) and 
 - Migrated all 66 source files from `vmm_sys_util::eventfd::EventFd` to `platform::EventFd`  
 - Migrated 18 files from `libc::EFD_NONBLOCK` to `platform::EFD_NONBLOCK`  
 - Added `platform` dependency to 12 crates  
-- Remaining: IPC abstraction, memory abstraction (lower priority)
+- Patched `vm-memory` to make `rawfd` feature a no-op on Windows  
+- Ported `arch`, `vm-allocator`, `vm-virtio`, `event_monitor` to compile on Windows  
+- **10 of 23 workspace crates now compile on Windows x86_64**  
+- Remaining 13 crates blocked by deep Linux deps (epoll, TAP, Unix sockets, vfio-bindings)
 
 ## Approach
 
