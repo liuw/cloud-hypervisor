@@ -30,7 +30,10 @@ use crate::arch::riscv64::aia::{Vaia, VaiaConfig};
 #[cfg(feature = "tdx")]
 use crate::arch::x86::CpuIdEntry;
 use crate::cpu::Vcpu;
+#[cfg(unix)]
 use crate::{IoEventAddress, IrqRoutingEntry};
+#[cfg(not(unix))]
+use crate::IrqRoutingEntry;
 
 ///
 /// I/O events data matches (32 or 64 bits).

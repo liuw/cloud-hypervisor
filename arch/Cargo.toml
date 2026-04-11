@@ -22,7 +22,7 @@ log = { workspace = true }
 serde = { workspace = true, features = ["derive", "rc"] }
 thiserror = { workspace = true }
 uuid = { workspace = true }
-vm-memory = { workspace = true, features = ["backend-bitmap", "backend-mmap"] }
+vm-memory = { workspace = true, features = ["backend-bitmap", "backend-mmap", "rawfd"] }
 vmm-sys-util = { workspace = true, features = ["with-serde"] }
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]

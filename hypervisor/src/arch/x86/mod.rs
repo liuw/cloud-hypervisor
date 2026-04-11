@@ -15,6 +15,7 @@ use core::fmt;
 
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
 use crate::CpuVendor;
 
 #[cfg(all(feature = "mshv_emulator", target_arch = "x86_64"))]
@@ -361,9 +362,13 @@ impl Default for XsaveState {
     }
 }
 
+#[cfg(target_os = "linux")]
 const ARCH_GET_XCOMP_SUPP: usize = 0x1021;
+#[cfg(target_os = "linux")]
 const ARCH_REQ_XCOMP_GUEST_PERM: usize = 0x1025;
+#[cfg(target_os = "linux")]
 const ARCH_XCOMP_TILECFG: usize = 17;
+#[cfg(target_os = "linux")]
 const ARCH_XCOMP_TILEDATA: usize = 18;
 
 /// Checks whether the host supports AMX.

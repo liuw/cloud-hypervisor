@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::arch::x86::{FpuState, LapicState, MsrEntry, SpecialRegisters};
+use crate::arch::x86::{FpuState, LapicState, MsrEntry};
 
 /// Standard x86_64 general-purpose registers for WHP.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -46,11 +46,23 @@ pub struct WhpIrqRoutingEntry {
     pub data: u32,
 }
 
+/// Control/special registers stored as raw values for serialization.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct WhpSpecialRegisters {
+    pub cr0: u64,
+    pub cr2: u64,
+    pub cr3: u64,
+    pub cr4: u64,
+    pub cr8: u64,
+    pub efer: u64,
+    pub apic_base: u64,
+}
+
 /// Complete vCPU state for snapshot/restore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VcpuWhpState {
     pub regs: WhpStandardRegisters,
-    pub sregs: SpecialRegisters,
+    pub sregs: WhpSpecialRegisters,
     pub fpu: FpuState,
     pub lapic: LapicState,
     pub msrs: Vec<MsrEntry>,

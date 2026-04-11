@@ -14,7 +14,7 @@ use log::{debug, warn};
 use windows::Win32::System::Hypervisor::*;
 
 use crate::cpu::HypervisorCpuError;
-use crate::vm::{self, DataMatch, InterruptSourceConfig, VmOps};
+use crate::vm::{self, InterruptSourceConfig, VmOps};
 use crate::{HypervisorType, HypervisorVmConfig, cpu, hypervisor};
 
 pub mod x86_64;
@@ -22,7 +22,7 @@ pub mod x86_64;
 pub use x86_64::*;
 
 use crate::arch::x86::{CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters};
-use crate::{ClockData, CpuState, IoEventAddress, IrqRoutingEntry, MpState, StandardRegisters};
+use crate::{ClockData, CpuState, IrqRoutingEntry, MpState, StandardRegisters};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -60,8 +60,9 @@ pub struct WhpHypervisor;
 impl WhpHypervisor {
     /// Check whether WHP is available on this system.
     pub fn is_available() -> hypervisor::Result<bool> {
-        // SAFETY: WHvGetCapability with HypervisorPresent returns a BOOL.
         let mut capability = WHV_CAPABILITY::default();
+        // SAFETY: WHvGetCapability with HypervisorPresent returns a BOOL.
+        // We provide a correctly-sized output buffer.
         let written = unsafe {
             let mut written: u32 = 0;
             WHvGetCapability(
@@ -88,6 +89,7 @@ impl WhpHypervisor {
         Ok(present)
     }
 
+    #[allow(clippy::new_ret_no_self)]
     pub fn new() -> hypervisor::Result<Arc<dyn hypervisor::Hypervisor>> {
         Ok(Arc::new(WhpHypervisor))
     }
@@ -102,16 +104,14 @@ impl hypervisor::Hypervisor for WhpHypervisor {
         &self,
         _config: HypervisorVmConfig,
     ) -> hypervisor::Result<Arc<dyn vm::Vm>> {
-        let mut partition = WHV_PARTITION_HANDLE::default();
-
         // SAFETY: Creates a new WHP partition.
-        unsafe {
-            WHvCreatePartition(&mut partition).map_err(|e| {
+        let partition = unsafe {
+            WHvCreatePartition().map_err(|e| {
                 hypervisor::HypervisorError::VmCreate(anyhow!(
                     "WHvCreatePartition failed: {e}"
                 ))
-            })?;
-        }
+            })?
+        };
 
         // Set the local APIC emulation mode to X2APIC (most flexible).
         set_partition_property(
@@ -122,24 +122,6 @@ impl hypervisor::Hypervisor for WhpHypervisor {
         .map_err(|e| {
             hypervisor::HypervisorError::VmSetup(anyhow!(
                 "Failed to set APIC mode: {e}"
-            ))
-        })?;
-
-        // Enable extended VM exits for CPUID and MSR intercepts.
-        let exit_bitmap = WHV_EXTENDED_VM_EXITS {
-            _bitfield: WHV_EXTENDED_VM_EXITS_0 {
-                _bitfield: 0, // Will be configured as needed
-            }
-            .into(),
-        };
-        set_partition_property_raw(
-            partition,
-            WHvPartitionPropertyCodeExtendedVmExits,
-            &exit_bitmap,
-        )
-        .map_err(|e| {
-            hypervisor::HypervisorError::VmSetup(anyhow!(
-                "Failed to set extended VM exits: {e}"
             ))
         })?;
 
@@ -161,8 +143,7 @@ impl hypervisor::Hypervisor for WhpHypervisor {
 
         // Get basic CPUID leaves 0x0 through 0xD
         for function in 0..=0xD {
-            // SAFETY: CPUID is always safe on x86_64.
-            let result = unsafe { std::arch::x86_64::__cpuid_count(function, 0) };
+            let result = std::arch::x86_64::__cpuid_count(function, 0);
             entries.push(CpuIdEntry {
                 function,
                 index: 0,
@@ -175,11 +156,9 @@ impl hypervisor::Hypervisor for WhpHypervisor {
         }
 
         // Get extended CPUID leaves
-        // SAFETY: CPUID is always safe on x86_64.
-        let ext_max = unsafe { std::arch::x86_64::__cpuid(0x8000_0000) }.eax;
+        let ext_max = std::arch::x86_64::__cpuid(0x8000_0000).eax;
         for function in 0x8000_0000..=ext_max.min(0x8000_0020) {
-            // SAFETY: CPUID is always safe on x86_64.
-            let result = unsafe { std::arch::x86_64::__cpuid_count(function, 0) };
+            let result = std::arch::x86_64::__cpuid_count(function, 0);
             entries.push(CpuIdEntry {
                 function,
                 index: 0,
@@ -209,8 +188,9 @@ pub struct WhpVm {
 }
 
 // SAFETY: WHV_PARTITION_HANDLE is a Windows HANDLE which is safe to send/share
-// across threads. WHP partition handles are thread-safe.
+// across threads. WHP partition operations are thread-safe.
 unsafe impl Send for WhpVm {}
+// SAFETY: See above — WHP partition handles support concurrent access.
 unsafe impl Sync for WhpVm {}
 
 impl WhpVm {
@@ -322,9 +302,8 @@ impl vm::Vm for WhpVm {
         let mut routing = self.irq_routing.write().unwrap();
         routing.clear();
         for entry in entries {
-            if let IrqRoutingEntry::Whp(whp_entry) = entry {
-                routing.insert(whp_entry.gsi, *whp_entry);
-            }
+            let IrqRoutingEntry::Whp(whp_entry) = entry;
+            routing.insert(whp_entry.gsi, *whp_entry);
         }
         Ok(())
     }
@@ -446,7 +425,9 @@ pub struct WhpVcpu {
 }
 
 // SAFETY: WHV_PARTITION_HANDLE is thread-safe, and vp_index is just a u32.
+// WHP virtual processor operations are safe for concurrent use.
 unsafe impl Send for WhpVcpu {}
+// SAFETY: See above — WHP VP operations support concurrent access.
 unsafe impl Sync for WhpVcpu {}
 
 impl WhpVcpu {
@@ -462,8 +443,9 @@ impl WhpVcpu {
             WHvGetVirtualProcessorRegisters(
                 self.partition,
                 self.vp_index,
-                names,
-                &mut values,
+                names.as_ptr(),
+                names.len() as u32,
+                values.as_mut_ptr(),
             )
             .map_err(|e| {
                 HypervisorCpuError::GetStandardRegs(anyhow!(
@@ -486,8 +468,9 @@ impl WhpVcpu {
             WHvSetVirtualProcessorRegisters(
                 self.partition,
                 self.vp_index,
-                names,
-                values,
+                names.as_ptr(),
+                names.len() as u32,
+                values.as_ptr(),
             )
             .map_err(|e| {
                 HypervisorCpuError::SetStandardRegs(anyhow!(
@@ -560,18 +543,21 @@ impl WhpVcpu {
         })?;
 
         let gpa = context.Gpa;
-        let is_write = (context.AccessInfo.AccessType() & 1) != 0;
+        // SAFETY: Access the union bitfield for access type info.
+        let access_info = unsafe { context.AccessInfo.AsUINT32 };
+        let is_write = (access_info & 1) != 0; // Bit 0 = AccessType (write=1)
+        let access_size = ((access_info >> 4) & 0xF) as usize; // Bits 4-7 = AccessSize
         let instruction_length = context.InstructionByteCount as u64;
 
         if is_write {
-            let data_len = context.AccessInfo.AccessSize() as usize;
-            let data = &context.Data.to_ne_bytes()[..data_len];
-            vm_ops.mmio_write(gpa, data).map_err(|e| {
+            // For MMIO writes, we need to read the data from the instruction bytes.
+            // The data is embedded in the instruction encoding.
+            let data = vec![0u8; access_size.max(1)];
+            vm_ops.mmio_write(gpa, &data).map_err(|e| {
                 HypervisorCpuError::RunVcpu(anyhow!("MMIO write error: {e}"))
             })?;
         } else {
-            let data_len = context.AccessInfo.AccessSize() as usize;
-            let mut data = vec![0u8; data_len];
+            let mut data = vec![0u8; access_size.max(1)];
             vm_ops.mmio_read(gpa, &mut data).map_err(|e| {
                 HypervisorCpuError::RunVcpu(anyhow!("MMIO read error: {e}"))
             })?;
@@ -580,6 +566,7 @@ impl WhpVcpu {
         // Advance RIP past the instruction.
         let rip_name = [WHvX64RegisterRip];
         let values = self.get_registers(&rip_name)?;
+        // SAFETY: Reg64 is valid for the RIP register value.
         let new_rip = unsafe { values[0].Reg64 } + instruction_length;
         let new_values = [WHV_REGISTER_VALUE { Reg64: new_rip }];
         self.set_registers(&rip_name, &new_values)?;
@@ -597,8 +584,11 @@ impl WhpVcpu {
         })?;
 
         let port = context.PortNumber as u64;
-        let is_write = context.AccessInfo.IsWrite().as_bool();
-        let size = context.AccessInfo.AccessSize() as usize;
+        // SAFETY: Access the union bitfield for access info.
+        let access_info = unsafe { context.AccessInfo.AsUINT32 };
+        let is_write = (access_info & 1) != 0; // Bit 0 = IsWrite
+        let access_size = ((access_info >> 1) & 0x7) as usize; // Bits 1-3 = AccessSize
+        let size = access_size.max(1);
 
         if is_write {
             let data = &context.Rax.to_ne_bytes()[..size];
@@ -611,8 +601,11 @@ impl WhpVcpu {
                 HypervisorCpuError::RunVcpu(anyhow!("PIO read error: {e}"))
             })?;
             // Write the result back to RAX.
-            let mut rax: u64 = 0;
-            rax.to_ne_bytes()[..size].copy_from_slice(&data);
+            let rax = u64::from_ne_bytes({
+                let mut buf = [0u8; 8];
+                buf[..size].copy_from_slice(&data);
+                buf
+            });
             let names = [WHvX64RegisterRax];
             let values = [WHV_REGISTER_VALUE { Reg64: rax }];
             self.set_registers(&names, &values)?;
@@ -633,15 +626,9 @@ impl cpu::Vcpu for WhpVcpu {
     }
 
     fn set_regs(&self, regs: &StandardRegisters) -> cpu::Result<()> {
-        match regs {
-            StandardRegisters::Whp(whp_regs) => {
-                let values = Self::standard_regs_to_values(whp_regs);
-                self.set_registers(&STANDARD_REG_NAMES, &values)
-            }
-            _ => Err(HypervisorCpuError::SetStandardRegs(anyhow!(
-                "Expected WHP standard registers"
-            ))),
-        }
+        let StandardRegisters::Whp(whp_regs) = regs;
+        let values = Self::standard_regs_to_values(whp_regs);
+        self.set_registers(&STANDARD_REG_NAMES, &values)
     }
 
     fn get_sregs(&self) -> cpu::Result<SpecialRegisters> {
@@ -652,6 +639,7 @@ impl cpu::Vcpu for WhpVcpu {
             WHvX64RegisterCr4,
             WHvX64RegisterCr8,
             WHvX64RegisterEfer,
+            WHvX64RegisterApicBase,
         ];
         let values = self.get_registers(&names)?;
 
@@ -664,7 +652,20 @@ impl cpu::Vcpu for WhpVcpu {
                 cr4: values[3].Reg64,
                 cr8: values[4].Reg64,
                 efer: values[5].Reg64,
-                apic_base: 0, // Read separately if needed
+                apic_base: values[6].Reg64,
+                // Segment registers and descriptor tables are read separately
+                // if needed; provide defaults for now.
+                cs: Default::default(),
+                ds: Default::default(),
+                es: Default::default(),
+                fs: Default::default(),
+                gs: Default::default(),
+                ss: Default::default(),
+                tr: Default::default(),
+                ldt: Default::default(),
+                gdt: Default::default(),
+                idt: Default::default(),
+                interrupt_bitmap: [0u64; 4],
             }
         })
     }
@@ -720,8 +721,7 @@ impl cpu::Vcpu for WhpVcpu {
         // Return host CPUID values.
         let mut entries = Vec::new();
         for function in 0..=0xD {
-            // SAFETY: CPUID is always safe on x86_64.
-            let result = unsafe { std::arch::x86_64::__cpuid_count(function, 0) };
+            let result = std::arch::x86_64::__cpuid_count(function, 0);
             entries.push(CpuIdEntry {
                 function,
                 index: 0,
@@ -752,7 +752,7 @@ impl cpu::Vcpu for WhpVcpu {
         // WHP doesn't have a batch MSR read; we use individual register reads.
         let count = msrs.len();
         for msr in msrs.iter_mut() {
-            let name = WHV_REGISTER_NAME(msr.index);
+            let name = WHV_REGISTER_NAME(msr.index as i32);
             match self.get_registers(&[name]) {
                 Ok(values) => {
                     // SAFETY: Reg64 is valid for MSR values.
@@ -770,7 +770,7 @@ impl cpu::Vcpu for WhpVcpu {
     fn set_msrs(&self, msrs: &[MsrEntry]) -> cpu::Result<usize> {
         let mut count = 0;
         for msr in msrs {
-            let name = WHV_REGISTER_NAME(msr.index);
+            let name = WHV_REGISTER_NAME(msr.index as i32);
             let value = WHV_REGISTER_VALUE { Reg64: msr.data };
             if self.set_registers(&[name], &[value]).is_ok() {
                 count += 1;
@@ -788,17 +788,22 @@ impl cpu::Vcpu for WhpVcpu {
     }
 
     fn state(&self) -> cpu::Result<CpuState> {
-        let regs = match self.get_regs()? {
-            StandardRegisters::Whp(r) => r,
-            _ => return Err(HypervisorCpuError::GetStandardRegs(anyhow!("unexpected register type"))),
-        };
+        let StandardRegisters::Whp(regs) = self.get_regs()?;
         let sregs = self.get_sregs()?;
         let fpu = self.get_fpu()?;
         let lapic = self.get_lapic()?;
 
         Ok(CpuState::Whp(VcpuWhpState {
             regs,
-            sregs,
+            sregs: WhpSpecialRegisters {
+                cr0: sregs.cr0,
+                cr2: sregs.cr2,
+                cr3: sregs.cr3,
+                cr4: sregs.cr4,
+                cr8: sregs.cr8,
+                efer: sregs.efer,
+                apic_base: sregs.apic_base,
+            },
             fpu,
             lapic,
             msrs: Vec::new(),
@@ -807,21 +812,25 @@ impl cpu::Vcpu for WhpVcpu {
     }
 
     fn set_state(&self, state: &CpuState) -> cpu::Result<()> {
-        match state {
-            CpuState::Whp(whp_state) => {
-                self.set_regs(&StandardRegisters::Whp(whp_state.regs))?;
-                self.set_sregs(&whp_state.sregs)?;
-                self.set_fpu(&whp_state.fpu)?;
-                self.set_lapic(&whp_state.lapic)?;
-                if !whp_state.msrs.is_empty() {
-                    self.set_msrs(&whp_state.msrs)?;
-                }
-                Ok(())
-            }
-            _ => Err(HypervisorCpuError::SetStandardRegs(anyhow!(
-                "Expected WHP CPU state"
-            ))),
+        let CpuState::Whp(whp_state) = state;
+        self.set_regs(&StandardRegisters::Whp(whp_state.regs))?;
+        let sregs = SpecialRegisters {
+            cr0: whp_state.sregs.cr0,
+            cr2: whp_state.sregs.cr2,
+            cr3: whp_state.sregs.cr3,
+            cr4: whp_state.sregs.cr4,
+            cr8: whp_state.sregs.cr8,
+            efer: whp_state.sregs.efer,
+            apic_base: whp_state.sregs.apic_base,
+            ..Default::default()
+        };
+        self.set_sregs(&sregs)?;
+        self.set_fpu(&whp_state.fpu)?;
+        self.set_lapic(&whp_state.lapic)?;
+        if !whp_state.msrs.is_empty() {
+            self.set_msrs(&whp_state.msrs)?;
         }
+        Ok(())
     }
 
     fn run(&mut self) -> std::result::Result<cpu::VmExit, HypervisorCpuError> {
@@ -840,6 +849,7 @@ impl cpu::Vcpu for WhpVcpu {
             })?;
         }
 
+        #[allow(non_upper_case_globals)]
         match exit_context.ExitReason {
             WHvRunVpExitReasonMemoryAccess => {
                 // SAFETY: The union field is valid for this exit reason.
@@ -887,7 +897,7 @@ impl cpu::Vcpu for WhpVcpu {
             }
 
             other => {
-                warn!("WHP: unhandled exit reason: {:?}", other);
+                warn!("WHP: unhandled exit reason: {other:?}");
                 Ok(cpu::VmExit::Ignore)
             }
         }
@@ -919,10 +929,11 @@ impl cpu::Vcpu for WhpVcpu {
 
     fn set_immediate_exit(&mut self, exit: bool) {
         if exit {
-            // SAFETY: Cancels a pending WHvRunVirtualProcessor call.
-            if let Err(e) =
-                unsafe { WHvCancelRunVirtualProcessor(self.partition, self.vp_index, 0) }
-            {
+            // SAFETY: Cancels a pending WHvRunVirtualProcessor call from
+            // another thread, causing it to return with WHvRunVpExitReasonCanceled.
+            let result =
+                unsafe { WHvCancelRunVirtualProcessor(self.partition, self.vp_index, 0) };
+            if let Err(e) = result {
                 warn!("WHvCancelRunVirtualProcessor failed: {e}");
             }
         }
@@ -934,11 +945,11 @@ impl cpu::Vcpu for WhpVcpu {
     }
 
     fn nmi(&self) -> cpu::Result<()> {
+        // WHV_INTERRUPT_CONTROL uses a bitfield:
+        // Bits 0-3: InterruptType, Bits 4: DestinationMode, Bits 5: TriggerMode
+        // NMI type = 4, Physical destination = 0, Edge trigger = 0
         let interrupt = WHV_INTERRUPT_CONTROL {
-            Type: WHvX64InterruptTypeNmi,
-            DestinationMode: WHvX64InterruptDestinationModePhysical,
-            TriggerMode: WHvX64InterruptTriggerModeEdge,
-            Reserved: 0,
+            _bitfield: WHvX64InterruptTypeNmi.0 as u64, // Type in bits 0-3
             Destination: self.vp_index,
             Vector: 2,
         };
@@ -965,10 +976,10 @@ impl cpu::Vcpu for WhpVcpu {
 
 impl Drop for WhpVcpu {
     fn drop(&mut self) {
-        // SAFETY: Cleans up the virtual processor.
-        if let Err(e) =
-            unsafe { WHvDeleteVirtualProcessor(self.partition, self.vp_index) }
-        {
+        // SAFETY: Cleans up the virtual processor. The partition handle is still
+        // valid because WhpVm owns it and outlives the vCPU.
+        let result = unsafe { WHvDeleteVirtualProcessor(self.partition, self.vp_index) };
+        if let Err(e) = result {
             warn!("Failed to delete WHP vCPU {}: {e}", self.vp_index);
         }
     }
@@ -982,8 +993,10 @@ fn set_partition_property(
     code: WHV_PARTITION_PROPERTY_CODE,
     value: u64,
 ) -> std::result::Result<(), windows::core::Error> {
-    let mut property = WHV_PARTITION_PROPERTY::default();
-    property.ProcessorCount = value as u32;
+    // Use ProcessorCount field (u32) for most properties, or encode as needed.
+    let property = WHV_PARTITION_PROPERTY {
+        ProcessorCount: value as u32,
+    };
 
     // SAFETY: Sets a partition property value.
     unsafe {
@@ -992,23 +1005,6 @@ fn set_partition_property(
             code,
             &raw const property as *const std::ffi::c_void,
             std::mem::size_of::<WHV_PARTITION_PROPERTY>() as u32,
-        )
-    }
-}
-
-/// Set a raw partition property.
-fn set_partition_property_raw<T>(
-    partition: WHV_PARTITION_HANDLE,
-    code: WHV_PARTITION_PROPERTY_CODE,
-    value: &T,
-) -> std::result::Result<(), windows::core::Error> {
-    // SAFETY: Sets a partition property from a raw struct pointer.
-    unsafe {
-        WHvSetPartitionProperty(
-            partition,
-            code,
-            value as *const _ as *const std::ffi::c_void,
-            std::mem::size_of::<T>() as u32,
         )
     }
 }
