@@ -7,15 +7,12 @@
 use std::cmp::min;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
-use std::{mem, thread};
+use std::thread;
 
-// https://github.com/rust-lang/libc/issues/1848
-#[cfg_attr(target_env = "musl", allow(deprecated))]
-use libc::time_t;
-use libc::{CLOCK_REALTIME, clock_gettime, gmtime_r, timespec, tm};
 use log::{info, warn};
-use vm_device::BusDevice;
 use platform::EventFd;
+use platform::clock;
+use vm_device::BusDevice;
 
 const INDEX_MASK: u8 = 0x7f;
 const INDEX_OFFSET: u64 = 0x0;
@@ -110,40 +107,20 @@ impl BusDevice for Cmos {
         data[0] = match offset {
             INDEX_OFFSET => self.index,
             DATA_OFFSET => {
-                let seconds;
-                let minutes;
-                let hours;
-                let week_day;
-                let day;
-                let month;
-                let year;
-                // SAFETY: The clock_gettime and gmtime_r calls are safe as long as the structs they are
-                // given are large enough, and neither of them fail. It is safe to zero initialize
-                // the tm and timespec struct because it contains only plain data.
-                let update_in_progress = unsafe {
-                    let mut timespec: timespec = mem::zeroed();
-                    clock_gettime(CLOCK_REALTIME, &mut timespec as *mut _);
+                let utc = clock::get_utc_time();
+                let seconds = utc.sec;
+                let minutes = utc.min;
+                let hours = utc.hour;
+                let week_day = utc.wday + 1;
+                let day = utc.mday;
+                let month = utc.mon + 1;
+                let year = utc.year;
 
-                    // https://github.com/rust-lang/libc/issues/1848
-                    #[cfg_attr(target_env = "musl", allow(deprecated))]
-                    let now: time_t = timespec.tv_sec;
-                    let mut tm: tm = mem::zeroed();
-                    gmtime_r(&now, &mut tm as *mut _);
-
-                    // The following lines of code are safe but depend on tm being in scope.
-                    seconds = tm.tm_sec;
-                    minutes = tm.tm_min;
-                    hours = tm.tm_hour;
-                    week_day = tm.tm_wday + 1;
-                    day = tm.tm_mday;
-                    month = tm.tm_mon + 1;
-                    year = tm.tm_year;
-
-                    // Update in Progress bit held for last 224us of each second
-                    const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
-                    const UIP_HOLD_LENGTH: i64 = 8 * NANOSECONDS_PER_SECOND / 32768;
-                    timespec.tv_nsec >= (NANOSECONDS_PER_SECOND - UIP_HOLD_LENGTH)
-                };
+                // Update in Progress bit held for last 224us of each second
+                const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
+                const UIP_HOLD_LENGTH: i64 = 8 * NANOSECONDS_PER_SECOND / 32768;
+                let update_in_progress =
+                    utc.nsec >= (NANOSECONDS_PER_SECOND - UIP_HOLD_LENGTH);
                 match self.index {
                     0x00 => to_bcd(seconds as u8),
                     0x02 => to_bcd(minutes as u8),

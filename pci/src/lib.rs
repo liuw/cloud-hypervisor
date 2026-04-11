@@ -9,10 +9,13 @@
 mod bus;
 mod configuration;
 mod device;
+#[cfg(unix)]
 mod mmap;
 mod msi;
 mod msix;
+#[cfg(unix)]
 mod vfio;
+#[cfg(unix)]
 mod vfio_user;
 
 use std::fmt::{self, Debug, Display};
@@ -36,7 +39,9 @@ pub use self::msix::{
     MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MaybeMutInterruptSourceGroup, MsixCap, MsixConfig,
     MsixTableEntry,
 };
+#[cfg(unix)]
 pub use self::vfio::{MmioRegion, VfioDmaMapping, VfioPciDevice, VfioPciError};
+#[cfg(unix)]
 pub use self::vfio_user::{VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError};
 
 /// PCI has four interrupt pins A->D.

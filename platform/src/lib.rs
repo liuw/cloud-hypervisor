@@ -10,6 +10,7 @@
 // - `terminal`: Terminal state save/restore and raw mode
 
 mod event_fd;
+pub mod clock;
 pub mod signal;
 pub mod terminal;
 

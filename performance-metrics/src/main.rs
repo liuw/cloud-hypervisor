@@ -4,6 +4,7 @@
 //
 
 // Custom harness to run performance tests
+#[cfg(unix)]
 mod micro_bench_block;
 mod performance_tests;
 mod util;

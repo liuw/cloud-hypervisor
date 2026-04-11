@@ -23,8 +23,7 @@ pub mod legacy;
 #[cfg(feature = "pvmemcontrol")]
 pub mod pvmemcontrol;
 pub mod pvpanic;
-// TODO: TPM is not yet supported
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(all(not(target_arch = "riscv64"), unix))]
 pub mod tpm;
 
 use bitflags::bitflags;

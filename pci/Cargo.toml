@@ -19,9 +19,6 @@ log = { workspace = true }
 platform = { path = "../platform" }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
-vfio-bindings = { workspace = true, features = ["fam-wrappers"] }
-vfio-ioctls = { workspace = true, default-features = false }
-vfio_user = { workspace = true }
 vm-allocator = { path = "../vm-allocator" }
 vm-device = { path = "../vm-device" }
 vm-memory = { workspace = true, features = [
@@ -31,6 +28,11 @@ vm-memory = { workspace = true, features = [
 
 ] }
 vm-migration = { path = "../vm-migration" }
+
+[target.'cfg(unix)'.dependencies]
+vfio-bindings = { workspace = true, features = ["fam-wrappers"] }
+vfio-ioctls = { workspace = true, default-features = false }
+vfio_user = { workspace = true }
 vmm-sys-util = { workspace = true }
 
 [lints]
