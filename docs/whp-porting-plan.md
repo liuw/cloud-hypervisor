@@ -13,8 +13,14 @@ Cloud-hypervisor currently supports two hypervisor backends — KVM (Linux) and 
 **Phase 1: COMPLETE** ✓  
 - WHP backend compiles and passes clippy on Windows x86_64  
 - `cargo clippy -p hypervisor --features whp` — zero errors, zero warnings  
-- `cargo clippy -p hypervisor` (no features) — zero errors, zero warnings  
 - Key changes across 2 commits, ~1100 lines of new WHP code
+
+**Phase 2: IN PROGRESS** (event + signal + terminal)  
+- Created `platform` crate with cross-platform EventFd, signal handler, and terminal I/O  
+- Migrated all 66 source files from `vmm_sys_util::eventfd::EventFd` to `platform::EventFd`  
+- Migrated 18 files from `libc::EFD_NONBLOCK` to `platform::EFD_NONBLOCK`  
+- Added `platform` dependency to 12 crates  
+- Remaining: IPC abstraction, memory abstraction (lower priority)
 
 ## Approach
 
