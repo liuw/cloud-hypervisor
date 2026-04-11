@@ -13,6 +13,7 @@ mod event_fd;
 pub mod clock;
 pub mod signal;
 pub mod terminal;
+pub mod timer;
 
 pub use event_fd::EventFd;
 

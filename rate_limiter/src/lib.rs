@@ -36,7 +36,7 @@
 //!
 //! ## Limitations
 //!
-//! This rate limiter implementation relies on the *Linux kernel's timerfd* so its
+//! This rate limiter implementation relies on the *Linux kernel's Timer* so its
 //! usage is limited to Linux systems.
 //!
 //! Another particularity of this implementation is that it is not self-driving.
@@ -45,16 +45,18 @@
 //! needs to be called by the user on every event on the rate limiter's `AsRawFd` FD.
 
 use std::io;
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use log::error;
+use platform::timer::Timer;
 use thiserror::Error;
-use vmm_sys_util::timerfd::TimerFd;
 
 /// Module for group rate limiting.
+#[cfg(unix)]
 pub mod group;
 
 #[derive(Error, Debug)]
@@ -63,7 +65,7 @@ pub enum Error {
     /// The event handler was called spuriously.
     #[error("Event handler was called spuriously: {0}")]
     SpuriousRateLimiterEvent(&'static str),
-    /// The event handler encounters while TimerFd::wait()
+    /// The event handler encounters while Timer::wait()
     #[error("Failed to wait for the timer")]
     TimerFdWaitError(#[source] std::io::Error),
 }
@@ -267,7 +269,7 @@ pub enum BucketUpdate {
 ///
 /// Bandwidth (bytes/s) and ops/s limiting can be used at the same time or individually.
 ///
-/// Implementation uses a single timer through TimerFd to refresh either or
+/// Implementation uses a single timer through Timer to refresh either or
 /// both token buckets.
 ///
 /// Its internal buckets are 'passively' replenished as they're being used (as
@@ -289,16 +291,16 @@ struct RateLimiterInner {
     bandwidth: Option<TokenBucket>,
     ops: Option<TokenBucket>,
 
-    timer_fd: TimerFd,
+    timer: Timer,
 }
 
 impl RateLimiterInner {
     // Arm the timer of the rate limiter with the provided `Duration` (which will fire only once).
     fn activate_timer(&mut self, dur: Duration, flag: &AtomicBool) {
-        // Panic when failing to arm the timer (same handling in crate TimerFd::set_state())
-        self.timer_fd
-            .reset(dur, None)
-            .expect("Can't arm the timer (unexpected 'timerfd_settime' failure).");
+        // Panic when failing to arm the timer
+        self.timer
+            .reset(dur, Duration::ZERO)
+            .expect("Can't arm the timer (unexpected failure).");
         flag.store(true, Ordering::Relaxed);
     }
 }
@@ -324,7 +326,7 @@ impl RateLimiter {
     ///
     /// # Errors
     ///
-    /// If the timerfd creation fails, an error is returned.
+    /// If the Timer creation fails, an error is returned.
     pub fn new(
         bytes_total_capacity: u64,
         bytes_one_time_burst: u64,
@@ -345,28 +347,31 @@ impl RateLimiter {
             ops_complete_refill_time_ms,
         );
 
-        // We'll need a timer_fd, even if our current config effectively disables rate limiting,
+        // We'll need a timer, even if our current config effectively disables rate limiting,
         // because `Self::update_buckets()` might re-enable it later, and we might be
-        // seccomp-blocked from creating the timer_fd at that time.
-        let timer_fd = TimerFd::new()?;
-        // Note: vmm_sys_util::TimerFd::new() open the fd w/o O_NONBLOCK. We manually add this flag
-        // so that `Self::event_handler` won't be blocked with `vmm_sys_util::TimerFd::wait()`.
-        // SAFETY: FFI calls.
-        let ret = unsafe {
-            let fd = timer_fd.as_raw_fd();
-            let mut flags = libc::fcntl(fd, libc::F_GETFL);
-            flags |= libc::O_NONBLOCK;
-            libc::fcntl(fd, libc::F_SETFL, flags)
-        };
-        if ret < 0 {
-            return Err(std::io::Error::last_os_error());
+        // seccomp-blocked from creating the timer at that time.
+        let timer = Timer::new()?;
+        // Set the timer fd to non-blocking on Unix so that event_handler
+        // won't block on Timer::wait().
+        #[cfg(unix)]
+        {
+            // SAFETY: FFI calls to set O_NONBLOCK on the timer fd.
+            let ret = unsafe {
+                let fd = timer.as_raw_fd();
+                let mut flags = libc::fcntl(fd, libc::F_GETFL);
+                flags |= libc::O_NONBLOCK;
+                libc::fcntl(fd, libc::F_SETFL, flags)
+            };
+            if ret < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
 
         Ok(RateLimiter {
             inner: Mutex::new(RateLimiterInner {
                 bandwidth: bytes_token_bucket,
                 ops: ops_token_bucket,
-                timer_fd,
+                timer,
             }),
             timer_active: AtomicBool::new(false),
         })
@@ -460,8 +465,8 @@ impl RateLimiter {
         let mut guard = self.inner.lock().unwrap();
         loop {
             // Note: As we manually added the `O_NONBLOCK` flag to the FD, the following
-            // `timer_fd::wait()` won't block (which is different from its default behavior.)
-            match guard.timer_fd.wait() {
+            // `timer::wait()` won't block (which is different from its default behavior.)
+            match guard.timer.wait() {
                 Err(e) => {
                     let err: std::io::Error = e.into();
                     match err.kind() {
@@ -499,6 +504,7 @@ impl RateLimiter {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for RateLimiter {
     /// Provides a FD which needs to be monitored for POLLIN events.
     ///
@@ -508,14 +514,14 @@ impl AsRawFd for RateLimiter {
     /// token types.
     fn as_raw_fd(&self) -> RawFd {
         let guard = self.inner.lock().unwrap();
-        guard.timer_fd.as_raw_fd()
+        guard.timer.as_raw_fd()
     }
 }
 
 impl Default for RateLimiter {
     /// Default RateLimiter is a no-op limiter with infinite budget.
     fn default() -> Self {
-        // Safe to unwrap since this will not attempt to create timer_fd.
+        // Safe to unwrap since this will not attempt to create timer.
         RateLimiter::new(0, 0, 0, 0, 0, 0).expect("Failed to build default RateLimiter")
     }
 }
@@ -739,7 +745,7 @@ pub(crate) mod unit_tests {
         assert!(l.is_blocked());
         // wait the other half of the timer period
         thread::sleep(Duration::from_millis(REFILL_TIMER_INTERVAL_MS / 2));
-        // the timer_fd should have an event on it by now
+        // the timer should have an event on it by now
         l.event_handler().unwrap();
         // limiter should now be unblocked
         assert!(!l.is_blocked());
@@ -772,7 +778,7 @@ pub(crate) mod unit_tests {
         assert!(l.is_blocked());
         // wait the other half of the timer period
         thread::sleep(Duration::from_millis(REFILL_TIMER_INTERVAL_MS / 2));
-        // the timer_fd should have an event on it by now
+        // the timer should have an event on it by now
         l.event_handler().unwrap();
         // limiter should now be unblocked
         assert!(!l.is_blocked());
@@ -806,7 +812,7 @@ pub(crate) mod unit_tests {
         assert!(l.is_blocked());
         // wait the other half of the timer period
         thread::sleep(Duration::from_millis(REFILL_TIMER_INTERVAL_MS / 2));
-        // the timer_fd should have an event on it by now
+        // the timer should have an event on it by now
         l.event_handler().unwrap();
         // limiter should now be unblocked
         assert!(!l.is_blocked());
