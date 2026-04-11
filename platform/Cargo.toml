@@ -1,0 +1,25 @@
+[package]
+authors = ["The Cloud Hypervisor Authors"]
+edition.workspace = true
+name = "platform"
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+libc = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = { workspace = true }
+vmm-sys-util = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Console",
+  "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

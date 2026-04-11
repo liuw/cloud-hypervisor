@@ -26,6 +26,7 @@ members = [
   "option_parser",
   "pci",
   "performance-metrics",
+  "platform",
   "rate_limiter",
   "serial_buffer",
   "test_infra",
