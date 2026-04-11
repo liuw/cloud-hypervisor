@@ -14,8 +14,39 @@ Cloud-hypervisor currently supports two hypervisor backends — KVM (Linux) and 
 
 - 20 of 20 workspace crates compile on Windows x86_64
 - Binary builds, runs, and executes guest code via WHP
-- Guest payload prints "Hi!" to virtual serial port and exits cleanly
+- Kernel loading framework (bzImage parser + flat binary loader)
+- Guest payload prints to virtual serial port and exits cleanly
 - Full guest lifecycle: create VM → map memory → load code → run vCPU → PIO exits → shutdown
+
+### Phase 6.2 — Performance notes
+
+The WHP backend has higher per-exit overhead than KVM/MSHV because:
+- Register access requires explicit `WHvGet/SetVirtualProcessorRegisters` calls
+- RIP advancement after I/O exits is done in userspace (no kernel irqfd/ioevent)
+- Each PIO exit requires a register read + register write for RIP
+
+For the demo payload (4 serial writes + 1 shutdown write = 5 PIO exits),
+execution completes in <1ms wall time. Production workloads with frequent
+I/O will benefit from batching register operations.
+
+### Phase 6.3 — Feature parity assessment
+
+| Feature | Linux (KVM/MSHV) | Windows (WHP) | Notes |
+|---------|:---:|:---:|-------|
+| VM creation | ✅ | ✅ | |
+| Memory mapping | ✅ | ✅ | |
+| vCPU execution | ✅ | ✅ | Real mode works; protected mode needs GDT register investigation |
+| PIO handling | ✅ | ✅ | |
+| MMIO handling | ✅ | ⚠️ | Framework in place, not tested |
+| Serial console | ✅ | ✅ | Port 0x3F8 I/O works |
+| Kernel loading | ✅ | ⚠️ | bzImage parser present; protected mode entry blocked by GDT reg write issue |
+| virtio devices | ✅ | ❌ | Needs Windows event loop (epoll replacement) |
+| Networking | ✅ | ❌ | Needs Windows TAP/vSwitch |
+| Block I/O | ✅ | ❌ | Needs Windows overlapped I/O |
+| Live migration | ✅ | ❌ | Needs state save/restore + networking |
+| Device hotplug | ✅ | ❌ | Needs VMM event loop |
+| VFIO passthrough | ✅ | ❌ | No Windows equivalent |
+| Seccomp/Landlock | ✅ | ❌ | Linux-only security features |
 
 ## Approach
 
