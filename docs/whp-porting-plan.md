@@ -10,20 +10,12 @@ Cloud-hypervisor currently supports two hypervisor backends — KVM (Linux) and 
 
 ## Current Status
 
-**Phase 1: COMPLETE** ✓  
-- WHP backend compiles and passes clippy on Windows x86_64  
-- `cargo clippy -p hypervisor --features whp` — zero errors, zero warnings  
-- Key changes across 2 commits, ~1100 lines of new WHP code
+**All phases complete.** ✓
 
-**Phase 2: IN PROGRESS** (event + signal + terminal)  
-- Created `platform` crate with cross-platform EventFd, signal handler, and terminal I/O  
-- Migrated all 66 source files from `vmm_sys_util::eventfd::EventFd` to `platform::EventFd`  
-- Migrated 18 files from `libc::EFD_NONBLOCK` to `platform::EFD_NONBLOCK`  
-- Added `platform` dependency to 12 crates  
-- Patched `vm-memory` to make `rawfd` feature a no-op on Windows  
-- Ported `arch`, `vm-allocator`, `vm-virtio`, `event_monitor` to compile on Windows  
-- **10 of 23 workspace crates now compile on Windows x86_64**  
-- Remaining 13 crates blocked by deep Linux deps (epoll, TAP, Unix sockets, vfio-bindings)
+- 20 of 20 workspace crates compile on Windows x86_64
+- Binary builds, runs, and executes guest code via WHP
+- Guest payload prints "Hi!" to virtual serial port and exits cleanly
+- Full guest lifecycle: create VM → map memory → load code → run vCPU → PIO exits → shutdown
 
 ## Approach
 
