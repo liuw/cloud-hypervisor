@@ -27,7 +27,7 @@ use vm_memory::{
 };
 use vm_migration::protocol::{Command, MemoryRangeTable, Request, Response};
 use vm_migration::{MigratableError, Snapshot};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::sync_utils::Gate;
 use crate::{GuestMemoryMmap, VmMigrationConfig};

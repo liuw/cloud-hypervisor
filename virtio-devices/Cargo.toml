@@ -23,6 +23,7 @@ log = { workspace = true }
 mshv-ioctls = { workspace = true, optional = true }
 net_util = { path = "../net_util" }
 pci = { path = "../pci" }
+platform = { path = "../platform" }
 rate_limiter = { path = "../rate_limiter" }
 seccompiler = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

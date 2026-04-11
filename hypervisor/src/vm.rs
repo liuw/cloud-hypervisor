@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use igvm_defs::IGVM_VHS_SNP_ID_BLOCK;
 use thiserror::Error;
 #[cfg(unix)]
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 #[cfg(target_arch = "x86_64")]
 use crate::ClockData;

@@ -119,7 +119,7 @@ use vm_migration::{
     snapshot_from_id, state_from_id,
 };
 use vm_virtio::{AccessPlatform, VirtioDeviceType};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo, ConsoleTransport};
 use crate::cpu::{CPU_MANAGER_ACPI_SIZE, CpuManager};

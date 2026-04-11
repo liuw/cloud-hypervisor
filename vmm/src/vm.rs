@@ -73,7 +73,7 @@ use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, snapshot_from_id,
 };
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::config::{MemoryRestoreMode, ValidationError, add_to_config};

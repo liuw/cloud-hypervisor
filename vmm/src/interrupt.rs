@@ -14,7 +14,7 @@ use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptSourceConfig, InterruptSourceGroup,
     LegacyIrqGroupConfig, MsiIrqGroupConfig,
 };
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 /// Reuse std::io::Result to simplify interoperability among crates.
 type Result<T> = std::io::Result<T>;
@@ -29,7 +29,7 @@ impl InterruptRoute {
     fn new() -> Result<Self> {
         // The irq_fd must be created eagerly because external components
         // (say, VFIO) need the fd at device initialization time via notifier().
-        Self::new_with_fd(Some(EventFd::new(libc::EFD_NONBLOCK)?))
+        Self::new_with_fd(Some(EventFd::new(platform::EFD_NONBLOCK)?))
     }
 
     fn new_with_fd(irq_fd: Option<EventFd>) -> Result<Self> {

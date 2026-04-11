@@ -12,7 +12,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use libc::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
 use log::warn;
 use vmm_sys_util::aio;
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFileError};
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
@@ -104,7 +104,7 @@ pub struct RawFileAsyncAio {
 impl RawFileAsyncAio {
     pub fn new(fd: RawFd, queue_depth: u32) -> BlockResult<Self> {
         let eventfd =
-            EventFd::new(libc::EFD_NONBLOCK).map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
+            EventFd::new(platform::EFD_NONBLOCK).map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
         let ctx =
             aio::IoContext::new(queue_depth).map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
 

@@ -34,7 +34,7 @@ use vm_memory::{
     GuestMemoryError, GuestMemoryRegion,
 };
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;

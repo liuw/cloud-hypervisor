@@ -16,6 +16,7 @@ byteorder = { workspace = true }
 hypervisor = { path = "../hypervisor" }
 libc = { workspace = true }
 log = { workspace = true }
+platform = { path = "../platform" }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 vfio-bindings = { workspace = true, features = ["fam-wrappers"] }

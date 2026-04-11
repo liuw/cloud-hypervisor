@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use anyhow::anyhow;
-use libc::EFD_NONBLOCK;
+use platform::EFD_NONBLOCK;
 use log::{error, info};
 use pci::{
     BarReprogrammingParams, MaybeMutInterruptSourceGroup, MsixCap, MsixConfig, PciBarConfiguration,
@@ -34,7 +34,7 @@ use vm_device::{BusDevice, PciBarType, Resource};
 use vm_memory::{Address, ByteValued, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, Le32};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use super::pci_common_config::VirtioPciCommonConfigState;
 use crate::transport::{VIRTIO_PCI_COMMON_CONFIG_ID, VirtioPciCommonConfig, VirtioTransport};

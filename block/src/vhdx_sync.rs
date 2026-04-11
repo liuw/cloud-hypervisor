@@ -7,7 +7,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFileError};
 use crate::error::{BlockError, BlockErrorKind, BlockResult, ErrorOp};
@@ -102,7 +102,7 @@ impl VhdxSync {
     pub fn new(vhdx_file: Arc<Mutex<Vhdx>>) -> Self {
         VhdxSync {
             vhdx_file,
-            eventfd: EventFd::new(libc::EFD_NONBLOCK)
+            eventfd: EventFd::new(platform::EFD_NONBLOCK)
                 .expect("Failed creating EventFd for VhdxSync"),
             completion_list: VecDeque::new(),
         }

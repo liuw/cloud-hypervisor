@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 
 use log::error;
 use seccompiler::{SeccompAction, apply_filter};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::ActivateError;
 use crate::epoll_helper::EpollHelperError;

@@ -15,7 +15,7 @@ use vm_device::interrupt::{
 };
 use vm_memory::address::Address;
 use vm_migration::{Migratable, Pausable, Snapshottable, Transportable};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use super::interrupt_controller::{Error, InterruptController};
 

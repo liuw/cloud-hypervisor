@@ -21,7 +21,7 @@ use virtio_bindings::virtio_blk::{
 use vm_memory::{ByteValued, GuestMemoryAtomic};
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use super::super::{ActivateResult, VirtioCommon, VirtioDevice, VirtioDeviceType};
 use super::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};

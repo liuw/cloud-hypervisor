@@ -6,7 +6,7 @@
 use std::{io, result};
 
 use thiserror::Error;
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 #[derive(Debug, Error)]
 pub enum Error {

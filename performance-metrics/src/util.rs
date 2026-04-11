@@ -8,7 +8,7 @@ use std::io::ErrorKind;
 use std::thread;
 use std::time::Duration;
 
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 use vmm_sys_util::tempfile::TempFile;
 
 pub const BLOCK_SIZE: u64 = 4096;

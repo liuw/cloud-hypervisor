@@ -14,7 +14,7 @@ use std::{env, io};
 
 use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
 use event_monitor::event;
-use libc::EFD_NONBLOCK;
+use platform::EFD_NONBLOCK;
 use log::{LevelFilter, error, info, warn};
 use option_parser::OptionParser;
 use seccompiler::SeccompAction;
@@ -36,7 +36,7 @@ use vmm::vm_config::{
     NetConfig, NumaConfig, PciSegmentConfig, PlatformConfig, PmemConfig, RateLimiterGroupConfig,
     TpmConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 use vmm_sys_util::signal::block_signal;
 
 #[cfg(feature = "dhat-heap")]

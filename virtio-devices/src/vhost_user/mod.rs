@@ -22,7 +22,7 @@ use vm_memory::mmap::MmapRegionError;
 use vm_memory::{Address, GuestAddressSpace, GuestMemory, GuestMemoryAtomic};
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{MigratableError, Snapshot};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 use vu_common_ctrl::VhostUserHandle;
 
 use crate::{

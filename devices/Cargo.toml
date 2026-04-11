@@ -23,6 +23,7 @@ linux-loader = { workspace = true, features = [
 log = { workspace = true }
 num_enum = "0.7.6"
 pci = { path = "../pci" }
+platform = { path = "../platform" }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tpm = { path = "../tpm" }

@@ -22,7 +22,7 @@ use vm_device::interrupt::{
 };
 use vm_memory::GuestAddress;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use super::interrupt_controller::{Error, InterruptController};
 

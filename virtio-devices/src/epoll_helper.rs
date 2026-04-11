@@ -16,7 +16,7 @@ use std::thread;
 
 use log::info;
 use thiserror::Error;
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 pub struct EpollHelper {
     pause_evt: EventFd,

@@ -326,7 +326,7 @@ impl Migratable for Gpio {}
 #[cfg(test)]
 mod unit_tests {
     use vm_device::interrupt::{InterruptIndex, InterruptSourceConfig};
-    use vmm_sys_util::eventfd::EventFd;
+    use platform::EventFd;
 
     use super::*;
 
@@ -369,7 +369,7 @@ mod unit_tests {
 
     #[test]
     fn test_gpio_read_write_and_event() {
-        let intr_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let intr_evt = EventFd::new(platform::EFD_NONBLOCK).unwrap();
         let mut gpio = Gpio::new(
             String::from(GPIO_NAME),
             Arc::new(TestInterrupt::new(intr_evt.try_clone().unwrap())),

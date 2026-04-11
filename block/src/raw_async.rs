@@ -9,7 +9,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use io_uring::{IoUring, opcode, types};
 use libc::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
 use log::warn;
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFileError};
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
@@ -104,7 +104,7 @@ pub struct RawFileAsync {
 impl RawFileAsync {
     pub fn new(fd: RawFd, ring_depth: u32) -> std::io::Result<Self> {
         let io_uring = IoUring::new(ring_depth)?;
-        let eventfd = EventFd::new(libc::EFD_NONBLOCK)?;
+        let eventfd = EventFd::new(platform::EFD_NONBLOCK)?;
 
         // Register the io_uring eventfd that will notify when something in
         // the completion queue is ready.

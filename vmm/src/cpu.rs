@@ -77,7 +77,7 @@ use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
     snapshot_from_id,
 };
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 use vmm_sys_util::signal::{SIGRTMIN, register_signal_handler};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 

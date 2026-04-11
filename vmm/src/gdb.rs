@@ -138,8 +138,8 @@ pub enum GdbResponsePayload {
 
 pub struct GdbStub {
     gdb_sender: mpsc::Sender<GdbRequest>,
-    gdb_event: vmm_sys_util::eventfd::EventFd,
-    vm_event: vmm_sys_util::eventfd::EventFd,
+    gdb_event: platform::EventFd,
+    vm_event: platform::EventFd,
     hw_breakpoints: Vec<GuestAddress>,
     single_step: bool,
 }
@@ -147,8 +147,8 @@ pub struct GdbStub {
 impl GdbStub {
     pub fn new(
         gdb_sender: mpsc::Sender<GdbRequest>,
-        gdb_event: vmm_sys_util::eventfd::EventFd,
-        vm_event: vmm_sys_util::eventfd::EventFd,
+        gdb_event: platform::EventFd,
+        vm_event: platform::EventFd,
         hw_breakpoints: usize,
     ) -> Self {
         Self {

@@ -46,7 +46,7 @@ use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
     UffdError,
 };
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::config::MemoryRestoreMode;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -923,7 +923,7 @@ impl MemoryManager {
             file_offset
         );
 
-        let stop_event = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFdFail)?;
+        let stop_event = EventFd::new(platform::EFD_NONBLOCK).map_err(Error::EventFdFail)?;
         let thread_stop_event = stop_event.try_clone().map_err(Error::EventFdFail)?;
         let thread_exit_evt = exit_evt.try_clone().map_err(Error::EventFdFail)?;
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);

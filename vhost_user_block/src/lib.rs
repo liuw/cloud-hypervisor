@@ -21,7 +21,7 @@ use std::{convert, io, process, result};
 
 use block::qcow::{self, ImageType, QcowFile};
 use block::{Request, VirtioBlockConfig, build_serial};
-use libc::EFD_NONBLOCK;
+use platform::EFD_NONBLOCK;
 use log::{debug, error, info, warn};
 use option_parser::{OptionParser, OptionParserError, Toggle};
 use thiserror::Error;
@@ -36,7 +36,7 @@ use virtio_queue::QueueT;
 use vm_memory::{ByteValued, Bytes, GuestAddressSpace, GuestMemoryAtomic};
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::event::{EventConsumer, EventNotifier};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<BitmapMmapRegion>;
 

@@ -61,7 +61,7 @@ use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryLoadGuard,
 };
 use vm_virtio::{AccessPlatform, Translatable};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 use vmm_sys_util::{aio, ioctl_io_nr, ioctl_ior_nr};
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};

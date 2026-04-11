@@ -38,7 +38,7 @@ use std::fs::File;
 use std::sync::mpsc::Sender;
 
 use micro_http::{Body, Method, Request, Response, StatusCode, Version};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::api::VmCoredump;

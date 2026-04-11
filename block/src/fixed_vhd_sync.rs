@@ -5,7 +5,7 @@
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFileError};
 use crate::error::{BlockError, BlockErrorKind, BlockResult, ErrorOp};

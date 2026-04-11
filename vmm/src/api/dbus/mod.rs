@@ -12,7 +12,7 @@ use futures::{FutureExt, executor};
 use hypervisor::HypervisorType;
 use log::{error, warn};
 use seccompiler::{SeccompAction, apply_filter};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 use zbus::connection::Builder;
 use zbus::fdo::{self, Result};
 use zbus::interface;

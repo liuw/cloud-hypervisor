@@ -330,6 +330,7 @@ dependencies = [
  "io-uring",
  "libc",
  "log",
+ "platform",
  "remain",
  "serde",
  "smallvec",
@@ -443,6 +444,7 @@ dependencies = [
  "log",
  "net_util",
  "option_parser",
+ "platform",
  "seccompiler",
  "serde_json",
  "signal-hook",
@@ -572,6 +574,7 @@ dependencies = [
  "log",
  "num_enum",
  "pci",
+ "platform",
  "serde",
  "thiserror",
  "tpm",
@@ -1013,6 +1016,7 @@ dependencies = [
  "mshv-bindings",
  "mshv-ioctls",
  "open-enum",
+ "platform",
  "serde",
  "serde_json",
  "serde_with",
@@ -1566,6 +1570,7 @@ dependencies = [
  "hypervisor",
  "libc",
  "log",
+ "platform",
  "serde",
  "thiserror",
  "vfio-bindings",
@@ -1586,6 +1591,7 @@ dependencies = [
  "clap",
  "dirs",
  "libc",
+ "platform",
  "serde",
  "serde_json",
  "test_infra",
@@ -1615,6 +1621,17 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+
+[[package]]
+name = "platform"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "signal-hook",
+ "vmm-sys-util",
+ "windows",
+]
 
 [[package]]
 name = "pnet"
@@ -1815,6 +1832,7 @@ dependencies = [
  "epoll",
  "libc",
  "log",
+ "platform",
  "thiserror",
  "vmm-sys-util",
 ]
@@ -2379,6 +2397,7 @@ dependencies = [
  "libc",
  "log",
  "option_parser",
+ "platform",
  "thiserror",
  "vhost",
  "vhost-user-backend",
@@ -2399,6 +2418,7 @@ dependencies = [
  "log",
  "net_util",
  "option_parser",
+ "platform",
  "thiserror",
  "vhost",
  "vhost-user-backend",
@@ -2428,6 +2448,7 @@ dependencies = [
  "mshv-ioctls",
  "net_util",
  "pci",
+ "platform",
  "rate_limiter",
  "seccompiler",
  "serde",
@@ -2472,6 +2493,7 @@ name = "vm-device"
 version = "0.1.0"
 dependencies = [
  "hypervisor",
+ "platform",
  "serde",
  "thiserror",
  "vfio-ioctls",
@@ -2551,6 +2573,7 @@ dependencies = [
  "net_util",
  "option_parser",
  "pci",
+ "platform",
  "range_map_vec",
  "rate_limiter",
  "seccompiler",

@@ -13,14 +13,14 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use libc::EFD_NONBLOCK;
+use platform::EFD_NONBLOCK;
 use log::{error, info, warn};
 use virtio_queue::Queue;
 use vm_device::UserspaceMapping;
 use vm_memory::{GuestAddress, GuestMemoryAtomic};
 use vm_migration::{MigratableError, Pausable};
 use vm_virtio::{AccessPlatform, VirtioDeviceType};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::{
     ActivateError, ActivateResult, Error, GuestMemoryMmap, GuestRegionMmap, MmapRegion,

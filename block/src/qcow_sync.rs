@@ -9,7 +9,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::{fmt, io, ptr, slice};
 
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 use vmm_sys_util::write_zeroes::{PunchHole, WriteZeroesAt};
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFileError};
@@ -315,7 +315,7 @@ impl QcowSync {
             data_file,
             backing_file,
             sparse,
-            eventfd: EventFd::new(libc::EFD_NONBLOCK)
+            eventfd: EventFd::new(platform::EFD_NONBLOCK)
                 .expect("Failed creating EventFd for QcowSync"),
             completion_list: VecDeque::new(),
         }

@@ -61,7 +61,7 @@ use std::io::{Error, ErrorKind};
 use std::sync::{Arc, Mutex};
 
 pub use hypervisor::{InterruptSourceConfig, LegacyIrqSourceConfig, MsiIrqSourceConfig};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 /// Reuse std::io::Result to simplify interoperability among crates.
 pub type Result<T> = std::io::Result<T>;

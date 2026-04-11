@@ -19,11 +19,11 @@ use std::{io, result, thread};
 use devices::legacy::Pl011;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 use devices::legacy::Serial;
-use libc::EFD_NONBLOCK;
+use platform::EFD_NONBLOCK;
 use log::{error, info, warn};
 use serial_buffer::SerialBuffer;
 use thiserror::Error;
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::console_devices::ConsoleTransport;
 

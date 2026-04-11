@@ -12,6 +12,7 @@ libc = { workspace = true }
 log = { workspace = true }
 net_util = { path = "../net_util" }
 option_parser = { path = "../option_parser" }
+platform = { path = "../platform" }
 thiserror = { workspace = true }
 vhost = { workspace = true, features = ["vhost-user-backend"] }
 vhost-user-backend = { workspace = true }

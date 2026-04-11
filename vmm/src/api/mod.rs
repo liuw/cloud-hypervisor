@@ -45,7 +45,7 @@ use option_parser::{OptionParser, OptionParserError, Toggle};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_migration::MigratableError;
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 #[cfg(feature = "dbus_api")]
 pub use self::dbus::start_dbus_thread;

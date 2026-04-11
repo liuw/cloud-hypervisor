@@ -11,6 +11,7 @@ env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 option_parser = { path = "../option_parser" }
+platform = { path = "../platform" }
 thiserror = { workspace = true }
 vhost = { workspace = true, features = ["vhost-user-backend"] }
 vhost-user-backend = { workspace = true }

@@ -31,7 +31,7 @@ use vm_device::interrupt::{
 use vm_device::{BusDevice, Resource};
 use vm_memory::{Address, GuestAddress, GuestAddressSpace, GuestMemory, GuestUsize};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::mmap::MmapRegion;
 use crate::msi::{MSI_CONFIG_ID, MsiConfigState};

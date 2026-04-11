@@ -22,7 +22,7 @@ use virtio_queue::QueueT;
 use vm_memory::{ByteValued, GuestMemoryAtomic};
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;

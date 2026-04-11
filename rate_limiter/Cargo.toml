@@ -8,6 +8,7 @@ version = "0.1.0"
 epoll = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
+platform = { path = "../platform" }
 thiserror = { workspace = true }
 vmm-sys-util = { workspace = true }
 

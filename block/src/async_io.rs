@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use thiserror::Error;
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::{BatchRequest, DiskTopology, SECTOR_SIZE};
 

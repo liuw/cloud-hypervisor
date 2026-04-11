@@ -457,7 +457,7 @@ mod unit_tests {
     use std::sync::Mutex;
 
     use vm_device::interrupt::{InterruptIndex, InterruptSourceConfig};
-    use vmm_sys_util::eventfd::EventFd;
+    use platform::EventFd;
 
     use super::*;
 

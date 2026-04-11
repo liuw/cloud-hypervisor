@@ -12,7 +12,7 @@ use std::{io, result, thread};
 
 use log::{error, info, warn};
 use thiserror::Error;
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::{RateLimiter, TokenType};
 
@@ -302,7 +302,7 @@ pub(crate) mod unit_tests {
     use std::thread;
     use std::time::Duration;
 
-    use vmm_sys_util::eventfd::EventFd;
+    use platform::EventFd;
 
     use super::RateLimiterGroupHandle;
     use crate::group::RateLimiterGroup;

@@ -17,7 +17,7 @@ use vm_device::UserspaceMapping;
 use vm_memory::GuestMemoryAtomic;
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use super::vu_common_ctrl::VhostUserHandle;
 use super::{Error, Result};

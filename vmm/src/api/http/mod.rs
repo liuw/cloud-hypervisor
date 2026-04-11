@@ -22,7 +22,7 @@ use micro_http::{
 use seccompiler::{SeccompAction, apply_filter};
 use serde_json::Error as SerdeError;
 use thiserror::Error;
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use self::http_endpoint::{VmActionHandler, VmCreate, VmInfo, VmmPing, VmmShutdown};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -333,7 +333,7 @@ fn start_http_thread(
     let api_seccomp_filter = get_seccomp_filter(seccomp_action, Thread::HttpApi, hypervisor_type)
         .map_err(VmmError::CreateSeccompFilter)?;
 
-    let api_shutdown_fd = EventFd::new(libc::EFD_NONBLOCK).map_err(VmmError::EventFdCreate)?;
+    let api_shutdown_fd = EventFd::new(platform::EFD_NONBLOCK).map_err(VmmError::EventFdCreate)?;
     let api_shutdown_fd_clone = api_shutdown_fd.try_clone().unwrap();
 
     server

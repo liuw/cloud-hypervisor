@@ -15,7 +15,7 @@ use vm_device::interrupt::{
 };
 use vm_memory::ByteValued;
 use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::{PciCapability, PciCapabilityId};
 
@@ -98,7 +98,7 @@ impl InterruptSourceGroup for MaybeMutInterruptSourceGroup {
     impl_method! {
         fn trigger(&self, index: InterruptIndex) -> vm_device::interrupt::Result<()>;
 
-        fn notifier(&self, index: InterruptIndex) -> Option<vmm_sys_util::eventfd::EventFd>;
+        fn notifier(&self, index: InterruptIndex) -> Option<platform::EventFd>;
 
         fn update(
             &self,

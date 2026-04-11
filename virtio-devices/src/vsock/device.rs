@@ -24,7 +24,7 @@ use virtio_queue::{Queue, QueueOwnedT, QueueT};
 use vm_memory::{GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 /// This is the `VirtioDevice` implementation for our vsock device. It handles the virtio-level
 /// device logic: feature negotiation, device configuration, and device activation.
@@ -533,7 +533,7 @@ impl<B> Migratable for Vsock<B> where B: VsockBackend + Sync + 'static {}
 
 #[cfg(test)]
 mod unit_tests {
-    use libc::EFD_NONBLOCK;
+    use platform::EFD_NONBLOCK;
 
     use super::super::unit_tests::{NoopVirtioInterrupt, TestContext};
     use super::super::*;

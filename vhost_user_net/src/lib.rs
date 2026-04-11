@@ -12,7 +12,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::sync::{Arc, Mutex, RwLock};
 use std::{io, process};
 
-use libc::EFD_NONBLOCK;
+use platform::EFD_NONBLOCK;
 use log::error;
 use net_util::{
     MacAddr, NetCounters, NetQueuePair, OpenTapError, RxVirtio, Tap, TxVirtio, open_tap,
@@ -28,7 +28,7 @@ use virtio_bindings::virtio_net::*;
 use vm_memory::{GuestAddressSpace, GuestMemoryAtomic};
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::event::{EventConsumer, EventNotifier};
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<BitmapMmapRegion>;
 

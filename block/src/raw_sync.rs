@@ -8,7 +8,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use libc::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
 use log::warn;
-use vmm_sys_util::eventfd::EventFd;
+use platform::EventFd;
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd, DiskFileError};
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
@@ -100,7 +100,7 @@ impl RawFileSync {
     pub fn new(fd: RawFd) -> Self {
         RawFileSync {
             fd,
-            eventfd: EventFd::new(libc::EFD_NONBLOCK).expect("Failed creating EventFd for RawFile"),
+            eventfd: EventFd::new(platform::EFD_NONBLOCK).expect("Failed creating EventFd for RawFile"),
             completion_list: VecDeque::new(),
             alignment: SECTOR_SIZE,
         }
