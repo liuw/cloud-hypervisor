@@ -578,6 +578,7 @@ impl WhpVcpu {
     fn handle_pio(
         &self,
         context: &WHV_X64_IO_PORT_ACCESS_CONTEXT,
+        instr_len: u64,
     ) -> std::result::Result<(), HypervisorCpuError> {
         let vm_ops = self.vm_ops.as_ref().ok_or_else(|| {
             HypervisorCpuError::RunVcpu(anyhow!("PIO exit but no VmOps configured"))
@@ -610,6 +611,14 @@ impl WhpVcpu {
             let values = [WHV_REGISTER_VALUE { Reg64: rax }];
             self.set_registers(&names, &values)?;
         }
+
+        // Advance RIP past the I/O instruction.
+        let rip_name = [WHvX64RegisterRip];
+        let rip_values = self.get_registers(&rip_name)?;
+        // SAFETY: Reg64 is valid for the RIP register.
+        let new_rip = unsafe { rip_values[0].Reg64 } + instr_len;
+        let new_rip_val = [WHV_REGISTER_VALUE { Reg64: new_rip }];
+        self.set_registers(&rip_name, &new_rip_val)?;
 
         Ok(())
     }
@@ -671,7 +680,8 @@ impl cpu::Vcpu for WhpVcpu {
     }
 
     fn set_sregs(&self, sregs: &SpecialRegisters) -> cpu::Result<()> {
-        let names = [
+        // Write control registers
+        let cr_names = [
             WHvX64RegisterCr0,
             WHvX64RegisterCr2,
             WHvX64RegisterCr3,
@@ -679,7 +689,7 @@ impl cpu::Vcpu for WhpVcpu {
             WHvX64RegisterCr8,
             WHvX64RegisterEfer,
         ];
-        let values = [
+        let cr_values = [
             WHV_REGISTER_VALUE { Reg64: sregs.cr0 },
             WHV_REGISTER_VALUE { Reg64: sregs.cr2 },
             WHV_REGISTER_VALUE { Reg64: sregs.cr3 },
@@ -687,10 +697,59 @@ impl cpu::Vcpu for WhpVcpu {
             WHV_REGISTER_VALUE { Reg64: sregs.cr8 },
             WHV_REGISTER_VALUE { Reg64: sregs.efer },
         ];
+        self.set_registers(&cr_names, &cr_values).map_err(|_| {
+            HypervisorCpuError::SetSpecialRegs(anyhow!("Failed to set control registers"))
+        })?;
 
-        self.set_registers(&names, &values).map_err(|_| {
-            HypervisorCpuError::SetSpecialRegs(anyhow!("Failed to set special registers"))
-        })
+        // Write segment registers (CS, DS, ES, SS) using WHV segment format.
+        // SAFETY: WHV_X64_SEGMENT_REGISTER fields are set from our SegmentRegister.
+        let seg_names = [
+            WHvX64RegisterCs,
+            WHvX64RegisterDs,
+            WHvX64RegisterEs,
+            WHvX64RegisterSs,
+        ];
+
+        fn seg_to_whv(seg: &crate::arch::x86::SegmentRegister) -> WHV_REGISTER_VALUE {
+            // Pack individual segment register fields into WHV's u16 attributes.
+            // x86 segment attributes layout:
+            //   Bits 0-3: Type, Bit 4: S, Bits 5-6: DPL, Bit 7: Present
+            //   Bit 8: AVL, Bit 9: L (long mode), Bit 10: D/B, Bit 11: G
+            let attributes: u16 = (seg.type_ as u16 & 0xF)
+                | ((seg.s as u16 & 1) << 4)
+                | ((seg.dpl as u16 & 3) << 5)
+                | ((seg.present as u16 & 1) << 7)
+                | ((seg.avl as u16 & 1) << 8)
+                | ((seg.l as u16 & 1) << 9)
+                | ((seg.db as u16 & 1) << 10)
+                | ((seg.g as u16 & 1) << 11);
+
+            let mut val = WHV_REGISTER_VALUE::default();
+            // SAFETY: The Segment field is valid for segment register names.
+            unsafe {
+                val.Segment = WHV_X64_SEGMENT_REGISTER {
+                    Base: seg.base,
+                    Limit: seg.limit,
+                    Selector: seg.selector,
+                    Anonymous: WHV_X64_SEGMENT_REGISTER_0 {
+                        Attributes: attributes,
+                    },
+                };
+            }
+            val
+        }
+
+        let seg_values = [
+            seg_to_whv(&sregs.cs),
+            seg_to_whv(&sregs.ds),
+            seg_to_whv(&sregs.es),
+            seg_to_whv(&sregs.ss),
+        ];
+        self.set_registers(&seg_names, &seg_values).map_err(|_| {
+            HypervisorCpuError::SetSpecialRegs(anyhow!("Failed to set segment registers"))
+        })?;
+
+        Ok(())
     }
 
     fn get_fpu(&self) -> cpu::Result<FpuState> {
@@ -836,6 +895,8 @@ impl cpu::Vcpu for WhpVcpu {
     fn run(&mut self) -> std::result::Result<cpu::VmExit, HypervisorCpuError> {
         let mut exit_context = WHV_RUN_VP_EXIT_CONTEXT::default();
 
+        debug!("WHP: calling WHvRunVirtualProcessor for vp {}", self.vp_index);
+
         // SAFETY: Runs the virtual processor until an exit occurs.
         unsafe {
             WHvRunVirtualProcessor(
@@ -849,6 +910,9 @@ impl cpu::Vcpu for WhpVcpu {
             })?;
         }
 
+        debug!("WHP: exit reason = {:?}, RIP = {:#x}", 
+               exit_context.ExitReason, exit_context.VpContext.Rip);
+
         #[allow(non_upper_case_globals)]
         match exit_context.ExitReason {
             WHvRunVpExitReasonMemoryAccess => {
@@ -861,7 +925,8 @@ impl cpu::Vcpu for WhpVcpu {
             WHvRunVpExitReasonX64IoPortAccess => {
                 // SAFETY: The union field is valid for this exit reason.
                 let io_ctx = unsafe { &exit_context.Anonymous.IoPortAccess };
-                self.handle_pio(io_ctx)?;
+                let instr_len = exit_context.VpContext._bitfield as u64;
+                self.handle_pio(io_ctx, instr_len)?;
                 Ok(cpu::VmExit::Ignore)
             }
 
