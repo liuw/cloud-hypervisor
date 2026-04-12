@@ -512,24 +512,24 @@ impl WhpVcpu {
     /// Convert WhpStandardRegisters to WHV_REGISTER_VALUE array.
     fn standard_regs_to_values(regs: &WhpStandardRegisters) -> [WHV_REGISTER_VALUE; NUM_STANDARD_REGS] {
         [
-            WHV_REGISTER_VALUE { Reg64: regs.rax },
-            WHV_REGISTER_VALUE { Reg64: regs.rbx },
-            WHV_REGISTER_VALUE { Reg64: regs.rcx },
-            WHV_REGISTER_VALUE { Reg64: regs.rdx },
-            WHV_REGISTER_VALUE { Reg64: regs.rsi },
-            WHV_REGISTER_VALUE { Reg64: regs.rdi },
-            WHV_REGISTER_VALUE { Reg64: regs.rsp },
-            WHV_REGISTER_VALUE { Reg64: regs.rbp },
-            WHV_REGISTER_VALUE { Reg64: regs.r8 },
-            WHV_REGISTER_VALUE { Reg64: regs.r9 },
-            WHV_REGISTER_VALUE { Reg64: regs.r10 },
-            WHV_REGISTER_VALUE { Reg64: regs.r11 },
-            WHV_REGISTER_VALUE { Reg64: regs.r12 },
-            WHV_REGISTER_VALUE { Reg64: regs.r13 },
-            WHV_REGISTER_VALUE { Reg64: regs.r14 },
-            WHV_REGISTER_VALUE { Reg64: regs.r15 },
-            WHV_REGISTER_VALUE { Reg64: regs.rip },
-            WHV_REGISTER_VALUE { Reg64: regs.rflags },
+            reg64_value(regs.rax),
+            reg64_value(regs.rbx),
+            reg64_value(regs.rcx),
+            reg64_value(regs.rdx),
+            reg64_value(regs.rsi),
+            reg64_value(regs.rdi),
+            reg64_value(regs.rsp),
+            reg64_value(regs.rbp),
+            reg64_value(regs.r8),
+            reg64_value(regs.r9),
+            reg64_value(regs.r10),
+            reg64_value(regs.r11),
+            reg64_value(regs.r12),
+            reg64_value(regs.r13),
+            reg64_value(regs.r14),
+            reg64_value(regs.r15),
+            reg64_value(regs.rip),
+            reg64_value(regs.rflags),
         ]
     }
 
@@ -568,7 +568,7 @@ impl WhpVcpu {
         let values = self.get_registers(&rip_name)?;
         // SAFETY: Reg64 is valid for the RIP register value.
         let new_rip = unsafe { values[0].Reg64 } + instruction_length;
-        let new_values = [WHV_REGISTER_VALUE { Reg64: new_rip }];
+        let new_values = [reg64_value(new_rip)];
         self.set_registers(&rip_name, &new_values)?;
 
         Ok(())
@@ -608,7 +608,7 @@ impl WhpVcpu {
                 buf
             });
             let names = [WHvX64RegisterRax];
-            let values = [WHV_REGISTER_VALUE { Reg64: rax }];
+            let values = [reg64_value(rax)];
             self.set_registers(&names, &values)?;
         }
 
@@ -617,7 +617,7 @@ impl WhpVcpu {
         let rip_values = self.get_registers(&rip_name)?;
         // SAFETY: Reg64 is valid for the RIP register.
         let new_rip = unsafe { rip_values[0].Reg64 } + instr_len;
-        let new_rip_val = [WHV_REGISTER_VALUE { Reg64: new_rip }];
+        let new_rip_val = [reg64_value(new_rip)];
         self.set_registers(&rip_name, &new_rip_val)?;
 
         Ok(())
@@ -649,10 +649,49 @@ impl cpu::Vcpu for WhpVcpu {
             WHvX64RegisterCr8,
             WHvX64RegisterEfer,
             WHvX64RegisterApicBase,
+            WHvX64RegisterCs,
+            WHvX64RegisterDs,
+            WHvX64RegisterEs,
+            WHvX64RegisterFs,
+            WHvX64RegisterGs,
+            WHvX64RegisterSs,
+            WHvX64RegisterTr,
+            WHvX64RegisterLdtr,
+            WHvX64RegisterGdtr,
+            WHvX64RegisterIdtr,
         ];
         let values = self.get_registers(&names)?;
 
-        // SAFETY: Reg64 is valid for control registers.
+        fn whv_to_seg(val: &WHV_REGISTER_VALUE) -> crate::arch::x86::SegmentRegister {
+            // SAFETY: Segment field is valid for segment register names.
+            let seg = unsafe { &val.Segment };
+            let attr = unsafe { seg.Anonymous.Attributes };
+            crate::arch::x86::SegmentRegister {
+                base: seg.Base,
+                limit: seg.Limit,
+                selector: seg.Selector,
+                type_: (attr & 0xF) as u8,
+                s: ((attr >> 4) & 1) as u8,
+                dpl: ((attr >> 5) & 3) as u8,
+                present: ((attr >> 7) & 1) as u8,
+                avl: ((attr >> 8) & 1) as u8,
+                l: ((attr >> 9) & 1) as u8,
+                db: ((attr >> 10) & 1) as u8,
+                g: ((attr >> 11) & 1) as u8,
+                unusable: 0,
+            }
+        }
+
+        fn whv_to_table(val: &WHV_REGISTER_VALUE) -> crate::arch::x86::DescriptorTable {
+            // SAFETY: Table field is valid for GDTR/IDTR.
+            let table = unsafe { &val.Table };
+            crate::arch::x86::DescriptorTable {
+                base: table.Base,
+                limit: table.Limit,
+            }
+        }
+
+        // SAFETY: Reg64 is valid for control registers; Segment/Table for others.
         Ok(unsafe {
             SpecialRegisters {
                 cr0: values[0].Reg64,
@@ -662,59 +701,27 @@ impl cpu::Vcpu for WhpVcpu {
                 cr8: values[4].Reg64,
                 efer: values[5].Reg64,
                 apic_base: values[6].Reg64,
-                // Segment registers and descriptor tables are read separately
-                // if needed; provide defaults for now.
-                cs: Default::default(),
-                ds: Default::default(),
-                es: Default::default(),
-                fs: Default::default(),
-                gs: Default::default(),
-                ss: Default::default(),
-                tr: Default::default(),
-                ldt: Default::default(),
-                gdt: Default::default(),
-                idt: Default::default(),
+                cs: whv_to_seg(&values[7]),
+                ds: whv_to_seg(&values[8]),
+                es: whv_to_seg(&values[9]),
+                fs: whv_to_seg(&values[10]),
+                gs: whv_to_seg(&values[11]),
+                ss: whv_to_seg(&values[12]),
+                tr: whv_to_seg(&values[13]),
+                ldt: whv_to_seg(&values[14]),
+                gdt: whv_to_table(&values[15]),
+                idt: whv_to_table(&values[16]),
                 interrupt_bitmap: [0u64; 4],
             }
         })
     }
 
     fn set_sregs(&self, sregs: &SpecialRegisters) -> cpu::Result<()> {
-        // Write control registers
-        let cr_names = [
-            WHvX64RegisterCr0,
-            WHvX64RegisterCr2,
-            WHvX64RegisterCr3,
-            WHvX64RegisterCr4,
-            WHvX64RegisterCr8,
-            WHvX64RegisterEfer,
-        ];
-        let cr_values = [
-            WHV_REGISTER_VALUE { Reg64: sregs.cr0 },
-            WHV_REGISTER_VALUE { Reg64: sregs.cr2 },
-            WHV_REGISTER_VALUE { Reg64: sregs.cr3 },
-            WHV_REGISTER_VALUE { Reg64: sregs.cr4 },
-            WHV_REGISTER_VALUE { Reg64: sregs.cr8 },
-            WHV_REGISTER_VALUE { Reg64: sregs.efer },
-        ];
-        self.set_registers(&cr_names, &cr_values).map_err(|_| {
-            HypervisorCpuError::SetSpecialRegs(anyhow!("Failed to set control registers"))
-        })?;
-
-        // Write segment registers (CS, DS, ES, SS) using WHV segment format.
-        // SAFETY: WHV_X64_SEGMENT_REGISTER fields are set from our SegmentRegister.
-        let seg_names = [
-            WHvX64RegisterCs,
-            WHvX64RegisterDs,
-            WHvX64RegisterEs,
-            WHvX64RegisterSs,
-        ];
+        // Write ALL special registers in a single WHvSetVirtualProcessorRegisters
+        // call so WHP validates them as a consistent state. Writing CR0.PE
+        // separately from segment registers causes InvalidVpRegisterValue.
 
         fn seg_to_whv(seg: &crate::arch::x86::SegmentRegister) -> WHV_REGISTER_VALUE {
-            // Pack individual segment register fields into WHV's u16 attributes.
-            // x86 segment attributes layout:
-            //   Bits 0-3: Type, Bit 4: S, Bits 5-6: DPL, Bit 7: Present
-            //   Bit 8: AVL, Bit 9: L (long mode), Bit 10: D/B, Bit 11: G
             let attributes: u16 = (seg.type_ as u16 & 0xF)
                 | ((seg.s as u16 & 1) << 4)
                 | ((seg.dpl as u16 & 3) << 5)
@@ -739,17 +746,61 @@ impl cpu::Vcpu for WhpVcpu {
             val
         }
 
-        let seg_values = [
+        fn table_to_whv(table: &crate::arch::x86::DescriptorTable) -> WHV_REGISTER_VALUE {
+            let mut val = WHV_REGISTER_VALUE::default();
+            // SAFETY: Table field is valid for GDTR/IDTR.
+            unsafe {
+                val.Table = WHV_X64_TABLE_REGISTER {
+                    Pad: [0; 3],
+                    Limit: table.limit,
+                    Base: table.base,
+                };
+            }
+            val
+        }
+
+        let names = vec![
+            // Table registers first
+            WHvX64RegisterGdtr,
+            WHvX64RegisterIdtr,
+            // Segment registers
+            WHvX64RegisterCs,
+            WHvX64RegisterDs,
+            WHvX64RegisterEs,
+            WHvX64RegisterFs,
+            WHvX64RegisterGs,
+            WHvX64RegisterSs,
+            WHvX64RegisterTr,
+            WHvX64RegisterLdtr,
+            // Control registers last
+            WHvX64RegisterCr0,
+            WHvX64RegisterCr2,
+            WHvX64RegisterCr3,
+            WHvX64RegisterCr4,
+            WHvX64RegisterEfer,
+        ];
+
+        let values = vec![
+            table_to_whv(&sregs.gdt),
+            table_to_whv(&sregs.idt),
             seg_to_whv(&sregs.cs),
             seg_to_whv(&sregs.ds),
             seg_to_whv(&sregs.es),
+            seg_to_whv(&sregs.fs),
+            seg_to_whv(&sregs.gs),
             seg_to_whv(&sregs.ss),
+            seg_to_whv(&sregs.tr),
+            seg_to_whv(&sregs.ldt),
+            reg64_value(sregs.cr0),
+            reg64_value(sregs.cr2),
+            reg64_value(sregs.cr3),
+            reg64_value(sregs.cr4),
+            reg64_value(sregs.efer),
         ];
-        self.set_registers(&seg_names, &seg_values).map_err(|_| {
-            HypervisorCpuError::SetSpecialRegs(anyhow!("Failed to set segment registers"))
-        })?;
 
-        Ok(())
+        self.set_registers(&names, &values).map_err(|e| {
+            HypervisorCpuError::SetSpecialRegs(anyhow!("Failed to set special registers: {e}"))
+        })
     }
 
     fn get_fpu(&self) -> cpu::Result<FpuState> {
@@ -830,7 +881,7 @@ impl cpu::Vcpu for WhpVcpu {
         let mut count = 0;
         for msr in msrs {
             let name = WHV_REGISTER_NAME(msr.index as i32);
-            let value = WHV_REGISTER_VALUE { Reg64: msr.data };
+            let value = reg64_value(msr.data);
             if self.set_registers(&[name], &[value]).is_ok() {
                 count += 1;
             }
@@ -1051,6 +1102,19 @@ impl Drop for WhpVcpu {
 }
 
 // ─── Helper functions ────────────────────────────────────────────────────────
+
+/// Create a zero-initialized WHV_REGISTER_VALUE with Reg64 set.
+/// 
+/// SAFETY: WHV_REGISTER_VALUE is a union. Partial initialization via
+/// `WHV_REGISTER_VALUE { Reg64: v }` leaves the upper 8 bytes undefined,
+/// causing access violations in WHvSetVirtualProcessorRegisters.
+/// This helper zeros the entire 16-byte union first.
+fn reg64_value(v: u64) -> WHV_REGISTER_VALUE {
+    let mut val = WHV_REGISTER_VALUE::default();
+    // SAFETY: Reg64 is a valid union field.
+    unsafe { val.Reg64 = v };
+    val
+}
 
 /// Set a u64 partition property.
 fn set_partition_property(

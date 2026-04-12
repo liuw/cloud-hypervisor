@@ -315,8 +315,8 @@ fn load_bzimage(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
 }
 
 fn load_flat_binary(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
-    // Load flat binary at 0x1000 in real mode (like demo payload)
-    let load_addr = 0x1000_usize;
+    // Load flat binary at KERNEL_LOAD_ADDR (1 MiB) in protected mode
+    let load_addr = KERNEL_LOAD_ADDR as usize;
     if load_addr + data.len() > GUEST_MEM_SIZE {
         return Err(anyhow!("Binary too large for guest memory"));
     }
@@ -324,8 +324,8 @@ fn load_flat_binary(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), host_mem.add(load_addr), data.len());
     }
-    println!("  Loaded flat binary ({} bytes) at {load_addr:#X}", data.len());
-    Ok(load_addr as u64)
+    println!("  Loaded flat binary ({} bytes) at {KERNEL_LOAD_ADDR:#X}", data.len());
+    Ok(KERNEL_LOAD_ADDR)
 }
 
 // ── GDT setup ────────────────────────────────────────────────────────────────
@@ -334,13 +334,15 @@ const GDT_ADDR: u64 = 0x500;
 
 /// Write a minimal GDT into guest memory at GDT_ADDR.
 /// Entry 0: null, Entry 1 (0x08): 64-bit code (unused for now),
-/// Entry 2 (0x10): 32-bit code, Entry 3 (0x18): 32-bit data.
+/// Entry 2 (0x10): 32-bit code, Entry 3 (0x18): 32-bit data,
+/// Entry 4 (0x20): TSS (for TR).
 fn setup_gdt(host_mem: *mut u8) {
-    let gdt: [u64; 4] = [
+    let gdt: [u64; 5] = [
         0,                      // 0x00: null descriptor
         0x00AF_9A00_0000_FFFF,  // 0x08: 64-bit code (L=1, D=0)
         0x00CF_9A00_0000_FFFF,  // 0x10: 32-bit code (G=1, D=1, P=1, S=1, Type=A)
         0x00CF_9200_0000_FFFF,  // 0x18: 32-bit data (G=1, D=1, P=1, S=1, Type=2)
+        0x0000_8B00_0000_FFFF,  // 0x20: 32-bit TSS (P=1, Type=0xB busy TSS)
     ];
     // SAFETY: Writing within allocated guest memory bounds.
     unsafe {
@@ -361,69 +363,74 @@ fn setup_regs(vcpu: &mut dyn hypervisor::Vcpu, entry: u64) -> anyhow::Result<()>
     let mut regs = vcpu.get_regs().context("get_regs")?;
     regs.set_rip(entry);
     regs.set_rflags(0x2);
-    regs.set_rsi(BOOT_PARAMS_ADDR); // Linux boot protocol: RSI = boot_params
+    regs.set_rsi(BOOT_PARAMS_ADDR);
     vcpu.set_regs(&regs).context("set_regs")?;
     println!("  GP registers set.");
 
-    let mut sregs = vcpu.get_sregs().context("get_sregs")?;
-    println!("  Current CR0={:#x}", sregs.cr0);
-
     if entry >= KERNEL_LOAD_ADDR {
-        // 32-bit protected mode for Linux kernel entry
+        // Protected mode: set segments + GDT + CR0.PE
         let code_seg = SegmentRegister {
-            base: 0,
-            limit: 0xFFFF_FFFF,
-            selector: 0x10,
-            type_: 0xB, // Execute/Read/Accessed
-            s: 1,
-            dpl: 0,
-            present: 1,
-            db: 1, // 32-bit
-            g: 1,  // 4K granularity
-            l: 0,
-            avl: 0,
-            unusable: 0,
+            base: 0, limit: 0xFFFF_FFFF, selector: 0x10,
+            type_: 0xB, s: 1, dpl: 0, present: 1, db: 1, g: 1,
+            l: 0, avl: 0, unusable: 0,
         };
         let data_seg = SegmentRegister {
-            type_: 0x3, // Read/Write/Accessed
-            selector: 0x18,
-            ..code_seg
+            type_: 0x3, selector: 0x18, ..code_seg
         };
-        sregs.cs = code_seg;
-        sregs.ds = data_seg;
-        sregs.es = data_seg;
-        sregs.ss = data_seg;
-        sregs.cr0 |= 1; // PE = protected mode enable
+        let tr_seg = SegmentRegister {
+            base: 0, limit: 0xFFFF, selector: 0, type_: 0xB,
+            s: 0, dpl: 0, present: 1, db: 0, g: 0, l: 0, avl: 0, unusable: 0,
+        };
+
+        let mut sregs = vcpu.get_sregs().context("get_sregs")?;
+        // Full protected mode setup: GDT + all segments + CR0.PE
+        // All must be consistent in one set_sregs call.
         sregs.gdt.base = GDT_ADDR;
-        sregs.gdt.limit = 31; // 4 entries * 8 bytes - 1
-        println!("  Setting sregs (CR0.PE, GDT, segments)...");
+        sregs.gdt.limit = 39;
+        sregs.cr0 = 0x11; // PE + ET
+        sregs.cs = SegmentRegister {
+            base: 0, limit: 0xFFFF_FFFF, selector: 0x10,
+            type_: 0xB, s: 1, dpl: 0, present: 1, db: 1, g: 1,
+            l: 0, avl: 0, unusable: 0,
+        };
+        let ds = SegmentRegister {
+            base: 0, limit: 0xFFFF_FFFF, selector: 0x18,
+            type_: 0x3, s: 1, dpl: 0, present: 1, db: 1, g: 1,
+            l: 0, avl: 0, unusable: 0,
+        };
+        sregs.ds = ds;
+        sregs.es = ds;
+        sregs.fs = ds;
+        sregs.gs = ds;
+        sregs.ss = ds;
+        sregs.tr = SegmentRegister {
+            base: 0, limit: 0xFFFF, selector: 0x20,
+            type_: 0xB, s: 0, dpl: 0, present: 1, db: 0, g: 0,
+            l: 0, avl: 0, unusable: 0,
+        };
+        sregs.ldt = SegmentRegister {
+            base: 0, limit: 0, selector: 0,
+            type_: 0x2, s: 0, dpl: 0, present: 0, db: 0, g: 0,
+            l: 0, avl: 0, unusable: 0,
+        };
+        println!("  Protected mode: CR0={:#x} GDT@{GDT_ADDR:#x}", sregs.cr0);
+        vcpu.set_sregs(&sregs).context("set_sregs (protected mode)")?;
     } else {
-        // 16-bit real mode for demo payload
+        // Real mode: set flat CS at base 0
         let code_seg = SegmentRegister {
-            base: 0,
-            limit: 0xFFFF,
-            selector: 0,
-            type_: 0xB,
-            s: 1,
-            dpl: 0,
-            present: 1,
-            db: 0,
-            g: 0,
-            l: 0,
-            avl: 0,
-            unusable: 0,
+            base: 0, limit: 0xFFFF, selector: 0, type_: 0xB,
+            s: 1, dpl: 0, present: 1, db: 0, g: 0, l: 0, avl: 0, unusable: 0,
         };
-        let data_seg = SegmentRegister {
-            type_: 0x3,
-            ..code_seg
-        };
+        let data_seg = SegmentRegister { type_: 0x3, ..code_seg };
+
+        let mut sregs = vcpu.get_sregs().context("get_sregs")?;
         sregs.cs = code_seg;
         sregs.ds = data_seg;
         sregs.es = data_seg;
         sregs.ss = data_seg;
+        vcpu.set_sregs(&sregs).context("set_sregs")?;
     }
 
-    vcpu.set_sregs(&sregs).context("set_sregs")?;
     Ok(())
 }
 
