@@ -69,7 +69,7 @@ pub fn run() -> anyhow::Result<()> {
     };
 
     // ── Set up GDT for protected mode ────────────────────────────────────
-    if entry_point >= KERNEL_LOAD_ADDR {
+    if kernel_path.is_some() {
         setup_gdt(host_mem);
     }
 
@@ -315,7 +315,7 @@ fn load_bzimage(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
 }
 
 fn load_flat_binary(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
-    // Load flat binary at KERNEL_LOAD_ADDR (1 MiB) in protected mode
+    // Load flat binary at KERNEL_LOAD_ADDR (1 MiB)
     let load_addr = KERNEL_LOAD_ADDR as usize;
     if load_addr + data.len() > GUEST_MEM_SIZE {
         return Err(anyhow!("Binary too large for guest memory"));
@@ -325,7 +325,56 @@ fn load_flat_binary(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
         std::ptr::copy_nonoverlapping(data.as_ptr(), host_mem.add(load_addr), data.len());
     }
     println!("  Loaded flat binary ({} bytes) at {KERNEL_LOAD_ADDR:#X}", data.len());
-    Ok(KERNEL_LOAD_ADDR)
+
+    // Write a real-mode bootstrap at BOOTSTRAP_ADDR that transitions to
+    // protected mode and far-jumps to the kernel at KERNEL_LOAD_ADDR.
+    // This is needed because WHP requires the guest (not the host) to
+    // perform the real→protected mode transition.
+    write_pm_bootstrap(host_mem);
+
+    // Return bootstrap address — the vCPU starts in real mode here
+    Ok(BOOTSTRAP_ADDR)
+}
+
+const BOOTSTRAP_ADDR: u64 = 0x2000;
+const GDT_DESC_ADDR: u64 = 0x2100;
+
+/// Write a 16-bit real-mode bootstrap that transitions to 32-bit protected mode.
+fn write_pm_bootstrap(host_mem: *mut u8) {
+    // GDT at GDT_ADDR (already written by setup_gdt)
+    // GDT descriptor at GDT_DESC_ADDR
+    let gdt_desc: [u8; 6] = {
+        let mut d = [0u8; 6];
+        d[0..2].copy_from_slice(&39u16.to_le_bytes()); // limit = 5*8-1
+        d[2..6].copy_from_slice(&(GDT_ADDR as u32).to_le_bytes());
+        d
+    };
+    // SAFETY: Writing within guest memory bounds.
+    unsafe { std::ptr::copy_nonoverlapping(gdt_desc.as_ptr(), host_mem.add(GDT_DESC_ADDR as usize), 6) };
+
+    // 16-bit bootstrap code at BOOTSTRAP_ADDR
+    let mut code = Vec::new();
+    // cli
+    code.push(0xFA);
+    // lgdt [GDT_DESC_ADDR]
+    code.extend_from_slice(&[0x0F, 0x01, 0x16]);
+    code.extend_from_slice(&(GDT_DESC_ADDR as u16).to_le_bytes());
+    // mov eax, cr0
+    code.extend_from_slice(&[0x0F, 0x20, 0xC0]);
+    // or al, 1 (set PE)
+    code.extend_from_slice(&[0x0C, 0x01]);
+    // mov cr0, eax
+    code.extend_from_slice(&[0x0F, 0x22, 0xC0]);
+    // jmp far 0x10:KERNEL_LOAD_ADDR (32-bit code segment, offset to kernel)
+    code.extend_from_slice(&[0x66, 0xEA]);
+    code.extend_from_slice(&(KERNEL_LOAD_ADDR as u32).to_le_bytes());
+    code.extend_from_slice(&0x10u16.to_le_bytes()); // CS selector = GDT entry 2
+
+    // SAFETY: Writing within guest memory bounds.
+    unsafe {
+        std::ptr::copy_nonoverlapping(code.as_ptr(), host_mem.add(BOOTSTRAP_ADDR as usize), code.len());
+    }
+    println!("  Bootstrap ({} bytes) at {BOOTSTRAP_ADDR:#X} → far jmp to {KERNEL_LOAD_ADDR:#X}", code.len());
 }
 
 // ── GDT setup ────────────────────────────────────────────────────────────────
@@ -359,77 +408,27 @@ fn setup_gdt(host_mem: *mut u8) {
 fn setup_regs(vcpu: &mut dyn hypervisor::Vcpu, entry: u64) -> anyhow::Result<()> {
     use hypervisor::arch::x86::SegmentRegister;
 
-    println!("  Setting GP registers (RIP={entry:#x})...");
+    // Always start in real mode. For protected-mode kernels, a bootstrap
+    // at BOOTSTRAP_ADDR handles the real→protected transition via lgdt+CR0.PE.
     let mut regs = vcpu.get_regs().context("get_regs")?;
     regs.set_rip(entry);
     regs.set_rflags(0x2);
     regs.set_rsi(BOOT_PARAMS_ADDR);
     vcpu.set_regs(&regs).context("set_regs")?;
-    println!("  GP registers set.");
 
-    if entry >= KERNEL_LOAD_ADDR {
-        // Protected mode: set segments + GDT + CR0.PE
-        let code_seg = SegmentRegister {
-            base: 0, limit: 0xFFFF_FFFF, selector: 0x10,
-            type_: 0xB, s: 1, dpl: 0, present: 1, db: 1, g: 1,
-            l: 0, avl: 0, unusable: 0,
-        };
-        let data_seg = SegmentRegister {
-            type_: 0x3, selector: 0x18, ..code_seg
-        };
-        let tr_seg = SegmentRegister {
-            base: 0, limit: 0xFFFF, selector: 0, type_: 0xB,
-            s: 0, dpl: 0, present: 1, db: 0, g: 0, l: 0, avl: 0, unusable: 0,
-        };
-
-        let mut sregs = vcpu.get_sregs().context("get_sregs")?;
-        // Full protected mode setup: GDT + all segments + CR0.PE
-        // All must be consistent in one set_sregs call.
-        sregs.gdt.base = GDT_ADDR;
-        sregs.gdt.limit = 39;
-        sregs.cr0 = 0x11; // PE + ET
-        sregs.cs = SegmentRegister {
-            base: 0, limit: 0xFFFF_FFFF, selector: 0x10,
-            type_: 0xB, s: 1, dpl: 0, present: 1, db: 1, g: 1,
-            l: 0, avl: 0, unusable: 0,
-        };
-        let ds = SegmentRegister {
-            base: 0, limit: 0xFFFF_FFFF, selector: 0x18,
-            type_: 0x3, s: 1, dpl: 0, present: 1, db: 1, g: 1,
-            l: 0, avl: 0, unusable: 0,
-        };
-        sregs.ds = ds;
-        sregs.es = ds;
-        sregs.fs = ds;
-        sregs.gs = ds;
-        sregs.ss = ds;
-        sregs.tr = SegmentRegister {
-            base: 0, limit: 0xFFFF, selector: 0x20,
-            type_: 0xB, s: 0, dpl: 0, present: 1, db: 0, g: 0,
-            l: 0, avl: 0, unusable: 0,
-        };
-        sregs.ldt = SegmentRegister {
-            base: 0, limit: 0, selector: 0,
-            type_: 0x2, s: 0, dpl: 0, present: 0, db: 0, g: 0,
-            l: 0, avl: 0, unusable: 0,
-        };
-        println!("  Protected mode: CR0={:#x} GDT@{GDT_ADDR:#x}", sregs.cr0);
-        vcpu.set_sregs(&sregs).context("set_sregs (protected mode)")?;
-    } else {
-        // Real mode: set flat CS at base 0
-        let code_seg = SegmentRegister {
-            base: 0, limit: 0xFFFF, selector: 0, type_: 0xB,
-            s: 1, dpl: 0, present: 1, db: 0, g: 0, l: 0, avl: 0, unusable: 0,
-        };
-        let data_seg = SegmentRegister { type_: 0x3, ..code_seg };
-
-        let mut sregs = vcpu.get_sregs().context("get_sregs")?;
-        sregs.cs = code_seg;
-        sregs.ds = data_seg;
-        sregs.es = data_seg;
-        sregs.ss = data_seg;
-        vcpu.set_sregs(&sregs).context("set_sregs")?;
-    }
+    // Set CS.base=0 so RIP maps directly to physical address
+    let mut sregs = vcpu.get_sregs().context("get_sregs")?;
+    let code_seg = SegmentRegister {
+        base: 0, limit: 0xFFFF, selector: 0,
+        type_: 0xB, s: 1, dpl: 0, present: 1, db: 0, g: 0,
+        l: 0, avl: 0, unusable: 0,
+    };
+    let data_seg = SegmentRegister { type_: 0x3, ..code_seg };
+    sregs.cs = code_seg;
+    sregs.ds = data_seg;
+    sregs.es = data_seg;
+    sregs.ss = data_seg;
+    vcpu.set_sregs(&sregs).context("set_sregs")?;
 
     Ok(())
 }
