@@ -35,11 +35,12 @@ I/O will benefit from batching register operations.
 |---------|:---:|:---:|-------|
 | VM creation | ✅ | ✅ | |
 | Memory mapping | ✅ | ✅ | |
-| vCPU execution | ✅ | ✅ | Real mode works; protected mode needs GDT register investigation |
-| PIO handling | ✅ | ✅ | |
-| MMIO handling | ✅ | ⚠️ | Framework in place, not tested |
-| Serial console | ✅ | ✅ | Port 0x3F8 I/O works |
-| Kernel loading | ✅ | ⚠️ | bzImage parser present; protected mode entry blocked by GDT reg write issue |
+| vCPU execution | ✅ | ✅ | Real mode AND 32-bit protected mode both work |
+| PIO handling | ✅ | ✅ | With correct instruction length from VpContext |
+| MMIO handling | ✅ | ✅ | With correct instruction length from VpContext |
+| Serial console | ✅ | ✅ | Bidirectional: host stdin ↔ guest serial 0x3F8 |
+| Protected mode | ✅ | ✅ | Guest-driven transition via lgdt+CR0.PE+far jmp |
+| Kernel loading | ✅ | ⚠️ | bzImage parser + bootstrap; needs long mode for real Linux |
 | virtio devices | ✅ | ❌ | Needs Windows event loop (epoll replacement) |
 | Networking | ✅ | ❌ | Needs Windows TAP/vSwitch |
 | Block I/O | ✅ | ❌ | Needs Windows overlapped I/O |
