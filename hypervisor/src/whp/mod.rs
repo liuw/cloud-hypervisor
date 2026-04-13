@@ -1195,8 +1195,8 @@ impl cpu::Vcpu for WhpVcpu {
                         WHvRegisterInternalActivityState,
                     ];
                     let mut reg_values = [WHV_REGISTER_VALUE::default(); 2];
-                    // Use RESCHEDULE_VECTOR (0xFD) to directly trigger rescheduling
-                    reg_values[0] = reg64_value(1 | (0xFDu64 << 8));
+                    // Inject LOCAL_TIMER_VECTOR (0xEF) to drive tick_handle_periodic
+                    reg_values[0] = reg64_value(1 | (0xEFu64 << 8));
                     reg_values[1] = reg64_value(0); // Clear HLT suspend
                     unsafe {
                         let _ = WHvSetVirtualProcessorRegisters(

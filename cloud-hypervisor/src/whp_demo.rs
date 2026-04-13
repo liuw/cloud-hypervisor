@@ -161,20 +161,19 @@ pub fn run() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("timer-inject".to_string())
             .spawn(move || {
-                // Wait for kernel to output boot messages before starting timer
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                // Start immediately — WHvRequestInterrupt is async
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 let whp = vm_for_timer.as_any().downcast_ref::<WhpVm>().unwrap();
-                eprintln!("[timer] Starting timer injection loop");
+                eprintln!("[timer] Starting timer injection (vector 0xEF)");
                 let mut tick = 0u64;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(10));
-                    match whp.cancel_run(0) {
-                        Ok(()) => {
-                            if tick == 0 { eprintln!("[timer] First cancel_run OK"); }
-                        }
-                        Err(e) => {
-                            if tick < 3 { eprintln!("[timer] cancel_run failed: {e}"); }
-                        }
+                    // Inject LOCAL_TIMER_VECTOR (0xEF) — calls local_apic_timer_interrupt
+                    // which advances jiffies via the clockevent subsystem
+                    if let Err(e) = whp.request_interrupt(0xEF, 0) {
+                        if tick < 3 { eprintln!("[timer] failed: {e}"); }
+                    } else if tick == 0 {
+                        eprintln!("[timer] First interrupt OK");
                     }
                     tick += 1;
                 }
@@ -777,7 +776,7 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         std::ptr::write_bytes(bp, 0, 4096);
 
         // Write command line
-        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check noapictimer noapic tsc=reliable loglevel=8 rdinit=/init\0";
+        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check tsc=reliable rdinit=/init\0";
         std::ptr::copy_nonoverlapping(
             cmdline.as_ptr(),
             host_mem.add(CMDLINE_ADDR as usize),
@@ -1025,6 +1024,10 @@ struct SerialVmOps {
     ioapic_regsel: std::sync::atomic::AtomicU32,
     /// I/O APIC redirection table (24 entries).
     ioapic_redtbl: std::sync::Mutex<[u64; 24]>,
+    /// Serial IER (Interrupt Enable Register) at port 0x3F9.
+    serial_ier: std::sync::atomic::AtomicU8,
+    /// Serial interrupt pending flag (set when THRE interrupt should fire).
+    serial_thre_pending: std::sync::atomic::AtomicBool,
 }
 
 impl SerialVmOps {
@@ -1043,6 +1046,8 @@ impl SerialVmOps {
             port61: std::sync::atomic::AtomicU8::new(0),
             ioapic_regsel: std::sync::atomic::AtomicU32::new(0),
             ioapic_redtbl: std::sync::Mutex::new(redtbl),
+            serial_ier: std::sync::atomic::AtomicU8::new(0),
+            serial_thre_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1167,6 +1172,28 @@ impl VmOps for SerialVmOps {
             0x3F8 => {
                 data[0] = self.read_input().unwrap_or(0);
             }
+            // Serial IER (Interrupt Enable Register) — read back
+            0x3F9 => {
+                data[0] = self.serial_ier.load(std::sync::atomic::Ordering::Relaxed);
+            }
+            // Serial IIR (Interrupt Identification Register)
+            0x3FA => {
+                use std::sync::atomic::Ordering;
+                let ier = self.serial_ier.load(Ordering::Relaxed);
+                if self.serial_thre_pending.load(Ordering::Relaxed) && (ier & 0x02) != 0 {
+                    // THRE interrupt pending
+                    data[0] = 0x02; // IIR: THRE interrupt
+                    self.serial_thre_pending.store(false, Ordering::Relaxed);
+                } else if self.has_input() && (ier & 0x01) != 0 {
+                    // Data available interrupt
+                    data[0] = 0x04; // IIR: received data available
+                } else {
+                    data[0] = 0x01; // IIR: no interrupt pending
+                }
+                data[0] |= 0xC0; // FIFO enabled bits
+            }
+            // Serial MCR
+            0x3FC => { data[0] = 0x08; /* MCR: AUX output 2 (interrupt enable) */ }
             // Serial Line Status Register
             0x3FD => {
                 let mut lsr = 0x60; // THR empty + Transmitter idle
@@ -1229,6 +1256,14 @@ impl VmOps for SerialVmOps {
             }
             use std::io::Write;
             let _ = std::io::stdout().flush();
+            // After writing data, THRE becomes empty → set pending
+            let ier = self.serial_ier.load(std::sync::atomic::Ordering::Relaxed);
+            if (ier & 0x02) != 0 {
+                self.serial_thre_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else if port == 0x3F9 && !data.is_empty() {
+            // IER write
+            self.serial_ier.store(data[0], std::sync::atomic::Ordering::Relaxed);
         } else if port == DEBUG_EXIT_PORT {
             println!();
             println!("--- Guest requested shutdown ---");
