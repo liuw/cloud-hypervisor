@@ -117,7 +117,7 @@ impl hypervisor::Hypervisor for WhpHypervisor {
         set_partition_property(
             partition,
             WHvPartitionPropertyCodeLocalApicEmulationMode,
-            WHvX64LocalApicEmulationModeX2Apic.0 as u64,
+            WHvX64LocalApicEmulationModeXApic.0 as u64,
         )
         .map_err(|e| {
             hypervisor::HypervisorError::VmSetup(anyhow!(
@@ -194,6 +194,62 @@ unsafe impl Send for WhpVm {}
 unsafe impl Sync for WhpVm {}
 
 impl WhpVm {
+    /// Returns the raw WHP partition handle for direct API access (e.g., interrupt injection).
+    pub fn partition_handle(&self) -> WHV_PARTITION_HANDLE {
+        self.partition
+    }
+
+    /// Inject a fixed interrupt into the guest vCPU using WHvRegisterPendingEvent.
+    /// Also kicks the vCPU out of HLT if needed.
+    pub fn inject_interrupt(&self, vector: u8, vp_index: u32) -> std::result::Result<(), anyhow::Error> {
+        // Use WHvRegisterPendingEvent (ExtInt) to inject the interrupt,
+        // matching how QEMU's WHPX backend does it.
+        let reg_names = [
+            WHvRegisterPendingEvent,
+            WHvRegisterInternalActivityState,
+        ];
+        let mut reg_values = [WHV_REGISTER_VALUE::default(); 2];
+
+        // Set up the pending external interrupt event
+        // WHV_X64_PENDING_EXT_INT_EVENT layout:
+        // bit 0: EventPending = 1
+        // bits 1-4: EventType = WHvX64PendingEventExtInt (5)
+        // bits 5-15: Reserved
+        // bits 16-23: Vector
+        let event_val: u64 = 1 // EventPending
+            | (5u64 << 1) // EventType = ExtInt
+            | ((vector as u64) << 16); // Vector
+        reg_values[0] = reg64_value(event_val);
+
+        // Clear HLT suspend state so the vCPU wakes from HLT
+        // WHV_INTERNAL_ACTIVITY_REGISTER: bit 0 = StartupSuspend, bit 1 = HaltSuspend
+        // Set HaltSuspend = 0 (clear it)
+        reg_values[1] = reg64_value(0);
+
+        // SAFETY: Sets virtual processor registers for interrupt injection.
+        unsafe {
+            WHvSetVirtualProcessorRegisters(
+                self.partition,
+                vp_index,
+                reg_names.as_ptr(),
+                reg_names.len() as u32,
+                reg_values.as_ptr(),
+            )
+            .map_err(|e| anyhow!("WHvSetVirtualProcessorRegisters (interrupt inject) failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Cancel the vCPU run to force it out of HLT or internal loops.
+    pub fn cancel_run(&self, vp_index: u32) -> std::result::Result<(), anyhow::Error> {
+        // SAFETY: Cancels the run of a virtual processor.
+        unsafe {
+            WHvCancelRunVirtualProcessor(self.partition, vp_index, 0)
+                .map_err(|e| anyhow!("WHvCancelRunVirtualProcessor failed: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Ensure the partition is set up. Must be called before creating vCPUs.
     fn ensure_setup(&self) -> vm::Result<()> {
         let mut is_setup = self.is_setup.write().unwrap();
@@ -215,6 +271,8 @@ impl WhpVm {
                 "Failed to set processor count: {e}"
             ))
         })?;
+
+        // No extended VM exits needed — WHP's APIC emulation handles timers internally.
 
         // SAFETY: Completes the partition setup.
         unsafe {
@@ -982,7 +1040,7 @@ impl cpu::Vcpu for WhpVcpu {
             }
 
             WHvRunVpExitReasonX64Halt => {
-                debug!("WHP: vCPU halted");
+                debug!("WHP: vCPU halted at RIP={:#x}", exit_context.VpContext.Rip);
                 Ok(cpu::VmExit::Shutdown)
             }
 
@@ -1116,16 +1174,24 @@ fn reg64_value(v: u64) -> WHV_REGISTER_VALUE {
     val
 }
 
-/// Set a u64 partition property.
+/// Set a partition property from raw bytes.
 fn set_partition_property(
     partition: WHV_PARTITION_HANDLE,
     code: WHV_PARTITION_PROPERTY_CODE,
     value: u64,
 ) -> std::result::Result<(), windows::core::Error> {
-    // Use ProcessorCount field (u32) for most properties, or encode as needed.
-    let property = WHV_PARTITION_PROPERTY {
-        ProcessorCount: value as u32,
-    };
+    // WHV_PARTITION_PROPERTY is a large union. Zero it, then write the value
+    // into the first 8 bytes, which covers both u32 (ProcessorCount) and
+    // u64 (ExtendedVmExits) property types.
+    let mut property = WHV_PARTITION_PROPERTY::default();
+    // SAFETY: Writing the value into the union's raw bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &value as *const u64 as *const u8,
+            &raw mut property as *mut u8,
+            std::mem::size_of::<u64>(),
+        );
+    }
 
     // SAFETY: Sets a partition property value.
     unsafe {

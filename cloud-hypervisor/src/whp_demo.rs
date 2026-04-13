@@ -76,6 +76,7 @@ pub fn run() -> anyhow::Result<()> {
     if kernel_path.is_some() {
         setup_gdt(host_mem);
         setup_page_tables(host_mem);
+        setup_acpi_tables(host_mem);
     }
 
     // ── Create vCPU ──────────────────────────────────────────────────────
@@ -90,6 +91,11 @@ pub fn run() -> anyhow::Result<()> {
 
     println!("vCPU 0 ready, RIP={entry_point:#x}. Running...");
     println!("--- Guest serial output ---");
+
+    // Start a timer interrupt injection thread for kernel boot.
+    // The kernel needs periodic timer interrupts (IRQ 0) to run the scheduler.
+    // We inject a fixed interrupt at vector 0x20 (standard PIT→PIC mapping) at ~100 Hz.
+    // Timer interrupt injection is handled in the vCPU loop below.
 
     // Start a stdin reader thread that feeds input to the serial port
     let vm_ops_for_stdin = vm_ops.clone();
@@ -686,7 +692,7 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         std::ptr::write_bytes(bp, 0, 4096);
 
         // Write command line
-        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 noapic noacpi nomodules\0";
+        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 nomodules tsc=reliable lpj=1000000 no_timer_check lapic\0";
         std::ptr::copy_nonoverlapping(
             cmdline.as_ptr(),
             host_mem.add(CMDLINE_ADDR as usize),
@@ -703,6 +709,9 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         *bp.add(0x211) = 0xC1;
         // cmd_line_ptr at offset 0x228
         w::<u32>(bp, 0x228, CMDLINE_ADDR as u32);
+
+        // acpi_rsdp_addr at offset 0x070 (boot_params.acpi_rsdp_addr)
+        w::<u64>(bp, 0x070, ACPI_RSDP_ADDR);
 
         // e820 memory map (e820_table at 0x2D0, 20 bytes per entry)
         // e820_entries count at offset 0x1E8
@@ -736,6 +745,7 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         w::<u64>(info, 16, CMDLINE_ADDR);            // cmdline_paddr
         w::<u64>(info, 40, MEMMAP_START);            // memmap_paddr
         w::<u32>(info, 48, 1);                       // memmap_entries
+        w::<u64>(info, 24, ACPI_RSDP_ADDR);           // rsdp_paddr
 
         // Memory map entry
         let memmap = host_mem.add(MEMMAP_START as usize);
@@ -745,6 +755,114 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
     }
 
     println!("  Boot params at {BOOT_PARAMS_ADDR:#X}, PVH info at 0x6000, cmdline at {CMDLINE_ADDR:#X}");
+}
+
+/// ACPI table base addresses
+const ACPI_RSDP_ADDR: u64 = 0x000E_0000; // RSDP in BIOS ROM scan range (0xE0000-0xFFFFF)
+const ACPI_TABLES_ADDR: u64 = 0x00F0_0000; // XSDT + MADT at 15MB
+
+/// Set up minimal ACPI tables (RSDP → XSDT → MADT) so the kernel finds the APIC.
+fn setup_acpi_tables(host_mem: *mut u8) {
+    /// Write a value at an unaligned offset within guest memory.
+    unsafe fn w<T: Copy>(base: *mut u8, offset: usize, val: T) {
+        std::ptr::write_unaligned(base.add(offset) as *mut T, val);
+    }
+
+    /// Compute ACPI table checksum (sum of all bytes must be 0).
+    fn acpi_checksum(data: &[u8]) -> u8 {
+        let sum: u8 = data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        (!sum).wrapping_add(1)
+    }
+
+    // SAFETY: Writing ACPI structures within allocated guest memory.
+    unsafe {
+        // === MADT (Multiple APIC Description Table) ===
+        // Layout: header (44 bytes) + Local APIC entry (8 bytes) + I/O APIC entry (12 bytes)
+        let madt_addr = ACPI_TABLES_ADDR + 64; // after XSDT
+        let madt = host_mem.add(madt_addr as usize);
+        std::ptr::write_bytes(madt, 0, 128);
+
+        // MADT header (44 bytes)
+        std::ptr::copy_nonoverlapping(b"APIC".as_ptr(), madt, 4); // Signature
+        let madt_len: u32 = 44 + 8 + 12; // header + LAPIC + IOAPIC
+        w::<u32>(madt, 4, madt_len); // Length
+        *madt.add(8) = 5; // Revision
+        // Checksum at offset 9 — computed later
+        std::ptr::copy_nonoverlapping(b"CLOUDH".as_ptr(), madt.add(10), 6); // OEM ID
+        std::ptr::copy_nonoverlapping(b"CHMADT  ".as_ptr(), madt.add(16), 8); // OEM Table ID
+        w::<u32>(madt, 24, 1); // OEM Revision
+        std::ptr::copy_nonoverlapping(b"CLHV".as_ptr(), madt.add(28), 4); // Creator ID
+        w::<u32>(madt, 32, 1); // Creator Revision
+        w::<u32>(madt, 36, 0xFEE0_0000); // Local APIC Address
+        w::<u32>(madt, 40, 1); // Flags (PCAT_COMPAT)
+
+        // Local APIC entry (type 0, length 8)
+        let lapic = madt.add(44);
+        *lapic = 0; // Type = Processor Local APIC
+        *lapic.add(1) = 8; // Length
+        *lapic.add(2) = 0; // ACPI Processor ID
+        *lapic.add(3) = 0; // APIC ID
+        w::<u32>(lapic, 4, 1); // Flags: Enabled
+
+        // I/O APIC entry (type 1, length 12)
+        let ioapic = madt.add(52);
+        *ioapic = 1; // Type = I/O APIC
+        *ioapic.add(1) = 12; // Length
+        *ioapic.add(2) = 0; // I/O APIC ID
+        *ioapic.add(3) = 0; // Reserved
+        w::<u32>(ioapic, 4, 0xFEC0_0000); // I/O APIC Address
+        w::<u32>(ioapic, 8, 0); // Global System Interrupt Base
+
+        // Compute MADT checksum
+        let madt_slice = std::slice::from_raw_parts(madt, madt_len as usize);
+        let cksum = acpi_checksum(madt_slice);
+        *madt.add(9) = cksum;
+
+        // === XSDT (Extended System Description Table) ===
+        let xsdt = host_mem.add(ACPI_TABLES_ADDR as usize);
+        std::ptr::write_bytes(xsdt, 0, 64);
+
+        // XSDT header (36 bytes) + one 8-byte pointer to MADT
+        let xsdt_len: u32 = 36 + 8;
+        std::ptr::copy_nonoverlapping(b"XSDT".as_ptr(), xsdt, 4);
+        w::<u32>(xsdt, 4, xsdt_len);
+        *xsdt.add(8) = 1; // Revision
+        std::ptr::copy_nonoverlapping(b"CLOUDH".as_ptr(), xsdt.add(10), 6);
+        std::ptr::copy_nonoverlapping(b"CHXSDT  ".as_ptr(), xsdt.add(16), 8);
+        w::<u32>(xsdt, 24, 1);
+        std::ptr::copy_nonoverlapping(b"CLHV".as_ptr(), xsdt.add(28), 4);
+        w::<u32>(xsdt, 32, 1);
+        // Pointer to MADT
+        w::<u64>(xsdt, 36, madt_addr);
+        // Checksum
+        let xsdt_slice = std::slice::from_raw_parts(xsdt, xsdt_len as usize);
+        let cksum = acpi_checksum(xsdt_slice);
+        *xsdt.add(9) = cksum;
+
+        // === RSDP (Root System Description Pointer) ===
+        let rsdp = host_mem.add(ACPI_RSDP_ADDR as usize);
+        std::ptr::write_bytes(rsdp, 0, 36);
+
+        // RSDP v2 (36 bytes)
+        std::ptr::copy_nonoverlapping(b"RSD PTR ".as_ptr(), rsdp, 8); // Signature
+        // Checksum at offset 8 — computed later
+        std::ptr::copy_nonoverlapping(b"CLOUDH".as_ptr(), rsdp.add(9), 6); // OEM ID
+        *rsdp.add(15) = 2; // Revision (ACPI 2.0+)
+        w::<u32>(rsdp, 16, ACPI_TABLES_ADDR as u32); // RSDT Address (same as XSDT for simplicity)
+        w::<u32>(rsdp, 20, 36); // Length (RSDP v2 = 36 bytes)
+        w::<u64>(rsdp, 24, ACPI_TABLES_ADDR); // XSDT Address
+        // Extended checksum at offset 32
+        let rsdp_slice = std::slice::from_raw_parts(rsdp, 36);
+        // First compute checksum for bytes 0-19 (RSDP v1 portion)
+        let cksum_v1 = acpi_checksum(&rsdp_slice[..20]);
+        *rsdp.add(8) = cksum_v1;
+        // Then extended checksum for all 36 bytes
+        let rsdp_slice = std::slice::from_raw_parts(rsdp, 36);
+        let cksum_ext = acpi_checksum(rsdp_slice);
+        *rsdp.add(32) = cksum_ext;
+    }
+
+    println!("  ACPI tables: RSDP at {ACPI_RSDP_ADDR:#X}, XSDT+MADT at {ACPI_TABLES_ADDR:#X}");
 }
 const PDPTE_ADDR: u64 = 0xB000;
 const PDE_ADDR: u64 = 0xC000; // 4 pages: 0xC000, 0xD000, 0xE000, 0xF000
@@ -810,6 +928,12 @@ struct SerialVmOps {
     input: std::sync::Mutex<std::collections::VecDeque<u8>>,
     seen_ports: std::sync::Mutex<std::collections::BTreeSet<u64>>,
     debug: bool,
+    /// Tracks the start time for PIT counter decrement emulation.
+    pit_start: std::time::Instant,
+    /// PIT counter 2 reload value.
+    pit_reload: std::sync::atomic::AtomicU16,
+    /// Port 0x61 (NMI Status and Control) register value.
+    port61: std::sync::atomic::AtomicU8,
 }
 
 impl SerialVmOps {
@@ -818,6 +942,9 @@ impl SerialVmOps {
             input: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seen_ports: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             debug: std::env::var("CH_DEBUG").is_ok(),
+            pit_start: std::time::Instant::now(),
+            pit_reload: std::sync::atomic::AtomicU16::new(0xFFFF),
+            port61: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -848,7 +975,8 @@ impl VmOps for SerialVmOps {
         if self.debug {
             eprintln!("[MMIO] read GPA={gpa:#X} len={}", data.len());
         }
-        data.fill(0xFF);
+        // Return 0 for IOAPIC/LAPIC reads (WHP handles LAPIC internally)
+        data.fill(0);
         Ok(())
     }
     fn mmio_write(&self, gpa: u64, data: &[u8]) -> Result<(), HypervisorVmError> {
@@ -877,6 +1005,42 @@ impl VmOps for SerialVmOps {
                 }
                 data[0] = lsr;
             }
+            // PIT counter 2 data port — return simulated decrementing counter
+            0x42 => {
+                use std::sync::atomic::Ordering;
+                // PIT runs at ~1.193182 MHz. Simulate counter decrement based on elapsed time.
+                let elapsed_us = self.pit_start.elapsed().as_micros() as u64;
+                // ~1.19 ticks per microsecond
+                let ticks = (elapsed_us * 1193) / 1000;
+                let reload = self.pit_reload.load(Ordering::Relaxed) as u64;
+                let counter = if reload > 0 {
+                    reload.saturating_sub(ticks % (reload + 1))
+                } else {
+                    0
+                };
+                data[0] = counter as u8;
+            }
+            // Port 0x61: NMI Status and Control Register
+            // Bit 5 = Timer Counter 2 output (toggles based on PIT counter 2)
+            0x61 => {
+                use std::sync::atomic::Ordering;
+                let val = self.port61.load(Ordering::Relaxed);
+                let elapsed_us = self.pit_start.elapsed().as_micros() as u64;
+                let reload = self.pit_reload.load(Ordering::Relaxed) as u64;
+                let cycles = if reload > 0 { elapsed_us * 1193 / 1000 / (reload + 1) } else { 0 };
+                // Toggle bit 5 based on elapsed PIT cycles
+                let out_bit = if cycles % 2 == 0 { 0 } else { 0x20 };
+                data[0] = (val & !0x20) | out_bit;
+            }
+            // CMOS/RTC
+            0x71 => {
+                // Return 0 for all CMOS reads (the kernel just needs something)
+                data[0] = 0;
+            }
+            // PIC (8259) — mask registers
+            0x21 | 0xA1 => {
+                data[0] = 0xFF; // All IRQs masked
+            }
             _ => data.fill(0xFF),
         }
         Ok(())
@@ -899,6 +1063,14 @@ impl VmOps for SerialVmOps {
             println!();
             println!("--- Guest requested shutdown ---");
             std::process::exit(0);
+        } else if port == 0x42 && !data.is_empty() {
+            // PIT counter 2 data — reload value
+            use std::sync::atomic::Ordering;
+            self.pit_reload.store(data[0] as u16, Ordering::Relaxed);
+        } else if port == 0x61 && !data.is_empty() {
+            // NMI Status and Control
+            use std::sync::atomic::Ordering;
+            self.port61.store(data[0], Ordering::Relaxed);
         }
         Ok(())
     }
