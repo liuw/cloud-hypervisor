@@ -204,9 +204,11 @@ pub fn run() -> anyhow::Result<()> {
                 eprintln!("[timer] Starting timer injection (0x20 PIC IRQ 0)");
                 let mut tick = 0u64;
                 loop {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    // Inject PIC IRQ 0 at vector 0x20 (standard 8259 base vector)
-                    let _ = whp.request_interrupt(0x20, 0);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    // Inject LOCAL_TIMER_VECTOR (0xEF) since WHP's LAPIC timer
+                    // may not fire autonomously. With lapic_timer_frequency set,
+                    // the handler advances jiffies via the clockevent.
+                    let _ = whp.request_interrupt(0xEF, 0);
                     tick += 1;
                     if tick == 1 { eprintln!("[timer] First tick OK"); }
                 }
@@ -809,7 +811,7 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         std::ptr::write_bytes(bp, 0, 4096);
 
         // Write command line
-        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check tsc=reliable keep_bootcon rdinit=/init\0";
+        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check noapic tsc=reliable keep_bootcon lapic_timer_frequency=1000000000 rdinit=/init\0";
         std::ptr::copy_nonoverlapping(
             cmdline.as_ptr(),
             host_mem.add(CMDLINE_ADDR as usize),

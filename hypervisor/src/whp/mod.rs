@@ -199,7 +199,7 @@ impl WhpVm {
         self.partition
     }
 
-    /// Request an interrupt via WHvRequestInterrupt (safe to call while vCPU is running).
+    /// Request a Fixed interrupt via WHvRequestInterrupt (safe to call while vCPU is running).
     pub fn request_interrupt(&self, vector: u8, destination: u32) -> std::result::Result<(), anyhow::Error> {
         let interrupt = WHV_INTERRUPT_CONTROL {
             _bitfield: WHvX64InterruptTypeFixed.0 as u64,
@@ -214,6 +214,25 @@ impl WhpVm {
                 std::mem::size_of::<WHV_INTERRUPT_CONTROL>() as u32,
             )
             .map_err(|e| anyhow!("WHvRequestInterrupt failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Request an ExtINT interrupt (PIC-style) via WHvRequestInterrupt.
+    pub fn request_extint(&self, vector: u8) -> std::result::Result<(), anyhow::Error> {
+        let interrupt = WHV_INTERRUPT_CONTROL {
+            // ExtInt type = 3 (WHvX64InterruptTypeExtInt)
+            _bitfield: 3u64, // ExtInt delivery mode
+            Destination: 0,
+            Vector: vector as u32,
+        };
+        unsafe {
+            WHvRequestInterrupt(
+                self.partition,
+                &interrupt,
+                std::mem::size_of::<WHV_INTERRUPT_CONTROL>() as u32,
+            )
+            .map_err(|e| anyhow!("WHvRequestInterrupt (ExtINT) failed: {e}"))?;
         }
         Ok(())
     }
