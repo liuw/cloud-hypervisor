@@ -221,10 +221,11 @@ pub fn run() -> anyhow::Result<()> {
                 let mut tick = 0u64;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(1));
-                    // No injection — let the kernel boot without interference.
-                    // The kernel reaches init without timer ticks.
-                    // We just sleep to keep the thread alive.
-                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    // Inject timer vectors:
+                    // 0x30 = PIT timer (IRQ 0 via IOAPIC), advances jiffies
+                    // 0x34 = serial IRQ 4 via IOAPIC (IRQ 0 gets 0x30, IRQ 4 should be 0x34)
+                    let _ = whp.request_interrupt(0x30, 0);
+                    let _ = whp.request_interrupt(0x34, 0);
                     tick += 1;
                     if tick == 1 { eprintln!("[timer] First tick OK"); }
                 }
@@ -827,7 +828,7 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         std::ptr::write_bytes(bp, 0, 4096);
 
         // Write command line
-        let cmdline = b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check noapictimer noapic tsc=reliable idle=halt rdinit=/init\0";
+        let cmdline = b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 tsc=reliable idle=halt rdinit=/init\0";
         std::ptr::copy_nonoverlapping(
             cmdline.as_ptr(),
             host_mem.add(CMDLINE_ADDR as usize),
