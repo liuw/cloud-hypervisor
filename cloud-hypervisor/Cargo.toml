@@ -22,6 +22,7 @@ required-features = ["kvm"]
 
 [dependencies]
 anyhow = { workspace = true }
+arch = { path = "../arch" }
 clap = { workspace = true, features = ["string"] }
 dhat = { workspace = true, optional = true }
 env_logger = { workspace = true }

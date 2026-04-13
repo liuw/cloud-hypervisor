@@ -55,8 +55,8 @@ pub fn run() -> anyhow::Result<()> {
         &[(GuestAddress(0), GUEST_MEM_SIZE)]
     ).context("Failed to allocate guest memory")?;
 
-    // Get host pointer and map into the WHP partition
-    let host_mem = guest_mem.get_host_address(vm_memory::GuestAddress(0))
+    // Get host pointer for WHP mapping
+    let host_mem = guest_mem.get_host_address(GuestAddress(0))
         .map_err(|e| anyhow!("get_host_address: {e:?}"))?;
     // SAFETY: GuestMemoryMmap owns the memory and it remains valid.
     unsafe {
@@ -67,7 +67,7 @@ pub fn run() -> anyhow::Result<()> {
 
     // ── Load payload ─────────────────────────────────────────────────────
     let entry_point = if let Some(ref path) = kernel_path {
-        load_kernel(host_mem, &guest_mem, path)?
+        load_kernel(host_mem, path)?
     } else {
         load_demo_payload(host_mem)
     };
@@ -221,7 +221,7 @@ fn load_demo_payload(host_mem: *mut u8) -> u64 {
 
 // ── Kernel loading ───────────────────────────────────────────────────────────
 
-fn load_kernel(host_mem: *mut u8, guest_mem: &GuestMem, path: &str) -> anyhow::Result<u64> {
+fn load_kernel(host_mem: *mut u8, path: &str) -> anyhow::Result<u64> {
     let mut file = File::open(path).context("Failed to open kernel image")?;
     let metadata = file.metadata()?;
     let file_size = metadata.len() as usize;
@@ -233,14 +233,14 @@ fn load_kernel(host_mem: *mut u8, guest_mem: &GuestMem, path: &str) -> anyhow::R
 
     // Check for bzImage magic at offset 0x202 ("HdrS")
     if file_size > 0x206 && &kernel_data[0x202..0x206] == b"HdrS" {
-        load_bzimage(host_mem, guest_mem, &kernel_data)
+        load_bzimage(host_mem, &kernel_data)
     } else {
         // Try loading as flat binary at 1 MiB
         load_flat_binary(host_mem, &kernel_data)
     }
 }
 
-fn load_bzimage(host_mem: *mut u8, guest_mem: &GuestMem, data: &[u8]) -> anyhow::Result<u64> {
+fn load_bzimage(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
     // Parse bzImage header
     let setup_sects = if data[0x1F1] == 0 { 4 } else { data[0x1F1] as usize };
     let setup_size = (setup_sects + 1) * 512;
@@ -253,42 +253,61 @@ fn load_bzimage(host_mem: *mut u8, guest_mem: &GuestMem, data: &[u8]) -> anyhow:
     }
 
     // Copy protected-mode kernel to KERNEL_LOAD_ADDR (1 MiB)
-    guest_mem.write_slice(&data[setup_size..], GuestAddress(KERNEL_LOAD_ADDR))
-        .map_err(|e| anyhow!("Write kernel: {e:?}"))?;
+    if KERNEL_LOAD_ADDR as usize + kernel_size > GUEST_MEM_SIZE {
+        return Err(anyhow!("Kernel too large for guest memory"));
+    }
+    // SAFETY: Writing within allocated guest memory bounds.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data[setup_size..].as_ptr(),
+            host_mem.add(KERNEL_LOAD_ADDR as usize),
+            kernel_size,
+        );
+    }
 
-    // Copy setup header (boot_params) to BOOT_PARAMS_ADDR
+    // Set up boot parameters at BOOT_PARAMS_ADDR
+    // Copy the setup header (first setup_size bytes contain boot_params)
     let params_size = setup_size.min(4096);
-    guest_mem.write_slice(&data[..params_size], GuestAddress(BOOT_PARAMS_ADDR))
-        .map_err(|e| anyhow!("Write boot_params: {e:?}"))?;
+    // SAFETY: Writing within allocated guest memory bounds.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            host_mem.add(BOOT_PARAMS_ADDR as usize),
+            params_size,
+        );
+    }
 
     // Write command line
     let cmdline = b"console=ttyS0 earlyprintk=serial noapic noacpi pci=off\0";
-    guest_mem.write_slice(cmdline, GuestAddress(CMDLINE_ADDR))
-        .map_err(|e| anyhow!("Write cmdline: {e:?}"))?;
+    // SAFETY: Writing within allocated guest memory bounds.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            cmdline.as_ptr(),
+            host_mem.add(CMDLINE_ADDR as usize),
+            cmdline.len(),
+        );
+    }
 
-    // Patch boot_params fields using GuestMemory write methods
-    guest_mem.write_obj(0xFFFFu16, GuestAddress(BOOT_PARAMS_ADDR + 0x1FA))
-        .map_err(|e| anyhow!("vid_mode: {e:?}"))?;
-    guest_mem.write_obj(0xFFu8, GuestAddress(BOOT_PARAMS_ADDR + 0x210))
-        .map_err(|e| anyhow!("type_of_loader: {e:?}"))?;
-    guest_mem.write_obj(0xC1u8, GuestAddress(BOOT_PARAMS_ADDR + 0x211))
-        .map_err(|e| anyhow!("loadflags: {e:?}"))?;
-    guest_mem.write_obj(CMDLINE_ADDR as u32, GuestAddress(BOOT_PARAMS_ADDR + 0x228))
-        .map_err(|e| anyhow!("cmd_line_ptr: {e:?}"))?;
+    // Patch boot_params fields
+    // SAFETY: Writing specific fields within the boot_params struct.
+    unsafe {
+        let bp = host_mem.add(BOOT_PARAMS_ADDR as usize);
 
-    // Write E820 memory map entry (one region: 0 to GUEST_MEM_SIZE, type=RAM)
-    // E820 table starts at offset 0x2D0 in boot_params, entry size = 20 bytes
-    // struct e820_entry { u64 addr; u64 size; u32 type; }
-    let e820_offset = BOOT_PARAMS_ADDR + 0x2D0;
-    guest_mem.write_obj(0u64, GuestAddress(e820_offset))       // addr
-        .map_err(|e| anyhow!("e820 addr: {e:?}"))?;
-    guest_mem.write_obj(GUEST_MEM_SIZE as u64, GuestAddress(e820_offset + 8)) // size
-        .map_err(|e| anyhow!("e820 size: {e:?}"))?;
-    guest_mem.write_obj(1u32, GuestAddress(e820_offset + 16))  // type = RAM
-        .map_err(|e| anyhow!("e820 type: {e:?}"))?;
-    // e820_entries count at offset 0x1E8
-    guest_mem.write_obj(1u8, GuestAddress(BOOT_PARAMS_ADDR + 0x1E8))
-        .map_err(|e| anyhow!("e820_entries: {e:?}"))?;
+        // vid_mode = normal (0xFFFF)
+        *(bp.add(0x1FA) as *mut u16) = 0xFFFF;
+
+        // type_of_loader = 0xFF (undefined)
+        *bp.add(0x210) = 0xFF;
+
+        // loadflags: set LOADED_HIGH (bit 0) + KEEP_SEGMENTS (bit 6) + CAN_USE_HEAP (bit 7)
+        *bp.add(0x211) = 0xC1;
+
+        // cmd_line_ptr
+        *(bp.add(0x228) as *mut u32) = CMDLINE_ADDR as u32;
+
+        // header sentinel for boot protocol version
+        // (already copied from the bzImage header)
+    }
 
     println!("  Boot params at {BOOT_PARAMS_ADDR:#X}, cmdline at {CMDLINE_ADDR:#X}");
     println!("  Protected-mode kernel at {KERNEL_LOAD_ADDR:#X}");

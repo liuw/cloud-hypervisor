@@ -537,7 +537,6 @@ impl WhpVcpu {
     fn handle_mmio(
         &self,
         context: &WHV_MEMORY_ACCESS_CONTEXT,
-        instr_len: u64,
     ) -> std::result::Result<(), HypervisorCpuError> {
         let vm_ops = self.vm_ops.as_ref().ok_or_else(|| {
             HypervisorCpuError::RunVcpu(anyhow!("MMIO exit but no VmOps configured"))
@@ -548,8 +547,11 @@ impl WhpVcpu {
         let access_info = unsafe { context.AccessInfo.AsUINT32 };
         let is_write = (access_info & 1) != 0; // Bit 0 = AccessType (write=1)
         let access_size = ((access_info >> 4) & 0xF) as usize; // Bits 4-7 = AccessSize
+        let instruction_length = context.InstructionByteCount as u64;
 
         if is_write {
+            // For MMIO writes, we need to read the data from the instruction bytes.
+            // The data is embedded in the instruction encoding.
             let data = vec![0u8; access_size.max(1)];
             vm_ops.mmio_write(gpa, &data).map_err(|e| {
                 HypervisorCpuError::RunVcpu(anyhow!("MMIO write error: {e}"))
@@ -565,7 +567,7 @@ impl WhpVcpu {
         let rip_name = [WHvX64RegisterRip];
         let values = self.get_registers(&rip_name)?;
         // SAFETY: Reg64 is valid for the RIP register value.
-        let new_rip = unsafe { values[0].Reg64 } + instr_len;
+        let new_rip = unsafe { values[0].Reg64 } + instruction_length;
         let new_values = [reg64_value(new_rip)];
         self.set_registers(&rip_name, &new_values)?;
 
@@ -967,8 +969,7 @@ impl cpu::Vcpu for WhpVcpu {
             WHvRunVpExitReasonMemoryAccess => {
                 // SAFETY: The union field is valid for this exit reason.
                 let mem_ctx = unsafe { &exit_context.Anonymous.MemoryAccess };
-                let instr_len = exit_context.VpContext._bitfield as u64;
-                self.handle_mmio(mem_ctx, instr_len)?;
+                self.handle_mmio(mem_ctx)?;
                 Ok(cpu::VmExit::Ignore)
             }
 
