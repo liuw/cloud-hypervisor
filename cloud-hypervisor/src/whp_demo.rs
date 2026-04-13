@@ -65,6 +65,33 @@ pub fn run() -> anyhow::Result<()> {
     }
     println!("Mapped {} MiB guest RAM at GPA 0x0", GUEST_MEM_SIZE >> 20);
 
+    // Map a dedicated page for the I/O APIC at 0xFEC00000.
+    // The kernel reads the IOAPIC version register to determine the number of
+    // interrupt pins. We pre-populate it as RAM (direct memory access, no MMIO exits).
+    let ioapic_page_layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
+    // SAFETY: Allocating a page-aligned 4K buffer.
+    let ioapic_host = unsafe { std::alloc::alloc_zeroed(ioapic_page_layout) };
+    if ioapic_host.is_null() {
+        return Err(anyhow!("Failed to allocate IOAPIC page"));
+    }
+    // Pre-populate IOAPIC registers in memory:
+    // Offset 0x00: IOREGSEL (initially 0 = ID register)
+    // Offset 0x10: IOWIN — when IOREGSEL=0 (ID), returns 0
+    // The kernel will set IOREGSEL=1 (version) then read IOWIN.
+    // Since this is RAM, IOWIN returns whatever was last written.
+    // We can't do dynamic register selection with RAM alone.
+    // Instead, write the version value directly at offset 0x10 and hope the
+    // kernel reads it with IOREGSEL=1 (which we set to 1 in memory).
+    unsafe {
+        // Set IOREGSEL = 1 (version register)
+        std::ptr::write_unaligned(ioapic_host as *mut u32, 1);
+        // Set IOWIN = IOAPIC version (0x0017_0011 = version 17, 24 entries)
+        std::ptr::write_unaligned(ioapic_host.add(0x10) as *mut u32, 0x0017_0011u32);
+        vm.create_user_memory_region(1, 0xFEC0_0000, 4096, ioapic_host, false, false)
+            .context("Failed to map IOAPIC page")?;
+    }
+    println!("Mapped IOAPIC page at GPA 0xFEC00000 (version=0x00170011)");
+
     // ── Load payload ─────────────────────────────────────────────────────
     let entry_point = if let Some(ref path) = kernel_path {
         load_kernel(host_mem, path)?
@@ -710,9 +737,6 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         // cmd_line_ptr at offset 0x228
         w::<u32>(bp, 0x228, CMDLINE_ADDR as u32);
 
-        // acpi_rsdp_addr at offset 0x070 (boot_params.acpi_rsdp_addr)
-        w::<u64>(bp, 0x070, ACPI_RSDP_ADDR);
-
         // e820 memory map (e820_table at 0x2D0, 20 bytes per entry)
         // e820_entries count at offset 0x1E8
         *bp.add(0x1E8) = 3;
@@ -745,7 +769,6 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         w::<u64>(info, 16, CMDLINE_ADDR);            // cmdline_paddr
         w::<u64>(info, 40, MEMMAP_START);            // memmap_paddr
         w::<u32>(info, 48, 1);                       // memmap_entries
-        w::<u64>(info, 24, ACPI_RSDP_ADDR);           // rsdp_paddr
 
         // Memory map entry
         let memmap = host_mem.add(MEMMAP_START as usize);
@@ -757,112 +780,118 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
     println!("  Boot params at {BOOT_PARAMS_ADDR:#X}, PVH info at 0x6000, cmdline at {CMDLINE_ADDR:#X}");
 }
 
-/// ACPI table base addresses
-const ACPI_RSDP_ADDR: u64 = 0x000E_0000; // RSDP in BIOS ROM scan range (0xE0000-0xFFFFF)
-const ACPI_TABLES_ADDR: u64 = 0x00F0_0000; // XSDT + MADT at 15MB
-
-/// Set up minimal ACPI tables (RSDP → XSDT → MADT) so the kernel finds the APIC.
+/// Set up MP (MultiProcessor) floating pointer and configuration tables.
+/// The kernel scans for "_MP_" signature to find the APIC and I/O APIC.
 fn setup_acpi_tables(host_mem: *mut u8) {
     /// Write a value at an unaligned offset within guest memory.
     unsafe fn w<T: Copy>(base: *mut u8, offset: usize, val: T) {
         std::ptr::write_unaligned(base.add(offset) as *mut T, val);
     }
 
-    /// Compute ACPI table checksum (sum of all bytes must be 0).
-    fn acpi_checksum(data: &[u8]) -> u8 {
+    /// Compute MP table checksum (sum of all bytes must be 0).
+    fn mp_checksum(data: &[u8]) -> u8 {
         let sum: u8 = data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         (!sum).wrapping_add(1)
     }
 
-    // SAFETY: Writing ACPI structures within allocated guest memory.
+    const MP_FP_ADDR: u64 = 0x9_FC00; // MP Floating Pointer in EBDA
+    const MP_TABLE_ADDR: u64 = 0x9_FD00; // MP Configuration Table
+
+    // SAFETY: Writing MP structures within allocated guest memory.
     unsafe {
-        // === MADT (Multiple APIC Description Table) ===
-        // Layout: header (44 bytes) + Local APIC entry (8 bytes) + I/O APIC entry (12 bytes)
-        let madt_addr = ACPI_TABLES_ADDR + 64; // after XSDT
-        let madt = host_mem.add(madt_addr as usize);
-        std::ptr::write_bytes(madt, 0, 128);
+        // === MP Configuration Table at MP_TABLE_ADDR ===
+        let mpc = host_mem.add(MP_TABLE_ADDR as usize);
+        std::ptr::write_bytes(mpc, 0, 256);
 
-        // MADT header (44 bytes)
-        std::ptr::copy_nonoverlapping(b"APIC".as_ptr(), madt, 4); // Signature
-        let madt_len: u32 = 44 + 8 + 12; // header + LAPIC + IOAPIC
-        w::<u32>(madt, 4, madt_len); // Length
-        *madt.add(8) = 5; // Revision
-        // Checksum at offset 9 — computed later
-        std::ptr::copy_nonoverlapping(b"CLOUDH".as_ptr(), madt.add(10), 6); // OEM ID
-        std::ptr::copy_nonoverlapping(b"CHMADT  ".as_ptr(), madt.add(16), 8); // OEM Table ID
-        w::<u32>(madt, 24, 1); // OEM Revision
-        std::ptr::copy_nonoverlapping(b"CLHV".as_ptr(), madt.add(28), 4); // Creator ID
-        w::<u32>(madt, 32, 1); // Creator Revision
-        w::<u32>(madt, 36, 0xFEE0_0000); // Local APIC Address
-        w::<u32>(madt, 40, 1); // Flags (PCAT_COMPAT)
+        // MP Config Table Header (44 bytes)
+        std::ptr::copy_nonoverlapping(b"PCMP".as_ptr(), mpc, 4); // Signature
+        // Length filled later
+        *mpc.add(4) = 0; // spec_rev placeholder
+        // Checksum at offset 7 — computed later
+        *mpc.add(6) = 4; // Spec revision (MP 1.4)
+        std::ptr::copy_nonoverlapping(b"CLOUDH  ".as_ptr(), mpc.add(8), 8); // OEM ID
+        std::ptr::copy_nonoverlapping(b"WHP DEMO    ".as_ptr(), mpc.add(16), 12); // Product ID
+        w::<u32>(mpc, 28, 0); // OEM table pointer
+        w::<u16>(mpc, 32, 0); // OEM table size
+        w::<u16>(mpc, 34, 3 + 16); // Entry count (1 CPU + 1 bus + 1 IOAPIC + 16 IRQ entries)
+        w::<u32>(mpc, 36, 0xFEE0_0000); // Local APIC address
+        w::<u16>(mpc, 40, 0); // Extended table length
+        *mpc.add(42) = 0; // Extended table checksum
 
-        // Local APIC entry (type 0, length 8)
-        let lapic = madt.add(44);
-        *lapic = 0; // Type = Processor Local APIC
-        *lapic.add(1) = 8; // Length
-        *lapic.add(2) = 0; // ACPI Processor ID
-        *lapic.add(3) = 0; // APIC ID
-        w::<u32>(lapic, 4, 1); // Flags: Enabled
+        let mut offset = 44;
 
-        // I/O APIC entry (type 1, length 12)
-        let ioapic = madt.add(52);
-        *ioapic = 1; // Type = I/O APIC
-        *ioapic.add(1) = 12; // Length
-        *ioapic.add(2) = 0; // I/O APIC ID
-        *ioapic.add(3) = 0; // Reserved
-        w::<u32>(ioapic, 4, 0xFEC0_0000); // I/O APIC Address
-        w::<u32>(ioapic, 8, 0); // Global System Interrupt Base
+        // CPU entry (type 0, 20 bytes)
+        let cpu = mpc.add(offset);
+        *cpu = 0; // Entry type = Processor
+        *cpu.add(1) = 0; // Local APIC ID
+        *cpu.add(2) = 0x14; // Local APIC version
+        *cpu.add(3) = 0x03; // CPU flags: enabled + bootstrap processor
+        w::<u32>(cpu, 4, 0); // CPU signature
+        w::<u32>(cpu, 8, 0); // Feature flags
+        // Reserved (8 bytes at offset 12)
+        offset += 20;
 
-        // Compute MADT checksum
-        let madt_slice = std::slice::from_raw_parts(madt, madt_len as usize);
-        let cksum = acpi_checksum(madt_slice);
-        *madt.add(9) = cksum;
+        // Bus entry (type 1, 8 bytes)
+        let bus = mpc.add(offset);
+        *bus = 1; // Entry type = Bus
+        *bus.add(1) = 0; // Bus ID
+        std::ptr::copy_nonoverlapping(b"ISA   ".as_ptr(), bus.add(2), 6); // Bus type
+        offset += 8;
 
-        // === XSDT (Extended System Description Table) ===
-        let xsdt = host_mem.add(ACPI_TABLES_ADDR as usize);
-        std::ptr::write_bytes(xsdt, 0, 64);
+        // I/O APIC entry (type 2, 8 bytes)
+        let ioapic = mpc.add(offset);
+        *ioapic = 2; // Entry type = I/O APIC
+        *ioapic.add(1) = 0; // I/O APIC ID
+        *ioapic.add(2) = 0x11; // I/O APIC version
+        *ioapic.add(3) = 0x01; // Flags: enabled
+        w::<u32>(ioapic, 4, 0xFEC0_0000); // I/O APIC address
+        offset += 8;
 
-        // XSDT header (36 bytes) + one 8-byte pointer to MADT
-        let xsdt_len: u32 = 36 + 8;
-        std::ptr::copy_nonoverlapping(b"XSDT".as_ptr(), xsdt, 4);
-        w::<u32>(xsdt, 4, xsdt_len);
-        *xsdt.add(8) = 1; // Revision
-        std::ptr::copy_nonoverlapping(b"CLOUDH".as_ptr(), xsdt.add(10), 6);
-        std::ptr::copy_nonoverlapping(b"CHXSDT  ".as_ptr(), xsdt.add(16), 8);
-        w::<u32>(xsdt, 24, 1);
-        std::ptr::copy_nonoverlapping(b"CLHV".as_ptr(), xsdt.add(28), 4);
-        w::<u32>(xsdt, 32, 1);
-        // Pointer to MADT
-        w::<u64>(xsdt, 36, madt_addr);
-        // Checksum
-        let xsdt_slice = std::slice::from_raw_parts(xsdt, xsdt_len as usize);
-        let cksum = acpi_checksum(xsdt_slice);
-        *xsdt.add(9) = cksum;
+        // I/O Interrupt Assignment entries (type 3, 8 bytes each)
+        // Map ISA IRQs 0-15 to I/O APIC inputs 0-15
+        for irq in 0..16u8 {
+            let entry = mpc.add(offset);
+            *entry = 3; // Entry type = I/O Interrupt Assignment
+            *entry.add(1) = 0; // Interrupt type: INT (vectored)
+            w::<u16>(entry, 2, 0); // Flags: default (bus-type dependent)
+            *entry.add(4) = 0; // Source bus ID
+            *entry.add(5) = irq; // Source bus IRQ
+            *entry.add(6) = 0; // Dest I/O APIC ID
+            *entry.add(7) = irq; // Dest I/O APIC INTIN#
+            offset += 8;
+        }
 
-        // === RSDP (Root System Description Pointer) ===
-        let rsdp = host_mem.add(ACPI_RSDP_ADDR as usize);
-        std::ptr::write_bytes(rsdp, 0, 36);
+        // Write length
+        w::<u16>(mpc, 4, offset as u16);
 
-        // RSDP v2 (36 bytes)
-        std::ptr::copy_nonoverlapping(b"RSD PTR ".as_ptr(), rsdp, 8); // Signature
-        // Checksum at offset 8 — computed later
-        std::ptr::copy_nonoverlapping(b"CLOUDH".as_ptr(), rsdp.add(9), 6); // OEM ID
-        *rsdp.add(15) = 2; // Revision (ACPI 2.0+)
-        w::<u32>(rsdp, 16, ACPI_TABLES_ADDR as u32); // RSDT Address (same as XSDT for simplicity)
-        w::<u32>(rsdp, 20, 36); // Length (RSDP v2 = 36 bytes)
-        w::<u64>(rsdp, 24, ACPI_TABLES_ADDR); // XSDT Address
-        // Extended checksum at offset 32
-        let rsdp_slice = std::slice::from_raw_parts(rsdp, 36);
-        // First compute checksum for bytes 0-19 (RSDP v1 portion)
-        let cksum_v1 = acpi_checksum(&rsdp_slice[..20]);
-        *rsdp.add(8) = cksum_v1;
-        // Then extended checksum for all 36 bytes
-        let rsdp_slice = std::slice::from_raw_parts(rsdp, 36);
-        let cksum_ext = acpi_checksum(rsdp_slice);
-        *rsdp.add(32) = cksum_ext;
+        // Compute checksum
+        let mpc_slice = std::slice::from_raw_parts(mpc, offset);
+        let cksum = mp_checksum(mpc_slice);
+        *mpc.add(7) = cksum;
+
+        // === MP Floating Pointer Structure at MP_FP_ADDR ===
+        // The kernel scans EBDA (from BDA pointer at 0x40E) and 0xE0000-0xFFFFF
+        // for the "_MP_" signature on 16-byte boundaries.
+        let mpfp = host_mem.add(MP_FP_ADDR as usize);
+        std::ptr::write_bytes(mpfp, 0, 16);
+
+        std::ptr::copy_nonoverlapping(b"_MP_".as_ptr(), mpfp, 4); // Signature
+        w::<u32>(mpfp, 4, MP_TABLE_ADDR as u32); // Physical pointer to MP config table
+        *mpfp.add(8) = 1; // Length (in 16-byte units)
+        *mpfp.add(9) = 4; // Spec revision (MP 1.4)
+        // Checksum at offset 10
+        // Feature bytes at 11-15 = 0
+
+        let mpfp_slice = std::slice::from_raw_parts(mpfp, 16);
+        let cksum = mp_checksum(mpfp_slice);
+        *mpfp.add(10) = cksum;
+
+        // Write BDA EBDA pointer at 0x40E (segment of EBDA)
+        // EBDA at 0x9FC00 → segment = 0x9FC0
+        w::<u16>(host_mem, 0x40E, 0x9FC0u16);
     }
 
-    println!("  ACPI tables: RSDP at {ACPI_RSDP_ADDR:#X}, XSDT+MADT at {ACPI_TABLES_ADDR:#X}");
+    println!("  MP tables: FP at {MP_FP_ADDR:#X}, config at {MP_TABLE_ADDR:#X}");
 }
 const PDPTE_ADDR: u64 = 0xB000;
 const PDE_ADDR: u64 = 0xC000; // 4 pages: 0xC000, 0xD000, 0xE000, 0xF000
@@ -934,10 +963,19 @@ struct SerialVmOps {
     pit_reload: std::sync::atomic::AtomicU16,
     /// Port 0x61 (NMI Status and Control) register value.
     port61: std::sync::atomic::AtomicU8,
+    /// I/O APIC register select (IOREGSEL).
+    ioapic_regsel: std::sync::atomic::AtomicU32,
+    /// I/O APIC redirection table (24 entries).
+    ioapic_redtbl: std::sync::Mutex<[u64; 24]>,
 }
 
 impl SerialVmOps {
     fn new() -> Self {
+        // Initialize redirection table: all entries masked (bit 16 = 1)
+        let mut redtbl = [0u64; 24];
+        for entry in &mut redtbl {
+            *entry = 1 << 16; // Masked
+        }
         SerialVmOps {
             input: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seen_ports: std::sync::Mutex::new(std::collections::BTreeSet::new()),
@@ -945,6 +983,8 @@ impl SerialVmOps {
             pit_start: std::time::Instant::now(),
             pit_reload: std::sync::atomic::AtomicU16::new(0xFFFF),
             port61: std::sync::atomic::AtomicU8::new(0),
+            ioapic_regsel: std::sync::atomic::AtomicU32::new(0),
+            ioapic_redtbl: std::sync::Mutex::new(redtbl),
         }
     }
 
@@ -962,6 +1002,51 @@ impl SerialVmOps {
         let mut buf = self.input.lock().unwrap();
         buf.pop_front()
     }
+
+    /// Read an I/O APIC register.
+    fn ioapic_read(&self, reg: u32) -> u32 {
+        match reg {
+            0x00 => 0, // IOAPIC ID
+            0x01 => {
+                // IOAPIC Version: bits 0-7 = version (0x11), bits 16-23 = max redir entry (23)
+                0x0017_0011
+            }
+            0x02 => 0, // Arbitration ID
+            0x10..=0x3F => {
+                // Redirection table: reg 0x10+2*n = low, 0x11+2*n = high
+                let idx = ((reg - 0x10) / 2) as usize;
+                let high = (reg - 0x10) % 2 == 1;
+                if idx < 24 {
+                    let tbl = self.ioapic_redtbl.lock().unwrap();
+                    if high { (tbl[idx] >> 32) as u32 } else { tbl[idx] as u32 }
+                } else { 0 }
+            }
+            _ => 0,
+        }
+    }
+
+    /// Write an I/O APIC register.
+    fn ioapic_write(&self, reg: u32, val: u32) {
+        match reg {
+            0x00 => {} // IOAPIC ID (ignore)
+            0x10..=0x3F => {
+                let idx = ((reg - 0x10) / 2) as usize;
+                let high = (reg - 0x10) % 2 == 1;
+                if idx < 24 {
+                    let mut tbl = self.ioapic_redtbl.lock().unwrap();
+                    if high {
+                        tbl[idx] = (tbl[idx] & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32);
+                    } else {
+                        tbl[idx] = (tbl[idx] & 0xFFFF_FFFF_0000_0000) | (val as u64);
+                    }
+                    if self.debug {
+                        eprintln!("[IOAPIC] redir[{idx}] = {:#018X}", tbl[idx]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl VmOps for SerialVmOps {
@@ -972,16 +1057,43 @@ impl VmOps for SerialVmOps {
         Ok(0)
     }
     fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> Result<(), HypervisorVmError> {
-        if self.debug {
-            eprintln!("[MMIO] read GPA={gpa:#X} len={}", data.len());
+        use std::sync::atomic::Ordering;
+        let val: u32 = match gpa {
+            0xFEC00000 => self.ioapic_regsel.load(Ordering::Relaxed),
+            0xFEC00010 => {
+                let reg = self.ioapic_regsel.load(Ordering::Relaxed);
+                self.ioapic_read(reg)
+            }
+            _ => {
+                if self.debug {
+                    eprintln!("[MMIO] read GPA={gpa:#X} len={}", data.len());
+                }
+                0
+            }
+        };
+        let bytes = val.to_le_bytes();
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = if i < 4 { bytes[i] } else { 0 };
         }
-        // Return 0 for IOAPIC/LAPIC reads (WHP handles LAPIC internally)
-        data.fill(0);
         Ok(())
     }
     fn mmio_write(&self, gpa: u64, data: &[u8]) -> Result<(), HypervisorVmError> {
-        if self.debug {
-            eprintln!("[MMIO] write GPA={gpa:#X} data={data:02X?}");
+        use std::sync::atomic::Ordering;
+        let mut bytes = [0u8; 4];
+        let len = data.len().min(4);
+        bytes[..len].copy_from_slice(&data[..len]);
+        let val = u32::from_le_bytes(bytes);
+        match gpa {
+            0xFEC00000 => { self.ioapic_regsel.store(val, Ordering::Relaxed); }
+            0xFEC00010 => {
+                let reg = self.ioapic_regsel.load(Ordering::Relaxed);
+                self.ioapic_write(reg, val);
+            }
+            _ => {
+                if self.debug {
+                    eprintln!("[MMIO] write GPA={gpa:#X} data={data:02X?}");
+                }
+            }
         }
         Ok(())
     }

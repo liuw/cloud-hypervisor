@@ -273,6 +273,7 @@ impl WhpVm {
         })?;
 
         // No extended VM exits needed — WHP's APIC emulation handles timers internally.
+        // HLT is handled by WHP internally (the LAPIC timer should wake the vCPU).
 
         // SAFETY: Completes the partition setup.
         unsafe {
@@ -1056,7 +1057,7 @@ impl cpu::Vcpu for WhpVcpu {
             }
 
             WHvRunVpExitReasonUnrecoverableException => {
-                warn!("WHP: unrecoverable exception");
+                warn!("WHP: unrecoverable exception at RIP={:#x}", exit_context.VpContext.Rip);
                 Ok(cpu::VmExit::Shutdown)
             }
 
