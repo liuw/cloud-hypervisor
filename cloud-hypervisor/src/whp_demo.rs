@@ -7,7 +7,7 @@
 //   cloud-hypervisor.exe --kernel <bzImage>     # load a Linux bzImage
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
@@ -227,17 +227,105 @@ fn load_kernel(host_mem: *mut u8, path: &str) -> anyhow::Result<u64> {
     let file_size = metadata.len() as usize;
     println!("Loading kernel: {path} ({file_size} bytes)");
 
-    // Read the entire kernel file into a buffer
-    let mut kernel_data = vec![0u8; file_size];
-    file.read_exact(&mut kernel_data)?;
+    // Read first bytes to detect format
+    let mut header = [0u8; 0x210];
+    let header_len = file.read(&mut header).context("Read header")?;
+    file.seek(std::io::SeekFrom::Start(0)).context("Seek")?;
 
-    // Check for bzImage magic at offset 0x202 ("HdrS")
-    if file_size > 0x206 && &kernel_data[0x202..0x206] == b"HdrS" {
-        load_bzimage(host_mem, &kernel_data)
+    if &header[0..4] == b"\x7FELF" {
+        println!("  Format: ELF");
+        load_elf(host_mem, &mut file)
+    } else if header_len > 0x206 && &header[0x202..0x206] == b"HdrS" {
+        println!("  Format: bzImage");
+        let mut data = vec![0u8; file_size];
+        file.read_exact(&mut data)?;
+        load_bzimage(host_mem, &data)
     } else {
-        // Try loading as flat binary at 1 MiB
-        load_flat_binary(host_mem, &kernel_data)
+        println!("  Format: flat binary");
+        let mut data = vec![0u8; file_size];
+        file.read_exact(&mut data)?;
+        load_flat_binary(host_mem, &data)
     }
+}
+
+fn load_elf(host_mem: *mut u8, file: &mut File) -> anyhow::Result<u64> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    // Read ELF header to find entry point and program headers
+    let mut ehdr = [0u8; 64]; // ELF64 header
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut ehdr)?;
+
+    let entry = u64::from_le_bytes(ehdr[24..32].try_into().unwrap());
+    let phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
+    let phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as usize;
+    let phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap()) as usize;
+
+    println!("  ELF entry: {entry:#x}, {phnum} program headers");
+
+    // Load each PT_LOAD segment
+    for i in 0..phnum {
+        let mut phdr = vec![0u8; phentsize];
+        file.seek(SeekFrom::Start(phoff + (i * phentsize) as u64))?;
+        file.read_exact(&mut phdr)?;
+
+        let p_type = u32::from_le_bytes(phdr[0..4].try_into().unwrap());
+        if p_type != 1 { continue; } // PT_LOAD = 1
+
+        let p_offset = u64::from_le_bytes(phdr[8..16].try_into().unwrap());
+        let p_paddr = u64::from_le_bytes(phdr[24..32].try_into().unwrap());
+        let p_filesz = u64::from_le_bytes(phdr[32..40].try_into().unwrap());
+        let p_memsz = u64::from_le_bytes(phdr[40..48].try_into().unwrap());
+
+        if p_paddr as usize + p_memsz as usize > GUEST_MEM_SIZE {
+            return Err(anyhow!("ELF segment at {p_paddr:#x} + {p_memsz:#x} exceeds guest memory"));
+        }
+
+        // Read segment data from file into guest memory
+        let mut data = vec![0u8; p_filesz as usize];
+        file.seek(SeekFrom::Start(p_offset))?;
+        file.read_exact(&mut data)?;
+        // SAFETY: Writing within allocated guest memory bounds.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), host_mem.add(p_paddr as usize), data.len());
+        }
+        println!("  Loaded segment: {p_paddr:#010x} ({p_filesz} bytes, memsz {p_memsz})");
+    }
+
+    // Write bootstrap for mode transition, then jump to entry
+    write_pm_bootstrap_to_entry(host_mem, entry);
+    Ok(BOOTSTRAP_ADDR)
+}
+
+/// Bootstrap that transitions to protected mode and jumps to a specific entry point.
+fn write_pm_bootstrap_to_entry(host_mem: *mut u8, entry: u64) {
+    // GDT at 0x500 (written by caller)
+    // GDT descriptor at GDT_DESC_ADDR (0x2100)
+    let gdt_desc: [u8; 6] = {
+        let mut d = [0u8; 6];
+        d[0..2].copy_from_slice(&31u16.to_le_bytes()); // 4 entries * 8 - 1
+        d[2..6].copy_from_slice(&0x500u32.to_le_bytes());
+        d
+    };
+    // SAFETY: Writing within guest memory bounds.
+    unsafe { std::ptr::copy_nonoverlapping(gdt_desc.as_ptr(), host_mem.add(GDT_DESC_ADDR as usize), 6) };
+
+    let mut code = Vec::new();
+    code.push(0xFA); // cli
+    code.extend_from_slice(&[0x0F, 0x01, 0x16]); // lgdt [GDT_DESC_ADDR]
+    code.extend_from_slice(&(GDT_DESC_ADDR as u16).to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0x20, 0xC0]); // mov eax, cr0
+    code.extend_from_slice(&[0x0C, 0x01]); // or al, 1
+    code.extend_from_slice(&[0x0F, 0x22, 0xC0]); // mov cr0, eax
+    code.extend_from_slice(&[0x66, 0xEA]); // jmp far
+    code.extend_from_slice(&(entry as u32).to_le_bytes()); // offset
+    code.extend_from_slice(&0x08u16.to_le_bytes()); // CS = code selector
+
+    // SAFETY: Writing within guest memory bounds.
+    unsafe {
+        std::ptr::copy_nonoverlapping(code.as_ptr(), host_mem.add(BOOTSTRAP_ADDR as usize), code.len());
+    }
+    println!("  Bootstrap at {BOOTSTRAP_ADDR:#X} → PM jmp to {entry:#x}");
 }
 
 fn load_bzimage(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
