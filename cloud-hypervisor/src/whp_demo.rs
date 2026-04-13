@@ -131,8 +131,8 @@ pub fn run() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("timer-inject".to_string())
             .spawn(move || {
-                // Wait for kernel to complete early init (all 90 boot lines)
-                std::thread::sleep(std::time::Duration::from_secs(3));
+                // Start immediately — kernel reaches its spin loop within milliseconds
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 let whp = vm_for_timer.as_any().downcast_ref::<WhpVm>().unwrap();
                 eprintln!("[timer] Starting timer injection loop");
                 let mut tick = 0u64;
@@ -747,7 +747,7 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         std::ptr::write_bytes(bp, 0, 4096);
 
         // Write command line
-        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 nomodules tsc=reliable lpj=1000000 no_timer_check lapic\0";
+        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 nomodules tsc=reliable lpj=1000000 no_timer_check noapictimer noapic\0";
         std::ptr::copy_nonoverlapping(
             cmdline.as_ptr(),
             host_mem.add(CMDLINE_ADDR as usize),

@@ -1074,27 +1074,36 @@ impl cpu::Vcpu for WhpVcpu {
 
             WHvRunVpExitReasonCanceled => {
                 // vCPU run was canceled (by timer thread).
-                // Only inject timer interrupt after kernel has booted (>500ms)
-                // and is in kernel virtual address space (high RIP).
                 let elapsed = self.start_time.elapsed();
                 let rip = exit_context.VpContext.Rip;
-                if elapsed.as_millis() > 500 && rip > 0xFFFF_FFFF_0000_0000 {
+                let count = self.exit_count.get();
+                if count % 100 == 0 {
+                    eprintln!("[vcpu] Canceled exit #{count} RIP={rip:#x} {:.1}s", elapsed.as_secs_f64());
+                }
+                // Only inject timer interrupt after kernel has booted (>500ms)
+                // and is in kernel virtual address space (high RIP).
+                if elapsed.as_millis() > 20 && rip > 0xFFFF_FFFF_0000_0000 {
                     // Inject timer interrupt and clear HLT suspend
                     let reg_names = [
                         WHvRegisterPendingInterruption,
                         WHvRegisterInternalActivityState,
                     ];
                     let mut reg_values = [WHV_REGISTER_VALUE::default(); 2];
-                    reg_values[0] = reg64_value(1 | (0x20u64 << 8));
+                    reg_values[0] = reg64_value(1 | (0xEFu64 << 8));
                     reg_values[1] = reg64_value(0);
-                    unsafe {
-                        let _ = WHvSetVirtualProcessorRegisters(
+                    let result = unsafe {
+                        WHvSetVirtualProcessorRegisters(
                             self.partition,
                             self.vp_index,
                             reg_names.as_ptr(),
                             reg_names.len() as u32,
                             reg_values.as_ptr(),
-                        );
+                        )
+                    };
+                    if let Err(e) = result {
+                        warn!("WHP: Failed to inject timer: {e}");
+                    } else if count % 100 == 0 {
+                        eprintln!("[vcpu] Injected timer at RIP={rip:#x}");
                     }
                 }
                 Ok(cpu::VmExit::Ignore)
