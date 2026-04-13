@@ -269,6 +269,27 @@ impl WhpVm {
         Ok(())
     }
 
+    /// Map a GPA range as read-only to trap writes (generates MemoryAccess exits).
+    pub fn map_gpa_trap(&self, gpa: u64, size: u64, host_addr: *mut u8) -> vm::Result<()> {
+        self.ensure_setup()?;
+        // Map as read-only: reads return host memory content, writes trap as MMIO exits.
+        unsafe {
+            WHvMapGpaRange(
+                self.partition,
+                host_addr as *const std::ffi::c_void,
+                gpa,
+                size,
+                WHvMapGpaRangeFlagRead, // Read-only: writes generate MemoryAccess exits
+            )
+            .map_err(|e| {
+                vm::HypervisorVmError::CreateUserMemory(anyhow!(
+                    "WHvMapGpaRange (trap) failed: {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Ensure the partition is set up. Must be called before creating vCPUs.
     fn ensure_setup(&self) -> vm::Result<()> {
         let mut is_setup = self.is_setup.write().unwrap();
@@ -630,32 +651,111 @@ impl WhpVcpu {
         // SAFETY: Access the union bitfield for access type info.
         let access_info = unsafe { context.AccessInfo.AsUINT32 };
         let is_write = (access_info & 1) != 0; // Bit 0 = AccessType (write=1)
-        let access_size = ((access_info >> 4) & 0xF) as usize; // Bits 4-7 = AccessSize
-        let instruction_length = context.InstructionByteCount as u64;
+        let instr_bytes = &context.InstructionBytes[..context.InstructionByteCount as usize];
 
         if is_write {
-            // For MMIO writes, we need to read the data from the instruction bytes.
-            // The data is embedded in the instruction encoding.
-            let data = vec![0u8; access_size.max(1)];
+            // Decode the write value from the instruction bytes.
+            // Common patterns for writel (mov dword [mem], reg or mov dword [mem], imm32):
+            // We use a simple heuristic: get the source register from the instruction encoding.
+            let data = self.decode_mmio_write_data(instr_bytes);
             vm_ops.mmio_write(gpa, &data).map_err(|e| {
                 HypervisorCpuError::RunVcpu(anyhow!("MMIO write error: {e}"))
             })?;
         } else {
-            let mut data = vec![0u8; access_size.max(1)];
+            // For reads, get the data from VmOps then place it in the destination register.
+            let mut data = [0u8; 4];
             vm_ops.mmio_read(gpa, &mut data).map_err(|e| {
                 HypervisorCpuError::RunVcpu(anyhow!("MMIO read error: {e}"))
             })?;
+            // Place the read value in RAX (most common destination for readl).
+            let reg_name = [WHvX64RegisterRax];
+            let val = u32::from_le_bytes(data) as u64;
+            let reg_val = [reg64_value(val)];
+            self.set_registers(&reg_name, &reg_val)?;
         }
 
-        // Advance RIP past the instruction.
+        // Advance RIP past the instruction using VpContext.InstructionLength.
         let rip_name = [WHvX64RegisterRip];
         let values = self.get_registers(&rip_name)?;
         // SAFETY: Reg64 is valid for the RIP register value.
-        let new_rip = unsafe { values[0].Reg64 } + instruction_length;
+        let instr_len = context.InstructionByteCount as u64;
+        let new_rip = unsafe { values[0].Reg64 } + instr_len;
         let new_values = [reg64_value(new_rip)];
         self.set_registers(&rip_name, &new_values)?;
 
         Ok(())
+    }
+
+    /// Decode the write data from MMIO instruction bytes.
+    /// Handles common x86-64 `mov [mem], reg` and `mov [mem], imm32` patterns.
+    fn decode_mmio_write_data(&self, instr: &[u8]) -> [u8; 4] {
+        // For simplicity, read the source register value from the vCPU.
+        // The instruction encoding tells us which register, but as a fallback
+        // we assume the source is EAX (the most common case for writel).
+        // This is used for IOAPIC register writes which are always 32-bit.
+        
+        // Try to find the source register from the instruction encoding
+        // Common patterns:
+        // 89 XX XX XX XX = mov [disp32], eax/ecx/... (reg in bits 3-5 of ModRM)
+        // C7 XX XX XX XX imm32 = mov [mem], imm32
+        let mut pos = 0;
+        // Skip prefixes (REX, address size, etc.)
+        while pos < instr.len() {
+            match instr[pos] {
+                0x40..=0x4F => pos += 1, // REX prefix
+                0x66 | 0x67 => pos += 1, // operand/address size
+                0xF0 | 0xF2 | 0xF3 => pos += 1, // lock/rep
+                _ => break,
+            }
+        }
+        if pos >= instr.len() {
+            return [0; 4];
+        }
+
+        let opcode = instr[pos];
+        match opcode {
+            // mov [mem], imm32 (C7 /0)
+            0xC7 => {
+                // The immediate is at the end of the instruction
+                if instr.len() >= 4 {
+                    let imm_start = instr.len() - 4;
+                    let mut data = [0u8; 4];
+                    data.copy_from_slice(&instr[imm_start..]);
+                    return data;
+                }
+            }
+            // mov [mem], reg (0x89 ModRM)
+            0x89 => {
+                if pos + 1 < instr.len() {
+                    let modrm = instr[pos + 1];
+                    let reg = (modrm >> 3) & 7;
+                    // Read the register value
+                    let reg_name = match reg {
+                        0 => WHvX64RegisterRax,
+                        1 => WHvX64RegisterRcx,
+                        2 => WHvX64RegisterRdx,
+                        3 => WHvX64RegisterRbx,
+                        4 => WHvX64RegisterRsp,
+                        5 => WHvX64RegisterRbp,
+                        6 => WHvX64RegisterRsi,
+                        7 => WHvX64RegisterRdi,
+                        _ => WHvX64RegisterRax,
+                    };
+                    if let Ok(vals) = self.get_registers(&[reg_name]) {
+                        let v = unsafe { vals[0].Reg64 } as u32;
+                        return v.to_le_bytes();
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Fallback: read EAX
+        if let Ok(vals) = self.get_registers(&[WHvX64RegisterRax]) {
+            let v = unsafe { vals[0].Reg64 } as u32;
+            return v.to_le_bytes();
+        }
+        [0; 4]
     }
 
     /// Handle a PIO exit from WHvRunVirtualProcessor.
@@ -1055,6 +1155,16 @@ impl cpu::Vcpu for WhpVcpu {
             WHvRunVpExitReasonMemoryAccess => {
                 // SAFETY: The union field is valid for this exit reason.
                 let mem_ctx = unsafe { &exit_context.Anonymous.MemoryAccess };
+                let count = self.exit_count.get();
+                if count < 10 || count % 1000 == 0 {
+                    let access_info = unsafe { mem_ctx.AccessInfo.AsUINT32 };
+                    let is_write = (access_info & 1) != 0;
+                    eprintln!("[mmio] #{count} GPA={:#X} {} bytes={} RIP={:#X}",
+                             mem_ctx.Gpa,
+                             if is_write { "W" } else { "R" },
+                             mem_ctx.InstructionByteCount,
+                             exit_context.VpContext.Rip);
+                }
                 self.handle_mmio(mem_ctx)?;
                 Ok(cpu::VmExit::Ignore)
             }

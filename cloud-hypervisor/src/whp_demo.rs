@@ -69,26 +69,24 @@ pub fn run() -> anyhow::Result<()> {
     }
     println!("Mapped {} MiB guest RAM at GPA 0x0", GUEST_MEM_SIZE >> 20);
 
-    // Map a dedicated page for the I/O APIC at 0xFEC00000.
-    // WHP doesn't generate MMIO exits for unmapped regions (returns 0 silently),
-    // so we must map it as RAM for the kernel to read the version register.
-    // IOAPIC redirect table tracking is done via a shared state in SerialVmOps
-    // by monitoring PIO writes to debug port 0x80 (the kernel writes to port 0x80
-    // as I/O delays between IOAPIC register writes).
+    // Map the I/O APIC page at 0xFEC00000 with NO access flags.
+    // Any guest read/write will generate a WHvRunVpExitReasonMemoryAccess exit,
+    // which is handled by the IOAPIC emulation in VmOps::mmio_read/mmio_write.
     let ioapic_page_layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
     // SAFETY: Allocating a page-aligned 4K buffer.
     let ioapic_host = unsafe { std::alloc::alloc_zeroed(ioapic_page_layout) };
     if ioapic_host.is_null() {
         return Err(anyhow!("Failed to allocate IOAPIC page"));
     }
+    // Map IOAPIC page as normal RAM for version register discovery.
+    // WHP doesn't support trap pages (read-only or no-access) for MMIO emulation.
     unsafe {
-        // Pre-populate: IOREGSEL=1 (version), IOWIN=version value
         std::ptr::write_unaligned(ioapic_host as *mut u32, 1);
         std::ptr::write_unaligned(ioapic_host.add(0x10) as *mut u32, 0x0017_0011u32);
         vm.create_user_memory_region(1, 0xFEC0_0000, 4096, ioapic_host, false, false)
             .context("Failed to map IOAPIC page")?;
     }
-    println!("Mapped IOAPIC page at GPA 0xFEC00000");
+    println!("Mapped IOAPIC trap page at GPA 0xFEC00000");
 
     // ── Load payload ─────────────────────────────────────────────────────
     let entry_point = if let Some(ref path) = kernel_path {
@@ -163,8 +161,8 @@ pub fn run() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("timer-inject".to_string())
             .spawn(move || {
-                // Start immediately
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                // Wait for kernel to output boot messages before starting timer
+                std::thread::sleep(std::time::Duration::from_secs(2));
                 let whp = vm_for_timer.as_any().downcast_ref::<WhpVm>().unwrap();
                 eprintln!("[timer] Starting timer injection loop");
                 let mut tick = 0u64;
