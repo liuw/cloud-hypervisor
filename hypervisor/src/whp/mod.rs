@@ -199,6 +199,25 @@ impl WhpVm {
         self.partition
     }
 
+    /// Request an interrupt via WHvRequestInterrupt (safe to call while vCPU is running).
+    pub fn request_interrupt(&self, vector: u8, destination: u32) -> std::result::Result<(), anyhow::Error> {
+        let interrupt = WHV_INTERRUPT_CONTROL {
+            _bitfield: WHvX64InterruptTypeFixed.0 as u64,
+            Destination: destination,
+            Vector: vector as u32,
+        };
+        // SAFETY: WHvRequestInterrupt is safe to call from any thread.
+        unsafe {
+            WHvRequestInterrupt(
+                self.partition,
+                &interrupt,
+                std::mem::size_of::<WHV_INTERRUPT_CONTROL>() as u32,
+            )
+            .map_err(|e| anyhow!("WHvRequestInterrupt failed: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Inject a fixed interrupt into the guest vCPU using WHvRegisterPendingEvent.
     /// Also kicks the vCPU out of HLT if needed.
     pub fn inject_interrupt(&self, vector: u8, vp_index: u32) -> std::result::Result<(), anyhow::Error> {
@@ -272,8 +291,8 @@ impl WhpVm {
             ))
         })?;
 
-        // No extended VM exits needed — WHP's APIC emulation handles timers internally.
-        // HLT is handled by WHP internally (the LAPIC timer should wake the vCPU).
+        // Do NOT enable HLT exits — they disrupt early kernel boot.
+        // Timer interrupts are injected from a separate thread after kernel init.
 
         // SAFETY: Completes the partition setup.
         unsafe {
@@ -333,6 +352,8 @@ impl vm::Vm for WhpVm {
             partition: self.partition,
             vp_index: id,
             vm_ops,
+            exit_count: std::cell::Cell::new(0),
+            start_time: std::time::Instant::now(),
         }))
     }
 
@@ -481,6 +502,10 @@ pub struct WhpVcpu {
     partition: WHV_PARTITION_HANDLE,
     vp_index: u32,
     vm_ops: Option<Arc<dyn VmOps>>,
+    /// Count of total VM exits (used for HLT interrupt injection gating).
+    exit_count: std::cell::Cell<u64>,
+    /// Time when vCPU was created.
+    start_time: std::time::Instant,
 }
 
 // SAFETY: WHV_PARTITION_HANDLE is thread-safe, and vp_index is just a u32.
@@ -1023,6 +1048,8 @@ impl cpu::Vcpu for WhpVcpu {
         debug!("WHP: exit reason = {:?}, RIP = {:#x}", 
                exit_context.ExitReason, exit_context.VpContext.Rip);
 
+        self.exit_count.set(self.exit_count.get() + 1);
+
         #[allow(non_upper_case_globals)]
         match exit_context.ExitReason {
             WHvRunVpExitReasonMemoryAccess => {
@@ -1046,7 +1073,30 @@ impl cpu::Vcpu for WhpVcpu {
             }
 
             WHvRunVpExitReasonCanceled => {
-                debug!("WHP: vCPU run canceled");
+                // vCPU run was canceled (by timer thread).
+                // Only inject timer interrupt after kernel has booted (>500ms)
+                // and is in kernel virtual address space (high RIP).
+                let elapsed = self.start_time.elapsed();
+                let rip = exit_context.VpContext.Rip;
+                if elapsed.as_millis() > 500 && rip > 0xFFFF_FFFF_0000_0000 {
+                    // Inject timer interrupt and clear HLT suspend
+                    let reg_names = [
+                        WHvRegisterPendingInterruption,
+                        WHvRegisterInternalActivityState,
+                    ];
+                    let mut reg_values = [WHV_REGISTER_VALUE::default(); 2];
+                    reg_values[0] = reg64_value(1 | (0x20u64 << 8));
+                    reg_values[1] = reg64_value(0);
+                    unsafe {
+                        let _ = WHvSetVirtualProcessorRegisters(
+                            self.partition,
+                            self.vp_index,
+                            reg_names.as_ptr(),
+                            reg_names.len() as u32,
+                            reg_values.as_ptr(),
+                        );
+                    }
+                }
                 Ok(cpu::VmExit::Ignore)
             }
 

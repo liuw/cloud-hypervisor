@@ -122,7 +122,35 @@ pub fn run() -> anyhow::Result<()> {
     // Start a timer interrupt injection thread for kernel boot.
     // The kernel needs periodic timer interrupts (IRQ 0) to run the scheduler.
     // We inject a fixed interrupt at vector 0x20 (standard PIT→PIC mapping) at ~100 Hz.
-    // Timer interrupt injection is handled in the vCPU loop below.
+    // Timer interrupt injection is handled via a background thread.
+    // After a delay (letting kernel boot), periodically inject timer interrupts
+    // and cancel the vCPU run to wake it from WHP-internal HLT.
+    if kernel_path.is_some() {
+        use hypervisor::whp::WhpVm;
+        let vm_for_timer: Arc<dyn hypervisor::Vm> = vm.clone();
+        std::thread::Builder::new()
+            .name("timer-inject".to_string())
+            .spawn(move || {
+                // Wait for kernel to complete early init (all 90 boot lines)
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                let whp = vm_for_timer.as_any().downcast_ref::<WhpVm>().unwrap();
+                eprintln!("[timer] Starting timer injection loop");
+                let mut tick = 0u64;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    match whp.cancel_run(0) {
+                        Ok(()) => {
+                            if tick == 0 { eprintln!("[timer] First cancel_run OK"); }
+                        }
+                        Err(e) => {
+                            if tick < 3 { eprintln!("[timer] cancel_run failed: {e}"); }
+                        }
+                    }
+                    tick += 1;
+                }
+            })
+            .context("Failed to spawn timer thread")?;
+    }
 
     // Start a stdin reader thread that feeds input to the serial port
     let vm_ops_for_stdin = vm_ops.clone();
