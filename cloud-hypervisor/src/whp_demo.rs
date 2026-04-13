@@ -828,7 +828,7 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         std::ptr::write_bytes(bp, 0, 4096);
 
         // Write command line
-        let cmdline = b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 tsc=reliable idle=halt rdinit=/init\0";
+        let cmdline = b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check tsc=reliable idle=halt rdinit=/init\0";
         std::ptr::copy_nonoverlapping(
             cmdline.as_ptr(),
             host_mem.add(CMDLINE_ADDR as usize),
