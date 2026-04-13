@@ -17,7 +17,7 @@ use vm_memory::bitmap::AtomicBitmap;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const GUEST_MEM_SIZE: usize = 128 << 20; // 128 MiB
+const GUEST_MEM_SIZE: usize = 256 << 20; // 256 MiB
 const SERIAL_PORT: u64 = 0x3F8;
 const DEBUG_EXIT_PORT: u64 = 0x501;
 
@@ -293,8 +293,27 @@ fn load_elf(host_mem: *mut u8, file: &mut File) -> anyhow::Result<u64> {
         println!("  Loaded segment: {p_paddr:#010x} ({p_filesz} bytes, memsz {p_memsz})");
     }
 
-    // Write bootstrap for mode transition, then jump to entry
-    write_pm_bootstrap_to_entry(host_mem, entry);
+    // Write bootstrap for mode transition, then jump to entry.
+    // Use the simple bootstrap — far jump directly to 64-bit code segment.
+    // GDT entry 1 (selector 0x08) has L=1 (long mode), and WHP handles
+    // the mode transition when loading this selector.
+    write_pm_bootstrap(host_mem);
+
+    // Set up boot_params (zero page) for Linux boot protocol
+    setup_linux_boot_params(host_mem);
+
+    // Override the bootstrap's jump target to the ELF entry
+    // The simple bootstrap jumps to KERNEL_LOAD_ADDR (0x100000) by default.
+    // For ELF, we need to jump to the actual entry point.
+    // Patch the far jump offset in the bootstrap code.
+    // The far jump is at offset 14 in the bootstrap: 66 EA <4-byte offset> <2-byte selector>
+    // Offset of the jump target = BOOTSTRAP_ADDR + 16 (14 for instructions before + 2 for 66 EA)
+    // SAFETY: Patching within guest memory.
+    unsafe {
+        *(host_mem.add(BOOTSTRAP_ADDR as usize + 16) as *mut u32) = entry as u32;
+    }
+    println!("  Patched bootstrap jmp target to {entry:#x}");
+
     Ok(BOOTSTRAP_ADDR)
 }
 
@@ -550,6 +569,58 @@ fn setup_gdt(host_mem: *mut u8) {
 }
 
 const PML4_ADDR: u64 = 0xA000;
+
+/// Set up Linux boot parameters (zero page) at BOOT_PARAMS_ADDR.
+fn setup_linux_boot_params(host_mem: *mut u8) {
+    // SAFETY: Writing boot_params fields within allocated guest memory.
+    unsafe {
+        let bp = host_mem.add(BOOT_PARAMS_ADDR as usize);
+
+        // Zero the entire 4K boot_params page
+        std::ptr::write_bytes(bp, 0, 4096);
+
+        // Boot protocol header signature at offset 0x202 = "HdrS"
+        std::ptr::copy_nonoverlapping(b"HdrS".as_ptr(), bp.add(0x202), 4);
+
+        // Boot protocol version at offset 0x206 = 0x020F (2.15)
+        *(bp.add(0x206) as *mut u16) = 0x020F;
+
+        // vid_mode at offset 0x1FA = 0xFFFF (normal)
+        *(bp.add(0x1FA) as *mut u16) = 0xFFFF;
+
+        // type_of_loader at offset 0x210 = 0xFF
+        *bp.add(0x210) = 0xFF;
+
+        // loadflags at offset 0x211 = LOADED_HIGH | KEEP_SEGMENTS | CAN_USE_HEAP
+        *bp.add(0x211) = 0xC1;
+
+        // cmd_line_ptr at offset 0x228
+        *(bp.add(0x228) as *mut u32) = CMDLINE_ADDR as u32;
+
+        // Write command line
+        let cmdline = b"console=ttyS0 earlyprintk=serial noapic noacpi pci=off nomodules\0";
+        std::ptr::copy_nonoverlapping(
+            cmdline.as_ptr(),
+            host_mem.add(CMDLINE_ADDR as usize),
+            cmdline.len(),
+        );
+
+        // E820 memory map — one entry: 0 to GUEST_MEM_SIZE, type=RAM(1)
+        // e820_table starts at offset 0x2D0, each entry is 20 bytes
+        let e820 = bp.add(0x2D0);
+        *(e820 as *mut u64) = 0;                      // addr
+        *(e820.add(8) as *mut u64) = GUEST_MEM_SIZE as u64; // size
+        *(e820.add(16) as *mut u32) = 1;               // type = RAM
+
+        // e820_entries at offset 0x1E8
+        *bp.add(0x1E8) = 1;
+
+        // init_size at offset 0x260 (required for recent kernels)
+        *(bp.add(0x260) as *mut u32) = GUEST_MEM_SIZE as u32;
+    }
+
+    println!("  Boot params at {BOOT_PARAMS_ADDR:#X}, cmdline at {CMDLINE_ADDR:#X}");
+}
 const PDPTE_ADDR: u64 = 0xB000;
 const PDE_ADDR: u64 = 0xC000; // 4 pages: 0xC000, 0xD000, 0xE000, 0xF000
 
