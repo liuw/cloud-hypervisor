@@ -72,9 +72,10 @@ pub fn run() -> anyhow::Result<()> {
         load_demo_payload(host_mem)
     };
 
-    // ── Set up GDT for protected mode ────────────────────────────────────
+    // ── Set up GDT and page tables for protected/long mode ─────────────
     if kernel_path.is_some() {
         setup_gdt(host_mem);
+        setup_page_tables(host_mem);
     }
 
     // ── Create vCPU ──────────────────────────────────────────────────────
@@ -297,35 +298,90 @@ fn load_elf(host_mem: *mut u8, file: &mut File) -> anyhow::Result<u64> {
     Ok(BOOTSTRAP_ADDR)
 }
 
-/// Bootstrap that transitions to protected mode and jumps to a specific entry point.
+/// Bootstrap that transitions real mode → 32-bit PM → 64-bit long mode → entry.
 fn write_pm_bootstrap_to_entry(host_mem: *mut u8, entry: u64) {
-    // GDT at 0x500 (written by caller)
-    // GDT descriptor at GDT_DESC_ADDR (0x2100)
+    // GDT descriptor at GDT_DESC_ADDR
     let gdt_desc: [u8; 6] = {
         let mut d = [0u8; 6];
-        d[0..2].copy_from_slice(&31u16.to_le_bytes()); // 4 entries * 8 - 1
-        d[2..6].copy_from_slice(&0x500u32.to_le_bytes());
+        d[0..2].copy_from_slice(&39u16.to_le_bytes()); // 5 entries * 8 - 1
+        d[2..6].copy_from_slice(&(GDT_ADDR as u32).to_le_bytes());
         d
     };
     // SAFETY: Writing within guest memory bounds.
     unsafe { std::ptr::copy_nonoverlapping(gdt_desc.as_ptr(), host_mem.add(GDT_DESC_ADDR as usize), 6) };
 
+    // 64-bit entry address stored at 0x2200 (used by the 32-bit trampoline)
+    // SAFETY: Writing within guest memory bounds.
+    unsafe { *(host_mem.add(0x2200) as *mut u64) = entry };
+
     let mut code = Vec::new();
+
+    // ── 16-bit real mode ──
     code.push(0xFA); // cli
-    code.extend_from_slice(&[0x0F, 0x01, 0x16]); // lgdt [GDT_DESC_ADDR]
+
+    // lgdt [GDT_DESC_ADDR]
+    code.extend_from_slice(&[0x0F, 0x01, 0x16]);
     code.extend_from_slice(&(GDT_DESC_ADDR as u16).to_le_bytes());
+
+    // mov eax, cr0; or al, 1; mov cr0, eax  (enable PE)
+    code.extend_from_slice(&[0x0F, 0x20, 0xC0]);
+    code.extend_from_slice(&[0x0C, 0x01]);
+    code.extend_from_slice(&[0x0F, 0x22, 0xC0]);
+
+    // Far jump to 32-bit code segment (selector 0x10 = 32-bit code in our GDT)
+    // Target: BOOTSTRAP_ADDR + pm32_offset (the next instruction after this jump)
+    let pm32_offset = code.len() + 7; // 66 EA <4 bytes offset> <2 bytes selector>
+    code.extend_from_slice(&[0x66, 0xEA]);
+    code.extend_from_slice(&((BOOTSTRAP_ADDR as u32) + pm32_offset as u32).to_le_bytes());
+    code.extend_from_slice(&0x10u16.to_le_bytes()); // CS = 32-bit code segment
+
+    // ── 32-bit protected mode ──
+    // Set data segments
+    code.extend_from_slice(&[0x66, 0xB8, 0x18, 0x00]); // mov ax, 0x18 (data selector)
+    code.extend_from_slice(&[0x8E, 0xD8]); // mov ds, ax
+    code.extend_from_slice(&[0x8E, 0xC0]); // mov es, ax
+    code.extend_from_slice(&[0x8E, 0xD0]); // mov ss, ax
+
+    // Enable PAE: mov eax, cr4; or eax, 0x20; mov cr4, eax
+    code.extend_from_slice(&[0x0F, 0x20, 0xE0]); // mov eax, cr4
+    code.extend_from_slice(&[0x83, 0xC8, 0x20]); // or eax, 0x20 (PAE)
+    code.extend_from_slice(&[0x0F, 0x22, 0xE0]); // mov cr4, eax
+
+    // Set CR3 to PML4: mov eax, PML4_ADDR; mov cr3, eax
+    code.extend_from_slice(&[0xB8]);
+    code.extend_from_slice(&(PML4_ADDR as u32).to_le_bytes()); // mov eax, PML4_ADDR
+    code.extend_from_slice(&[0x0F, 0x22, 0xD8]); // mov cr3, eax
+
+    // Enable long mode in EFER MSR (0xC0000080): rdmsr; or eax, 0x100; wrmsr
+    code.extend_from_slice(&[0xB9, 0x80, 0x00, 0x00, 0xC0]); // mov ecx, 0xC0000080
+    code.extend_from_slice(&[0x0F, 0x32]); // rdmsr
+    code.extend_from_slice(&[0x0F, 0xBA, 0xE8, 0x08]); // bts eax, 8 (LME bit)
+    code.extend_from_slice(&[0x0F, 0x30]); // wrmsr
+
+    // Enable paging: mov eax, cr0; or eax, 0x80000000; mov cr0, eax
     code.extend_from_slice(&[0x0F, 0x20, 0xC0]); // mov eax, cr0
-    code.extend_from_slice(&[0x0C, 0x01]); // or al, 1
+    code.extend_from_slice(&[0x0D, 0x00, 0x00, 0x00, 0x80]); // or eax, 0x80000000
     code.extend_from_slice(&[0x0F, 0x22, 0xC0]); // mov cr0, eax
-    code.extend_from_slice(&[0x66, 0xEA]); // jmp far
-    code.extend_from_slice(&(entry as u32).to_le_bytes()); // offset
-    code.extend_from_slice(&0x08u16.to_le_bytes()); // CS = code selector
+
+    // Far jump to 64-bit code (selector 0x08 = 64-bit code in our GDT)
+    // We jump to a small 64-bit trampoline right after this instruction
+    let lm64_offset = code.len() + 7;
+    code.extend_from_slice(&[0xEA]); // jmp far (32-bit encoding in 32-bit mode)
+    code.extend_from_slice(&((BOOTSTRAP_ADDR as u32) + lm64_offset as u32).to_le_bytes());
+    code.extend_from_slice(&0x08u16.to_le_bytes()); // CS = 64-bit code
+
+    // ── 64-bit long mode ──
+    // Load the 64-bit entry address from 0x2200 and jump to it
+    // mov rax, [0x2200]; jmp rax
+    code.extend_from_slice(&[0x48, 0xA1]); // mov rax, [imm64]
+    code.extend_from_slice(&0x2200u64.to_le_bytes());
+    code.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
 
     // SAFETY: Writing within guest memory bounds.
     unsafe {
         std::ptr::copy_nonoverlapping(code.as_ptr(), host_mem.add(BOOTSTRAP_ADDR as usize), code.len());
     }
-    println!("  Bootstrap at {BOOTSTRAP_ADDR:#X} → PM jmp to {entry:#x}");
+    println!("  Bootstrap ({} bytes) at {BOOTSTRAP_ADDR:#X} → 64-bit jmp to {entry:#x}", code.len());
 }
 
 fn load_bzimage(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
@@ -490,6 +546,36 @@ fn setup_gdt(host_mem: *mut u8) {
             host_mem.add(GDT_ADDR as usize),
             gdt.len() * 8,
         );
+    }
+}
+
+const PML4_ADDR: u64 = 0xA000;
+const PDPTE_ADDR: u64 = 0xB000;
+const PDE_ADDR: u64 = 0xC000; // 4 pages: 0xC000, 0xD000, 0xE000, 0xF000
+
+/// Set up identity-mapped page tables for the first 4 GiB using 2MB pages.
+/// PML4[0] → PDPTE, PDPTE[0..3] → PDE tables, each with 512 × 2MB entries.
+fn setup_page_tables(host_mem: *mut u8) {
+    // SAFETY: All writes are within allocated guest memory bounds.
+    unsafe {
+        // PML4: one entry pointing to PDPTE
+        let pml4 = host_mem.add(PML4_ADDR as usize) as *mut u64;
+        *pml4 = PDPTE_ADDR | 0x3; // Present + Writable
+
+        // PDPTE: 4 entries, each pointing to a PDE table
+        let pdpte = host_mem.add(PDPTE_ADDR as usize) as *mut u64;
+        for i in 0..4u64 {
+            *pdpte.add(i as usize) = (PDE_ADDR + i * 0x1000) | 0x3; // Present + Writable
+        }
+
+        // PDE: 4 tables × 512 entries = 2048 × 2MB pages = 4GB
+        for i in 0..2048u64 {
+            let pde_table = i / 512;
+            let pde_index = i % 512;
+            let pde = host_mem.add((PDE_ADDR + pde_table * 0x1000) as usize) as *mut u64;
+            // 2MB page: address | PS (bit 7) | Present + Writable
+            *pde.add(pde_index as usize) = (i * 0x200000) | 0x83;
+        }
     }
 }
 
