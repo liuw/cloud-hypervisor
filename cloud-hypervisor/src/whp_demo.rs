@@ -35,6 +35,10 @@ pub fn run() -> anyhow::Result<()> {
         .windows(2)
         .find(|w| w[0] == "--kernel")
         .map(|w| w[1].clone());
+    let initramfs_path = args
+        .windows(2)
+        .find(|w| w[0] == "--initramfs")
+        .map(|w| w[1].clone());
 
     println!("cloud-hypervisor (Windows / WHP backend)");
     println!();
@@ -66,31 +70,25 @@ pub fn run() -> anyhow::Result<()> {
     println!("Mapped {} MiB guest RAM at GPA 0x0", GUEST_MEM_SIZE >> 20);
 
     // Map a dedicated page for the I/O APIC at 0xFEC00000.
-    // The kernel reads the IOAPIC version register to determine the number of
-    // interrupt pins. We pre-populate it as RAM (direct memory access, no MMIO exits).
+    // WHP doesn't generate MMIO exits for unmapped regions (returns 0 silently),
+    // so we must map it as RAM for the kernel to read the version register.
+    // IOAPIC redirect table tracking is done via a shared state in SerialVmOps
+    // by monitoring PIO writes to debug port 0x80 (the kernel writes to port 0x80
+    // as I/O delays between IOAPIC register writes).
     let ioapic_page_layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
     // SAFETY: Allocating a page-aligned 4K buffer.
     let ioapic_host = unsafe { std::alloc::alloc_zeroed(ioapic_page_layout) };
     if ioapic_host.is_null() {
         return Err(anyhow!("Failed to allocate IOAPIC page"));
     }
-    // Pre-populate IOAPIC registers in memory:
-    // Offset 0x00: IOREGSEL (initially 0 = ID register)
-    // Offset 0x10: IOWIN — when IOREGSEL=0 (ID), returns 0
-    // The kernel will set IOREGSEL=1 (version) then read IOWIN.
-    // Since this is RAM, IOWIN returns whatever was last written.
-    // We can't do dynamic register selection with RAM alone.
-    // Instead, write the version value directly at offset 0x10 and hope the
-    // kernel reads it with IOREGSEL=1 (which we set to 1 in memory).
     unsafe {
-        // Set IOREGSEL = 1 (version register)
+        // Pre-populate: IOREGSEL=1 (version), IOWIN=version value
         std::ptr::write_unaligned(ioapic_host as *mut u32, 1);
-        // Set IOWIN = IOAPIC version (0x0017_0011 = version 17, 24 entries)
         std::ptr::write_unaligned(ioapic_host.add(0x10) as *mut u32, 0x0017_0011u32);
         vm.create_user_memory_region(1, 0xFEC0_0000, 4096, ioapic_host, false, false)
             .context("Failed to map IOAPIC page")?;
     }
-    println!("Mapped IOAPIC page at GPA 0xFEC00000 (version=0x00170011)");
+    println!("Mapped IOAPIC page at GPA 0xFEC00000");
 
     // ── Load payload ─────────────────────────────────────────────────────
     let entry_point = if let Some(ref path) = kernel_path {
@@ -99,11 +97,45 @@ pub fn run() -> anyhow::Result<()> {
         load_demo_payload(host_mem)
     };
 
+    // ── Load initramfs if provided ───────────────────────────────────────
+    let mut initrd_addr: u64 = 0;
+    let mut initrd_size: u64 = 0;
+    if let Some(ref path) = initramfs_path {
+        let mut f = File::open(path)
+            .with_context(|| format!("Failed to open initramfs: {path}"))?;
+        let fsize = f.metadata()?.len() as usize;
+        // Place initramfs at end of guest RAM, page-aligned
+        let addr = ((GUEST_MEM_SIZE - fsize) & !0xFFF) as u64;
+        if addr < 0x200000 {
+            return Err(anyhow!("Initramfs too large ({fsize} bytes)"));
+        }
+        // SAFETY: Reading into allocated guest memory bounds.
+        unsafe {
+            let buf = std::slice::from_raw_parts_mut(host_mem.add(addr as usize), fsize);
+            f.read_exact(buf)?;
+        }
+        initrd_addr = addr;
+        initrd_size = fsize as u64;
+        println!("Loaded initramfs: {path} ({fsize} bytes at GPA {addr:#X})");
+    }
+
     // ── Set up GDT and page tables for protected/long mode ─────────────
     if kernel_path.is_some() {
         setup_gdt(host_mem);
         setup_page_tables(host_mem);
         setup_acpi_tables(host_mem);
+
+        // Set initrd fields in boot_params if initramfs was loaded
+        if initrd_size > 0 {
+            unsafe {
+                let bp = host_mem.add(BOOT_PARAMS_ADDR as usize);
+                // ramdisk_image at offset 0x218 (u32)
+                std::ptr::write_unaligned(bp.add(0x218) as *mut u32, initrd_addr as u32);
+                // ramdisk_size at offset 0x21C (u32)
+                std::ptr::write_unaligned(bp.add(0x21C) as *mut u32, initrd_size as u32);
+            }
+            println!("  Set boot_params initrd: addr={initrd_addr:#X} size={initrd_size}");
+        }
     }
 
     // ── Create vCPU ──────────────────────────────────────────────────────
@@ -131,8 +163,8 @@ pub fn run() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("timer-inject".to_string())
             .spawn(move || {
-                // Start immediately — kernel reaches its spin loop within milliseconds
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                // Start immediately
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 let whp = vm_for_timer.as_any().downcast_ref::<WhpVm>().unwrap();
                 eprintln!("[timer] Starting timer injection loop");
                 let mut tick = 0u64;
@@ -747,7 +779,7 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         std::ptr::write_bytes(bp, 0, 4096);
 
         // Write command line
-        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 nomodules tsc=reliable lpj=1000000 no_timer_check noapictimer noapic\0";
+        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check noapictimer noapic tsc=reliable loglevel=8 rdinit=/init\0";
         std::ptr::copy_nonoverlapping(
             cmdline.as_ptr(),
             host_mem.add(CMDLINE_ADDR as usize),

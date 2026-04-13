@@ -1074,37 +1074,33 @@ impl cpu::Vcpu for WhpVcpu {
 
             WHvRunVpExitReasonCanceled => {
                 // vCPU run was canceled (by timer thread).
-                let elapsed = self.start_time.elapsed();
+                // Inject timer interrupt to advance jiffies and drive the scheduler.
                 let rip = exit_context.VpContext.Rip;
                 let count = self.exit_count.get();
-                if count % 100 == 0 {
-                    eprintln!("[vcpu] Canceled exit #{count} RIP={rip:#x} {:.1}s", elapsed.as_secs_f64());
-                }
-                // Only inject timer interrupt after kernel has booted (>500ms)
-                // and is in kernel virtual address space (high RIP).
-                if elapsed.as_millis() > 20 && rip > 0xFFFF_FFFF_0000_0000 {
-                    // Inject timer interrupt and clear HLT suspend
+                if rip > 0xFFFF_FFFF_0000_0000 {
+                    // Kernel is in virtual address space — inject timer vector 0x30
+                    // (first IOAPIC vector, used for IRQ 0 = PIT timer).
                     let reg_names = [
                         WHvRegisterPendingInterruption,
                         WHvRegisterInternalActivityState,
                     ];
                     let mut reg_values = [WHV_REGISTER_VALUE::default(); 2];
-                    reg_values[0] = reg64_value(1 | (0xEFu64 << 8));
-                    reg_values[1] = reg64_value(0);
-                    let result = unsafe {
-                        WHvSetVirtualProcessorRegisters(
+                    // Use RESCHEDULE_VECTOR (0xFD) to directly trigger rescheduling
+                    reg_values[0] = reg64_value(1 | (0xFDu64 << 8));
+                    reg_values[1] = reg64_value(0); // Clear HLT suspend
+                    unsafe {
+                        let _ = WHvSetVirtualProcessorRegisters(
                             self.partition,
                             self.vp_index,
                             reg_names.as_ptr(),
                             reg_names.len() as u32,
                             reg_values.as_ptr(),
-                        )
-                    };
-                    if let Err(e) = result {
-                        warn!("WHP: Failed to inject timer: {e}");
-                    } else if count % 100 == 0 {
-                        eprintln!("[vcpu] Injected timer at RIP={rip:#x}");
+                        );
                     }
+                }
+                if count % 100 == 0 {
+                    eprintln!("[vcpu] Canceled #{count} RIP={rip:#x} {:.1}s",
+                              self.start_time.elapsed().as_secs_f64());
                 }
                 Ok(cpu::VmExit::Ignore)
             }
