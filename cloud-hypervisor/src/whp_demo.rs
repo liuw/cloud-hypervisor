@@ -109,11 +109,19 @@ pub fn run() -> anyhow::Result<()> {
 
     // ── Run loop ─────────────────────────────────────────────────────────
     let mut exit_count = 0u64;
+    let start = std::time::Instant::now();
+    let mut last_rip_dump = std::time::Instant::now();
+    let debug_kernel = std::env::var("CH_DEBUG").is_ok();
     loop {
         match vcpu.run() {
             Ok(hypervisor::VmExit::Ignore) => {}
             Ok(hypervisor::VmExit::Shutdown) => {
-                println!("\n--- Guest halted (after {exit_count} exits) ---");
+                println!("\n--- Guest halted (after {exit_count} exits, {:.1}s) ---",
+                         start.elapsed().as_secs_f64());
+                // Dump final RIP
+                if let Ok(regs) = vcpu.get_regs() {
+                    println!("  Final RIP = {:#X}", regs.get_rip());
+                }
                 break;
             }
             Ok(hypervisor::VmExit::Reset) => {
@@ -130,6 +138,15 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         exit_count += 1;
+
+        // Periodic RIP dump for debugging
+        if debug_kernel && last_rip_dump.elapsed().as_secs() >= 2 {
+            if let Ok(regs) = vcpu.get_regs() {
+                eprintln!("[{:.1}s] exits={exit_count} RIP={:#X}",
+                          start.elapsed().as_secs_f64(), regs.get_rip());
+            }
+            last_rip_dump = std::time::Instant::now();
+        }
     }
 
     println!("WHP demo complete.");
@@ -302,17 +319,18 @@ fn load_elf(host_mem: *mut u8, file: &mut File) -> anyhow::Result<u64> {
     // Set up boot_params (zero page) for Linux boot protocol
     setup_linux_boot_params(host_mem);
 
-    // Override the bootstrap's jump target to the ELF entry
-    // The simple bootstrap jumps to KERNEL_LOAD_ADDR (0x100000) by default.
-    // For ELF, we need to jump to the actual entry point.
-    // Patch the far jump offset in the bootstrap code.
-    // The far jump is at offset 14 in the bootstrap: 66 EA <4-byte offset> <2-byte selector>
-    // Offset of the jump target = BOOTSTRAP_ADDR + 16 (14 for instructions before + 2 for 66 EA)
+    // Override the bootstrap's kernel address.
+    // The bootstrap uses `mov rax, <8-byte addr>` to load the kernel entry.
+    // The 8-byte immediate is at BOOTSTRAP_KERNEL_ADDR_OFFSET from BOOTSTRAP_ADDR.
+    // We write the actual ELF entry point there.
     // SAFETY: Patching within guest memory.
     unsafe {
-        *(host_mem.add(BOOTSTRAP_ADDR as usize + 16) as *mut u32) = entry as u32;
+        std::ptr::write_unaligned(
+            host_mem.add(BOOTSTRAP_ADDR as usize + BOOTSTRAP_KERNEL_ADDR_OFFSET) as *mut u64,
+            entry,
+        );
     }
-    println!("  Patched bootstrap jmp target to {entry:#x}");
+    println!("  Patched bootstrap kernel addr to {entry:#x}");
 
     Ok(BOOTSTRAP_ADDR)
 }
@@ -352,7 +370,7 @@ fn write_pm_bootstrap_to_entry(host_mem: *mut u8, entry: u64) {
     let pm32_offset = code.len() + 7; // 66 EA <4 bytes offset> <2 bytes selector>
     code.extend_from_slice(&[0x66, 0xEA]);
     code.extend_from_slice(&((BOOTSTRAP_ADDR as u32) + pm32_offset as u32).to_le_bytes());
-    code.extend_from_slice(&0x10u16.to_le_bytes()); // CS = 32-bit code segment
+    code.extend_from_slice(&0x10u16.to_le_bytes()); // CS = 32-bit code (GDT entry 2)
 
     // ── 32-bit protected mode ──
     // Set data segments
@@ -457,7 +475,7 @@ fn load_bzimage(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
         let bp = host_mem.add(BOOT_PARAMS_ADDR as usize);
 
         // vid_mode = normal (0xFFFF)
-        *(bp.add(0x1FA) as *mut u16) = 0xFFFF;
+        std::ptr::write_unaligned(bp.add(0x1FA) as *mut u16, 0xFFFFu16);
 
         // type_of_loader = 0xFF (undefined)
         *bp.add(0x210) = 0xFF;
@@ -466,7 +484,7 @@ fn load_bzimage(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
         *bp.add(0x211) = 0xC1;
 
         // cmd_line_ptr
-        *(bp.add(0x228) as *mut u32) = CMDLINE_ADDR as u32;
+        std::ptr::write_unaligned(bp.add(0x228) as *mut u32, CMDLINE_ADDR as u32);
 
         // header sentinel for boot protocol version
         // (already copied from the bzImage header)
@@ -503,6 +521,9 @@ fn load_flat_binary(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
 
 const BOOTSTRAP_ADDR: u64 = 0x2000;
 const GDT_DESC_ADDR: u64 = 0x2100;
+/// Offset within the bootstrap code where the 8-byte kernel entry address is stored.
+/// This is the immediate operand of `mov rax, <addr>` in the 64-bit section.
+const BOOTSTRAP_KERNEL_ADDR_OFFSET: usize = 106;
 
 /// Write a 16-bit real-mode bootstrap that transitions to 32-bit protected mode.
 fn write_pm_bootstrap(host_mem: *mut u8) {
@@ -517,8 +538,11 @@ fn write_pm_bootstrap(host_mem: *mut u8) {
     // SAFETY: Writing within guest memory bounds.
     unsafe { std::ptr::copy_nonoverlapping(gdt_desc.as_ptr(), host_mem.add(GDT_DESC_ADDR as usize), 6) };
 
-    // 16-bit bootstrap code at BOOTSTRAP_ADDR
+    // 16-bit bootstrap: real mode → 32-bit PM → 64-bit long mode
+    // GDT layout: 0x08=64-bit code(L=1), 0x10=32-bit code, 0x18=data
     let mut code = Vec::new();
+
+    // === Phase 1: Real mode → 32-bit PM ===
     // cli
     code.push(0xFA);
     // lgdt [GDT_DESC_ADDR]
@@ -530,16 +554,93 @@ fn write_pm_bootstrap(host_mem: *mut u8) {
     code.extend_from_slice(&[0x0C, 0x01]);
     // mov cr0, eax
     code.extend_from_slice(&[0x0F, 0x22, 0xC0]);
-    // jmp far 0x10:KERNEL_LOAD_ADDR (32-bit code segment, offset to kernel)
+    // jmp far 0x10:pm32_start (32-bit code segment)
+    let pm32_start = BOOTSTRAP_ADDR as u32 + 22; // after this 8-byte far jmp
     code.extend_from_slice(&[0x66, 0xEA]);
-    code.extend_from_slice(&(KERNEL_LOAD_ADDR as u32).to_le_bytes());
-    code.extend_from_slice(&0x10u16.to_le_bytes()); // CS selector = GDT entry 2
+    code.extend_from_slice(&pm32_start.to_le_bytes());
+    code.extend_from_slice(&0x10u16.to_le_bytes()); // offset 20-21
+
+    // === Phase 2: 32-bit PM — set up for long mode ===
+    // offset 22: Now in 32-bit code
+    // Reload data segments
+    // mov ax, 0x18
+    code.extend_from_slice(&[0x66, 0xB8]);
+    code.extend_from_slice(&0x18u16.to_le_bytes());
+    // mov ds, ax
+    code.extend_from_slice(&[0x8E, 0xD8]);
+    // mov es, ax
+    code.extend_from_slice(&[0x8E, 0xC0]);
+    // mov ss, ax
+    code.extend_from_slice(&[0x8E, 0xD0]);
+
+    // Enable PAE: mov eax, cr4; or eax, 0x20; mov cr4, eax
+    code.extend_from_slice(&[0x0F, 0x20, 0xE0]); // mov eax, cr4
+    code.extend_from_slice(&[0x0D, 0x20, 0x00, 0x00, 0x00]); // or eax, 0x20
+    code.extend_from_slice(&[0x0F, 0x22, 0xE0]); // mov cr4, eax
+
+    // Load page tables: mov eax, PML4_ADDR; mov cr3, eax
+    code.extend_from_slice(&[0xB8]); // mov eax, imm32
+    code.extend_from_slice(&(PML4_ADDR as u32).to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0x22, 0xD8]); // mov cr3, eax
+
+    // Enable long mode: rdmsr(EFER); or eax, 0x100; wrmsr(EFER)
+    // mov ecx, 0xC0000080 (IA32_EFER)
+    code.extend_from_slice(&[0xB9]);
+    code.extend_from_slice(&0xC000_0080u32.to_le_bytes());
+    // rdmsr
+    code.extend_from_slice(&[0x0F, 0x32]);
+    // or eax, 0x100 (LME bit)
+    code.extend_from_slice(&[0x0D, 0x00, 0x01, 0x00, 0x00]);
+    // wrmsr
+    code.extend_from_slice(&[0x0F, 0x30]);
+
+    // Enable paging: mov eax, cr0; or eax, 0x80000000; mov cr0, eax
+    code.extend_from_slice(&[0x0F, 0x20, 0xC0]); // mov eax, cr0
+    code.extend_from_slice(&[0x0D, 0x00, 0x00, 0x00, 0x80]); // or eax, 0x80000000
+    code.extend_from_slice(&[0x0F, 0x22, 0xC0]); // mov cr0, eax
+
+    // === Phase 3: Far jump to 64-bit code segment ===
+    // jmp far 0x08:lm64_start
+    // In 32-bit code, the encoding is: EA <4-byte offset> <2-byte selector>
+    let lm64_offset = code.len() + 7; // after this 7-byte far jmp
+    let lm64_addr = BOOTSTRAP_ADDR as u32 + lm64_offset as u32;
+    code.push(0xEA);
+    code.extend_from_slice(&lm64_addr.to_le_bytes());
+    code.extend_from_slice(&0x08u16.to_le_bytes()); // CS = 64-bit code (GDT entry 1, L=1)
+
+    // === Phase 4: 64-bit long mode ===
+    // Now in 64-bit mode. Set up RSI and jump to kernel.
+    let lm64_start = code.len();
+    assert_eq!(lm64_start, lm64_offset, "64-bit code offset mismatch");
+
+    // Set up stack: mov rsp, 0x80000  (REX.W + mov)
+    // 48 C7 C4 00 00 08 00 = mov rsp, 0x80000
+    code.extend_from_slice(&[0x48, 0xC7, 0xC4]);
+    code.extend_from_slice(&0x80000u32.to_le_bytes());
+
+    // mov rsi, BOOT_PARAMS_ADDR (for bzImage/zero page compat)
+    // 48 C7 C6 <imm32>
+    code.extend_from_slice(&[0x48, 0xC7, 0xC6]);
+    code.extend_from_slice(&(BOOT_PARAMS_ADDR as u32).to_le_bytes());
+
+    // mov rbx, PVH_INFO_START (for PVH boot)
+    // 48 C7 C3 <imm32>
+    code.extend_from_slice(&[0x48, 0xC7, 0xC3]);
+    code.extend_from_slice(&0x6000u32.to_le_bytes());
+
+    // Jump to kernel: mov rax, KERNEL_LOAD_ADDR; jmp rax
+    // 48 B8 <8-byte imm> = mov rax, imm64
+    code.extend_from_slice(&[0x48, 0xB8]);
+    assert_eq!(code.len(), BOOTSTRAP_KERNEL_ADDR_OFFSET, "kernel addr offset mismatch");
+    code.extend_from_slice(&(KERNEL_LOAD_ADDR as u64).to_le_bytes());
+    // jmp rax = FF E0
+    code.extend_from_slice(&[0xFF, 0xE0]);
 
     // SAFETY: Writing within guest memory bounds.
     unsafe {
         std::ptr::copy_nonoverlapping(code.as_ptr(), host_mem.add(BOOTSTRAP_ADDR as usize), code.len());
     }
-    println!("  Bootstrap ({} bytes) at {BOOTSTRAP_ADDR:#X} → far jmp to {KERNEL_LOAD_ADDR:#X}", code.len());
+    println!("  Bootstrap ({} bytes) at {BOOTSTRAP_ADDR:#X}, enters 64-bit long mode", code.len());
 }
 
 // ── GDT setup ────────────────────────────────────────────────────────────────
@@ -570,56 +671,80 @@ fn setup_gdt(host_mem: *mut u8) {
 
 const PML4_ADDR: u64 = 0xA000;
 
-/// Set up Linux boot parameters (zero page) at BOOT_PARAMS_ADDR.
+/// Set up Linux boot parameters for ELF vmlinux.
+/// Creates a boot_params "zero page" at BOOT_PARAMS_ADDR and a PVH hvm_start_info at 0x6000.
 fn setup_linux_boot_params(host_mem: *mut u8) {
-    // SAFETY: Writing boot_params fields within allocated guest memory.
-    unsafe {
-        let bp = host_mem.add(BOOT_PARAMS_ADDR as usize);
+    /// Write a value at an unaligned offset within guest memory.
+    unsafe fn w<T: Copy>(base: *mut u8, offset: usize, val: T) {
+        std::ptr::write_unaligned(base.add(offset) as *mut T, val);
+    }
 
-        // Zero the entire 4K boot_params page
+    // SAFETY: Writing boot structures within allocated guest memory.
+    unsafe {
+        // === Zero page (boot_params) at BOOT_PARAMS_ADDR (0x7000) ===
+        let bp = host_mem.add(BOOT_PARAMS_ADDR as usize);
         std::ptr::write_bytes(bp, 0, 4096);
 
-        // Boot protocol header signature at offset 0x202 = "HdrS"
-        std::ptr::copy_nonoverlapping(b"HdrS".as_ptr(), bp.add(0x202), 4);
-
-        // Boot protocol version at offset 0x206 = 0x020F (2.15)
-        *(bp.add(0x206) as *mut u16) = 0x020F;
-
-        // vid_mode at offset 0x1FA = 0xFFFF (normal)
-        *(bp.add(0x1FA) as *mut u16) = 0xFFFF;
-
-        // type_of_loader at offset 0x210 = 0xFF
-        *bp.add(0x210) = 0xFF;
-
-        // loadflags at offset 0x211 = LOADED_HIGH | KEEP_SEGMENTS | CAN_USE_HEAP
-        *bp.add(0x211) = 0xC1;
-
-        // cmd_line_ptr at offset 0x228
-        *(bp.add(0x228) as *mut u32) = CMDLINE_ADDR as u32;
-
         // Write command line
-        let cmdline = b"console=ttyS0 earlyprintk=serial noapic noacpi pci=off nomodules\0";
+        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 noapic noacpi nomodules\0";
         std::ptr::copy_nonoverlapping(
             cmdline.as_ptr(),
             host_mem.add(CMDLINE_ADDR as usize),
             cmdline.len(),
         );
 
-        // E820 memory map — one entry: 0 to GUEST_MEM_SIZE, type=RAM(1)
-        // e820_table starts at offset 0x2D0, each entry is 20 bytes
-        let e820 = bp.add(0x2D0);
-        *(e820 as *mut u64) = 0;                      // addr
-        *(e820.add(8) as *mut u64) = GUEST_MEM_SIZE as u64; // size
-        *(e820.add(16) as *mut u32) = 1;               // type = RAM
+        // Setup header signature "HdrS" at offset 0x202
+        w::<u32>(bp, 0x202, 0x53726448);
+        // Boot protocol version 2.14 at offset 0x206
+        w::<u16>(bp, 0x206, 0x020E);
+        // type_of_loader = 0xFF at offset 0x210
+        *bp.add(0x210) = 0xFF;
+        // loadflags: LOADED_HIGH(0x01) | KEEP_SEGMENTS(0x40) | CAN_USE_HEAP(0x80)
+        *bp.add(0x211) = 0xC1;
+        // cmd_line_ptr at offset 0x228
+        w::<u32>(bp, 0x228, CMDLINE_ADDR as u32);
 
-        // e820_entries at offset 0x1E8
-        *bp.add(0x1E8) = 1;
+        // e820 memory map (e820_table at 0x2D0, 20 bytes per entry)
+        // e820_entries count at offset 0x1E8
+        *bp.add(0x1E8) = 3;
 
-        // init_size at offset 0x260 (required for recent kernels)
-        *(bp.add(0x260) as *mut u32) = GUEST_MEM_SIZE as u32;
+        // Entry 0: Low memory (0 - 0x9FC00) = usable
+        w::<u64>(bp, 0x2D0, 0);          // addr
+        w::<u64>(bp, 0x2D8, 0x9FC00);    // size
+        w::<u32>(bp, 0x2E0, 1);          // type = RAM
+
+        // Entry 1: Reserved (0x9FC00 - 0x100000)
+        w::<u64>(bp, 0x2E4, 0x9FC00);                        // addr
+        w::<u64>(bp, 0x2EC, 0x100000 - 0x9FC00);              // size
+        w::<u32>(bp, 0x2F4, 2);                               // type = Reserved
+
+        // Entry 2: Main memory (1MB - end of guest RAM)
+        w::<u64>(bp, 0x2F8, 0x100000);                        // addr
+        w::<u64>(bp, 0x300, GUEST_MEM_SIZE as u64 - 0x100000); // size
+        w::<u32>(bp, 0x308, 1);                               // type = RAM
+
+        // === PVH hvm_start_info at 0x6000 (for PVH boot compat) ===
+        const PVH_INFO_START: u64 = 0x6000;
+        const MEMMAP_START: u64 = 0x6100;
+        const XEN_HVM_START_MAGIC: u32 = 0x336ec578;
+
+        let info = host_mem.add(PVH_INFO_START as usize);
+        std::ptr::write_bytes(info, 0, 256);
+
+        w::<u32>(info, 0, XEN_HVM_START_MAGIC);    // magic
+        w::<u32>(info, 4, 1);                       // version
+        w::<u64>(info, 16, CMDLINE_ADDR);            // cmdline_paddr
+        w::<u64>(info, 40, MEMMAP_START);            // memmap_paddr
+        w::<u32>(info, 48, 1);                       // memmap_entries
+
+        // Memory map entry
+        let memmap = host_mem.add(MEMMAP_START as usize);
+        w::<u64>(memmap, 0, 0);                     // addr
+        w::<u64>(memmap, 8, GUEST_MEM_SIZE as u64); // size
+        w::<u32>(memmap, 16, 1);                    // type = RAM
     }
 
-    println!("  Boot params at {BOOT_PARAMS_ADDR:#X}, cmdline at {CMDLINE_ADDR:#X}");
+    println!("  Boot params at {BOOT_PARAMS_ADDR:#X}, PVH info at 0x6000, cmdline at {CMDLINE_ADDR:#X}");
 }
 const PDPTE_ADDR: u64 = 0xB000;
 const PDE_ADDR: u64 = 0xC000; // 4 pages: 0xC000, 0xD000, 0xE000, 0xF000
@@ -660,7 +785,6 @@ fn setup_regs(vcpu: &mut dyn hypervisor::Vcpu, entry: u64) -> anyhow::Result<()>
     let mut regs = vcpu.get_regs().context("get_regs")?;
     regs.set_rip(entry);
     regs.set_rflags(0x2);
-    regs.set_rsi(BOOT_PARAMS_ADDR);
     vcpu.set_regs(&regs).context("set_regs")?;
 
     // Set CS.base=0 so RIP maps directly to physical address
@@ -684,12 +808,16 @@ fn setup_regs(vcpu: &mut dyn hypervisor::Vcpu, entry: u64) -> anyhow::Result<()>
 
 struct SerialVmOps {
     input: std::sync::Mutex<std::collections::VecDeque<u8>>,
+    seen_ports: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    debug: bool,
 }
 
 impl SerialVmOps {
     fn new() -> Self {
         SerialVmOps {
             input: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            seen_ports: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            debug: std::env::var("CH_DEBUG").is_ok(),
         }
     }
 
@@ -716,14 +844,26 @@ impl VmOps for SerialVmOps {
     fn guest_mem_read(&self, _gpa: u64, _buf: &mut [u8]) -> Result<usize, HypervisorVmError> {
         Ok(0)
     }
-    fn mmio_read(&self, _gpa: u64, data: &mut [u8]) -> Result<(), HypervisorVmError> {
+    fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> Result<(), HypervisorVmError> {
+        if self.debug {
+            eprintln!("[MMIO] read GPA={gpa:#X} len={}", data.len());
+        }
         data.fill(0xFF);
         Ok(())
     }
-    fn mmio_write(&self, _gpa: u64, _data: &[u8]) -> Result<(), HypervisorVmError> {
+    fn mmio_write(&self, gpa: u64, data: &[u8]) -> Result<(), HypervisorVmError> {
+        if self.debug {
+            eprintln!("[MMIO] write GPA={gpa:#X} data={data:02X?}");
+        }
         Ok(())
     }
     fn pio_read(&self, port: u64, data: &mut [u8]) -> Result<(), HypervisorVmError> {
+        if self.debug {
+            let mut ports = self.seen_ports.lock().unwrap();
+            if ports.insert(port) && ports.len() <= 50 {
+                eprintln!("[PIO] read port {port:#X}");
+            }
+        }
         match port {
             // Serial data register — return next input byte
             0x3F8 => {
@@ -742,6 +882,12 @@ impl VmOps for SerialVmOps {
         Ok(())
     }
     fn pio_write(&self, port: u64, data: &[u8]) -> Result<(), HypervisorVmError> {
+        if self.debug {
+            let mut ports = self.seen_ports.lock().unwrap();
+            if ports.insert(port | 0x10000) && ports.len() <= 50 {
+                eprintln!("[PIO] write port {port:#X} data={data:02X?}");
+            }
+        }
         if port == SERIAL_PORT && !data.is_empty() {
             let ch = data[0];
             if ch.is_ascii() {
