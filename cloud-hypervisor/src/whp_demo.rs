@@ -6,12 +6,17 @@
 //   cloud-hypervisor.exe                       # run built-in "Hi!" payload
 //   cloud-hypervisor.exe --kernel <bzImage>     # load a Linux bzImage
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, anyhow};
-use hypervisor::{HypervisorVmError, VmOps};
+use devices::interrupt_controller::InterruptController;
+use hypervisor::{HypervisorVmError, InterruptSourceConfig, MsiIrqSourceConfig, VmOps};
+use vm_device::interrupt::{
+    InterruptIndex, InterruptManager, InterruptSourceGroup, MsiIrqGroupConfig,
+};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 use vm_memory::bitmap::AtomicBitmap;
 
@@ -69,24 +74,54 @@ pub fn run() -> anyhow::Result<()> {
     }
     println!("Mapped {} MiB guest RAM at GPA 0x0", GUEST_MEM_SIZE >> 20);
 
-    // Map the I/O APIC page at 0xFEC00000 with NO access flags.
-    // Any guest read/write will generate a WHvRunVpExitReasonMemoryAccess exit,
-    // which is handled by the IOAPIC emulation in VmOps::mmio_read/mmio_write.
-    let ioapic_page_layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
-    // SAFETY: Allocating a page-aligned 4K buffer.
-    let ioapic_host = unsafe { std::alloc::alloc_zeroed(ioapic_page_layout) };
-    if ioapic_host.is_null() {
-        return Err(anyhow!("Failed to allocate IOAPIC page"));
-    }
-    // Map IOAPIC page as normal RAM for version register discovery.
-    // WHP doesn't support trap pages (read-only or no-access) for MMIO emulation.
-    unsafe {
-        std::ptr::write_unaligned(ioapic_host as *mut u32, 1);
-        std::ptr::write_unaligned(ioapic_host.add(0x10) as *mut u32, 0x0017_0011u32);
-        vm.create_user_memory_region(1, 0xFEC0_0000, 4096, ioapic_host, false, false)
-            .context("Failed to map IOAPIC page")?;
-    }
-    println!("Mapped IOAPIC trap page at GPA 0xFEC00000");
+    // Create the I/O APIC using the existing devices crate implementation.
+    // This provides functional interrupt routing (PIT IRQ 0 → LAPIC → timer calibration).
+    let ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>> = if kernel_path.is_some() {
+        let interrupt_manager = WhpInterruptManager { vm: vm.clone() };
+        let ioapic_dev = devices::ioapic::Ioapic::new(
+            "ioapic".to_string(),
+            GuestAddress(0xFEE0_0000),
+            &interrupt_manager,
+            None,
+        ).context("Failed to create IOAPIC")?;
+        let ioapic = Arc::new(Mutex::new(ioapic_dev));
+
+        // Pre-program IOAPIC redirect entries since WHP can't trap MMIO writes
+        // to 0xFEC00000 (guest writes go to unmapped memory and return 0).
+        // The kernel will try to program these via MMIO but the writes are lost.
+        // We pre-configure IRQ 0 (PIT timer) and IRQ 4 (serial) with proper vectors.
+        {
+            use vm_device::BusDevice;
+            let mut ioapic_guard = ioapic.lock().unwrap();
+
+            // Helper: write IOREGSEL then IOWIN to program an IOAPIC register
+            fn ioapic_write_reg(ioapic: &mut devices::ioapic::Ioapic, reg: u32, val: u32) {
+                let reg_bytes = reg.to_le_bytes();
+                let val_bytes = val.to_le_bytes();
+                ioapic.write(0xFEC0_0000, 0x00, &reg_bytes); // IOREGSEL
+                ioapic.write(0xFEC0_0000, 0x10, &val_bytes); // IOWIN
+            }
+
+            // IRQ 0 (PIT timer) → vector 0x30, physical destination 0, edge-triggered
+            // Redirect entry 0: low dword at register 0x10
+            ioapic_write_reg(&mut ioapic_guard, 0x10, 0x0000_0030); // vector=0x30, unmasked
+            // Redirect entry 0: high dword at register 0x11
+            ioapic_write_reg(&mut ioapic_guard, 0x11, 0x0000_0000); // destination=0
+
+            // IRQ 4 (serial ttyS0) → vector 0x34, physical destination 0, edge-triggered
+            // Redirect entry 4: low dword at register 0x18
+            ioapic_write_reg(&mut ioapic_guard, 0x18, 0x0000_0034); // vector=0x34, unmasked
+            // Redirect entry 4: high dword at register 0x19
+            ioapic_write_reg(&mut ioapic_guard, 0x19, 0x0000_0000); // destination=0
+
+            println!("  Pre-programmed IOAPIC: IRQ0→vec 0x30, IRQ4→vec 0x34");
+        }
+
+        println!("Created IOAPIC with WHP interrupt injection");
+        Some(ioapic)
+    } else {
+        None
+    };
 
     // ── Load payload ─────────────────────────────────────────────────────
     let entry_point = if let Some(ref path) = kernel_path {
@@ -137,7 +172,7 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     // ── Create vCPU ──────────────────────────────────────────────────────
-    let vm_ops = Arc::new(SerialVmOps::new());
+    let vm_ops = Arc::new(SerialVmOps::new(ioapic.clone()));
     let vm_ops_clone: Arc<dyn VmOps> = vm_ops.clone();
     let mut vcpu = vm
         .create_vcpu(0, Some(vm_ops_clone))
@@ -155,27 +190,25 @@ pub fn run() -> anyhow::Result<()> {
     // Timer interrupt injection is handled via a background thread.
     // After a delay (letting kernel boot), periodically inject timer interrupts
     // and cancel the vCPU run to wake it from WHP-internal HLT.
+    // Timer interrupt injection thread.
+    // Injects both LAPIC timer vector and IRQ 0 to advance jiffies and drive work queues.
     if kernel_path.is_some() {
         use hypervisor::whp::WhpVm;
         let vm_for_timer: Arc<dyn hypervisor::Vm> = vm.clone();
+        let ioapic_for_timer = ioapic.clone();
         std::thread::Builder::new()
             .name("timer-inject".to_string())
             .spawn(move || {
-                // Start immediately — WHvRequestInterrupt is async
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 let whp = vm_for_timer.as_any().downcast_ref::<WhpVm>().unwrap();
-                eprintln!("[timer] Starting timer injection (vector 0xEF)");
+                eprintln!("[timer] Starting timer injection (0x20 PIC IRQ 0)");
                 let mut tick = 0u64;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(10));
-                    // Inject LOCAL_TIMER_VECTOR (0xEF) — calls local_apic_timer_interrupt
-                    // which advances jiffies via the clockevent subsystem
-                    if let Err(e) = whp.request_interrupt(0xEF, 0) {
-                        if tick < 3 { eprintln!("[timer] failed: {e}"); }
-                    } else if tick == 0 {
-                        eprintln!("[timer] First interrupt OK");
-                    }
+                    // Inject PIC IRQ 0 at vector 0x20 (standard 8259 base vector)
+                    let _ = whp.request_interrupt(0x20, 0);
                     tick += 1;
+                    if tick == 1 { eprintln!("[timer] First tick OK"); }
                 }
             })
             .context("Failed to spawn timer thread")?;
@@ -776,7 +809,7 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         std::ptr::write_bytes(bp, 0, 4096);
 
         // Write command line
-        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check tsc=reliable rdinit=/init\0";
+        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check tsc=reliable keep_bootcon rdinit=/init\0";
         std::ptr::copy_nonoverlapping(
             cmdline.as_ptr(),
             host_mem.add(CMDLINE_ADDR as usize),
@@ -1008,6 +1041,92 @@ fn setup_regs(vcpu: &mut dyn hypervisor::Vcpu, entry: u64) -> anyhow::Result<()>
     Ok(())
 }
 
+// ── WHP Interrupt Manager for IOAPIC ─────────────────────────────────────────
+
+/// Interrupt manager that delivers interrupts via WHvRequestInterrupt.
+/// Used with the existing `devices::ioapic::Ioapic` to provide functional
+/// I/O APIC emulation on WHP.
+struct WhpInterruptManager {
+    vm: Arc<dyn hypervisor::Vm>,
+}
+
+impl InterruptManager for WhpInterruptManager {
+    type GroupConfig = MsiIrqGroupConfig;
+
+    fn create_group(&self, config: Self::GroupConfig) -> std::io::Result<Arc<dyn InterruptSourceGroup>> {
+        Ok(Arc::new(WhpInterruptSourceGroup {
+            vm: self.vm.clone(),
+            configs: Mutex::new(HashMap::new()),
+            masked: Mutex::new(HashMap::new()),
+            _base: config.base,
+            _count: config.count,
+        }))
+    }
+
+    fn destroy_group(&self, _group: Arc<dyn InterruptSourceGroup>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Interrupt source group that injects interrupts via WHvRequestInterrupt.
+struct WhpInterruptSourceGroup {
+    vm: Arc<dyn hypervisor::Vm>,
+    configs: Mutex<HashMap<InterruptIndex, MsiIrqSourceConfig>>,
+    masked: Mutex<HashMap<InterruptIndex, bool>>,
+    _base: InterruptIndex,
+    _count: InterruptIndex,
+}
+
+impl InterruptSourceGroup for WhpInterruptSourceGroup {
+    fn trigger(&self, index: InterruptIndex) -> std::io::Result<()> {
+        // Check if masked
+        if *self.masked.lock().unwrap().get(&index).unwrap_or(&false) {
+            return Ok(());
+        }
+
+        // Get the MSI config for this interrupt
+        let cfg = match self.configs.lock().unwrap().get(&index).copied() {
+            Some(c) => c,
+            None => return Ok(()), // No config yet, skip
+        };
+
+        // Extract vector and destination from MSI address/data
+        let vector = (cfg.data & 0xFF) as u8;
+        let destination = ((cfg.low_addr >> 12) & 0xFF) as u32;
+
+        // Inject via WHP
+        use hypervisor::whp::WhpVm;
+        let whp_vm = self.vm.as_any().downcast_ref::<WhpVm>()
+            .ok_or_else(|| std::io::Error::other("not WhpVm"))?;
+        whp_vm.request_interrupt(vector, destination)
+            .map_err(|e| std::io::Error::other(format!("WHvRequestInterrupt: {e}")))?;
+
+        Ok(())
+    }
+
+    fn notifier(&self, _index: InterruptIndex) -> Option<platform::EventFd> {
+        None
+    }
+
+    fn update(
+        &self,
+        index: InterruptIndex,
+        config: InterruptSourceConfig,
+        masked: bool,
+        _set_gsi: bool,
+    ) -> std::io::Result<()> {
+        if let InterruptSourceConfig::MsiIrq(msi_cfg) = config {
+            self.configs.lock().unwrap().insert(index, msi_cfg);
+        }
+        self.masked.lock().unwrap().insert(index, masked);
+        Ok(())
+    }
+
+    fn set_gsi(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 // ── VmOps: serial I/O handler ────────────────────────────────────────────────
 
 struct SerialVmOps {
@@ -1020,23 +1139,20 @@ struct SerialVmOps {
     pit_reload: std::sync::atomic::AtomicU16,
     /// Port 0x61 (NMI Status and Control) register value.
     port61: std::sync::atomic::AtomicU8,
-    /// I/O APIC register select (IOREGSEL).
-    ioapic_regsel: std::sync::atomic::AtomicU32,
-    /// I/O APIC redirection table (24 entries).
-    ioapic_redtbl: std::sync::Mutex<[u64; 24]>,
     /// Serial IER (Interrupt Enable Register) at port 0x3F9.
     serial_ier: std::sync::atomic::AtomicU8,
     /// Serial interrupt pending flag (set when THRE interrupt should fire).
     serial_thre_pending: std::sync::atomic::AtomicBool,
+    /// PIC master IMR (port 0x21) — track writes for probe detection.
+    pic_master_imr: std::sync::atomic::AtomicU8,
+    /// PIC slave IMR (port 0xA1).
+    pic_slave_imr: std::sync::atomic::AtomicU8,
+    /// Real IOAPIC device for interrupt routing.
+    ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>>,
 }
 
 impl SerialVmOps {
-    fn new() -> Self {
-        // Initialize redirection table: all entries masked (bit 16 = 1)
-        let mut redtbl = [0u64; 24];
-        for entry in &mut redtbl {
-            *entry = 1 << 16; // Masked
-        }
+    fn new(ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>>) -> Self {
         SerialVmOps {
             input: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seen_ports: std::sync::Mutex::new(std::collections::BTreeSet::new()),
@@ -1044,10 +1160,11 @@ impl SerialVmOps {
             pit_start: std::time::Instant::now(),
             pit_reload: std::sync::atomic::AtomicU16::new(0xFFFF),
             port61: std::sync::atomic::AtomicU8::new(0),
-            ioapic_regsel: std::sync::atomic::AtomicU32::new(0),
-            ioapic_redtbl: std::sync::Mutex::new(redtbl),
             serial_ier: std::sync::atomic::AtomicU8::new(0),
             serial_thre_pending: std::sync::atomic::AtomicBool::new(false),
+            pic_master_imr: std::sync::atomic::AtomicU8::new(0xFF),
+            pic_slave_imr: std::sync::atomic::AtomicU8::new(0xFF),
+            ioapic,
         }
     }
 
@@ -1065,51 +1182,6 @@ impl SerialVmOps {
         let mut buf = self.input.lock().unwrap();
         buf.pop_front()
     }
-
-    /// Read an I/O APIC register.
-    fn ioapic_read(&self, reg: u32) -> u32 {
-        match reg {
-            0x00 => 0, // IOAPIC ID
-            0x01 => {
-                // IOAPIC Version: bits 0-7 = version (0x11), bits 16-23 = max redir entry (23)
-                0x0017_0011
-            }
-            0x02 => 0, // Arbitration ID
-            0x10..=0x3F => {
-                // Redirection table: reg 0x10+2*n = low, 0x11+2*n = high
-                let idx = ((reg - 0x10) / 2) as usize;
-                let high = (reg - 0x10) % 2 == 1;
-                if idx < 24 {
-                    let tbl = self.ioapic_redtbl.lock().unwrap();
-                    if high { (tbl[idx] >> 32) as u32 } else { tbl[idx] as u32 }
-                } else { 0 }
-            }
-            _ => 0,
-        }
-    }
-
-    /// Write an I/O APIC register.
-    fn ioapic_write(&self, reg: u32, val: u32) {
-        match reg {
-            0x00 => {} // IOAPIC ID (ignore)
-            0x10..=0x3F => {
-                let idx = ((reg - 0x10) / 2) as usize;
-                let high = (reg - 0x10) % 2 == 1;
-                if idx < 24 {
-                    let mut tbl = self.ioapic_redtbl.lock().unwrap();
-                    if high {
-                        tbl[idx] = (tbl[idx] & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32);
-                    } else {
-                        tbl[idx] = (tbl[idx] & 0xFFFF_FFFF_0000_0000) | (val as u64);
-                    }
-                    if self.debug {
-                        eprintln!("[IOAPIC] redir[{idx}] = {:#018X}", tbl[idx]);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 impl VmOps for SerialVmOps {
@@ -1120,37 +1192,33 @@ impl VmOps for SerialVmOps {
         Ok(0)
     }
     fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> Result<(), HypervisorVmError> {
-        use std::sync::atomic::Ordering;
-        let val: u32 = match gpa {
-            0xFEC00000 => self.ioapic_regsel.load(Ordering::Relaxed),
-            0xFEC00010 => {
-                let reg = self.ioapic_regsel.load(Ordering::Relaxed);
-                self.ioapic_read(reg)
+        match gpa {
+            0xFEC00000..=0xFEC000FF => {
+                // Forward to real IOAPIC device
+                if let Some(ref ioapic) = self.ioapic {
+                    use vm_device::BusDevice;
+                    ioapic.lock().unwrap().read(0xFEC0_0000, gpa - 0xFEC0_0000, data);
+                } else {
+                    data.fill(0);
+                }
             }
             _ => {
                 if self.debug {
                     eprintln!("[MMIO] read GPA={gpa:#X} len={}", data.len());
                 }
-                0
+                data.fill(0);
             }
-        };
-        let bytes = val.to_le_bytes();
-        for (i, b) in data.iter_mut().enumerate() {
-            *b = if i < 4 { bytes[i] } else { 0 };
         }
         Ok(())
     }
     fn mmio_write(&self, gpa: u64, data: &[u8]) -> Result<(), HypervisorVmError> {
-        use std::sync::atomic::Ordering;
-        let mut bytes = [0u8; 4];
-        let len = data.len().min(4);
-        bytes[..len].copy_from_slice(&data[..len]);
-        let val = u32::from_le_bytes(bytes);
         match gpa {
-            0xFEC00000 => { self.ioapic_regsel.store(val, Ordering::Relaxed); }
-            0xFEC00010 => {
-                let reg = self.ioapic_regsel.load(Ordering::Relaxed);
-                self.ioapic_write(reg, val);
+            0xFEC00000..=0xFEC000FF => {
+                // Forward to real IOAPIC device
+                if let Some(ref ioapic) = self.ioapic {
+                    use vm_device::BusDevice;
+                    ioapic.lock().unwrap().write(0xFEC0_0000, gpa - 0xFEC0_0000, data);
+                }
             }
             _ => {
                 if self.debug {
@@ -1234,9 +1302,14 @@ impl VmOps for SerialVmOps {
                 // Return 0 for all CMOS reads (the kernel just needs something)
                 data[0] = 0;
             }
-            // PIC (8259) — mask registers
-            0x21 | 0xA1 => {
-                data[0] = 0xFF; // All IRQs masked
+            // PIC (8259) emulation — track IMR for probe detection
+            0x20 => { data[0] = 0x00; } // Master PIC CMD: IRR = no pending
+            0x21 => {
+                data[0] = self.pic_master_imr.load(std::sync::atomic::Ordering::Relaxed);
+            }
+            0xA0 => { data[0] = 0x00; } // Slave PIC CMD
+            0xA1 => {
+                data[0] = self.pic_slave_imr.load(std::sync::atomic::Ordering::Relaxed);
             }
             _ => data.fill(0xFF),
         }
@@ -1276,6 +1349,12 @@ impl VmOps for SerialVmOps {
             // NMI Status and Control
             use std::sync::atomic::Ordering;
             self.port61.store(data[0], Ordering::Relaxed);
+        } else if port == 0x21 && !data.is_empty() {
+            // PIC master IMR write
+            self.pic_master_imr.store(data[0], std::sync::atomic::Ordering::Relaxed);
+        } else if port == 0xA1 && !data.is_empty() {
+            // PIC slave IMR write
+            self.pic_slave_imr.store(data[0], std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }

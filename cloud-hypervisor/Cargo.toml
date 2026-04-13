@@ -25,6 +25,7 @@ anyhow = { workspace = true }
 arch = { path = "../arch" }
 clap = { workspace = true, features = ["string"] }
 dhat = { workspace = true, optional = true }
+devices = { path = "../devices" }
 env_logger = { workspace = true }
 hypervisor = { path = "../hypervisor" }
 libc = { workspace = true }
@@ -35,6 +36,7 @@ platform = { path = "../platform" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracer = { path = "../tracer" }
+vm-device = { path = "../vm-device" }
 vm-memory = { workspace = true, features = ["backend-mmap"] }
 vmm = { path = "../vmm" }
 
