@@ -309,6 +309,94 @@ impl WhpVm {
         Ok(())
     }
 
+    /// Set Hyper-V CPUID results for the partition.
+    /// This makes the guest detect Hyper-V and use synthetic timers.
+    fn set_hyperv_cpuid(&self) -> vm::Result<()> {
+        // WHV_X64_CPUID_RESULT2 structure: function(u32), index(u32), vpindex(u32),
+        // flags(u32), output(WHV_CPUID_OUTPUT={eax,ebx,ecx,edx})
+        // Total: 32 bytes per entry
+        // 
+        // We use WHvPartitionPropertyCodeCpuidResultList2 which supports per-VP results.
+        // Each entry is: { Function: u32, Index: u32, VpIndex: u32, Flags: u32, Output: {eax,ebx,ecx,edx} }
+        
+        // Simpler approach: use the raw property buffer.
+        // WHV_PARTITION_PROPERTY for CpuidResultList is an array of WHV_X64_CPUID_RESULT.
+        // WHV_X64_CPUID_RESULT: { Function: u32, Reserved: [u32; 3], Eax: u32, Ebx: u32, Ecx: u32, Edx: u32 }
+        // = 32 bytes per entry
+
+        #[repr(C)]
+        #[derive(Default)]
+        struct CpuidResult {
+            function: u32,
+            reserved: [u32; 3],
+            eax: u32,
+            ebx: u32,
+            ecx: u32,
+            edx: u32,
+        }
+
+        // Get host CPUID leaf 1 and set hypervisor present bit (ECX bit 31)
+        let host_cpuid1 = unsafe { std::arch::x86_64::__cpuid(1) };
+        
+        let entries = [
+            // CPUID leaf 1: set hypervisor present bit
+            CpuidResult {
+                function: 1,
+                eax: host_cpuid1.eax,
+                ebx: host_cpuid1.ebx,
+                ecx: host_cpuid1.ecx | (1 << 31), // Set hypervisor present
+                edx: host_cpuid1.edx,
+                ..Default::default()
+            },
+            CpuidResult {
+                function: 0x40000000,
+                eax: 0x4000000a,
+                ebx: 0x756e694c, // "Linu"
+                ecx: 0x564b2078, // "x KV"
+                edx: 0x7648204d, // "M Hv"
+                ..Default::default()
+            },
+            CpuidResult {
+                function: 0x40000001,
+                eax: 0x31237648, // "Hv#1"
+                ..Default::default()
+            },
+            CpuidResult {
+                function: 0x40000002,
+                eax: 0x3839,
+                ebx: 0xa0000,
+                ..Default::default()
+            },
+            CpuidResult {
+                function: 0x40000003,
+                eax: (1 << 1) | (1 << 2) | (1 << 3) | (1 << 9),
+                edx: 1 << 3,
+                ..Default::default()
+            },
+            CpuidResult {
+                function: 0x40000004,
+                eax: 1 << 5, // Recommend relaxed timing
+                ..Default::default()
+            },
+        ];
+
+        unsafe {
+            WHvSetPartitionProperty(
+                self.partition,
+                WHvPartitionPropertyCodeCpuidResultList,
+                entries.as_ptr() as *const std::ffi::c_void,
+                (entries.len() * std::mem::size_of::<CpuidResult>()) as u32,
+            )
+            .map_err(|e| {
+                vm::HypervisorVmError::InitializeVm(anyhow!(
+                    "Failed to set CPUID results: {e}"
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+
     /// Ensure the partition is set up. Must be called before creating vCPUs.
     fn ensure_setup(&self) -> vm::Result<()> {
         let mut is_setup = self.is_setup.write().unwrap();
@@ -333,6 +421,39 @@ impl WhpVm {
 
         // Do NOT enable HLT exits — they disrupt early kernel boot.
         // Timer interrupts are injected from a separate thread after kernel init.
+
+        // Set Hyper-V CPUID results so the kernel detects the hypervisor
+        // and uses Hyper-V enlightenments (synthetic timers, etc.)
+        if let Err(e) = self.set_hyperv_cpuid() {
+            eprintln!("[whp] Warning: Failed to set Hyper-V CPUID: {e:?}");
+        }
+        
+        // Enable CPUID exits for hypervisor leaves
+        set_partition_property(
+            self.partition,
+            WHvPartitionPropertyCodeExtendedVmExits,
+            0x4, // CpuidExit = bit 2
+        )
+        .map_err(|e| {
+            vm::HypervisorVmError::InitializeVm(anyhow!(
+                "Failed to set extended VM exits: {e}"
+            ))
+        })?;
+        
+        // Set CPUID exit list — which CPUID leaves cause exits
+        let cpuid_exit_list: [u32; 2] = [1, 0x40000000];
+        let cpuid_result = unsafe {
+            WHvSetPartitionProperty(
+                self.partition,
+                WHvPartitionPropertyCodeCpuidExitList,
+                cpuid_exit_list.as_ptr() as *const std::ffi::c_void,
+                (cpuid_exit_list.len() * 4) as u32,
+            )
+        };
+        match cpuid_result {
+            Ok(()) => eprintln!("[whp] CPUID exit list set OK"),
+            Err(e) => eprintln!("[whp] CPUID exit list failed: {e}"),
+        }
 
         // SAFETY: Completes the partition setup.
         unsafe {
@@ -1231,6 +1352,43 @@ impl cpu::Vcpu for WhpVcpu {
                     eprintln!("[vcpu] Canceled #{count} RIP={rip:#x} {:.1}s",
                               self.start_time.elapsed().as_secs_f64());
                 }
+                Ok(cpu::VmExit::Ignore)
+            }
+
+            WHvRunVpExitReasonX64Cpuid => {
+                // SAFETY: The union field is valid for this exit reason.
+                let cpuid_ctx = unsafe { &exit_context.Anonymous.CpuidAccess };
+                let function = cpuid_ctx.Rax as u32;
+                if self.exit_count.get() < 20 || function >= 0x40000000 {
+                    eprintln!("[cpuid] leaf={function:#X} RIP={:#X}", exit_context.VpContext.Rip);
+                }
+                let (eax, ebx, ecx, edx) = match function {
+                    1 => {
+                        // Set hypervisor present bit (ECX bit 31)
+                        let host = unsafe { std::arch::x86_64::__cpuid(1) };
+                        (host.eax, host.ebx, host.ecx | (1 << 31), host.edx)
+                    }
+                    0x40000000 => (
+                        0x4000000a, 0x756e694c, 0x564b2078, 0x7648204d,
+                    ),
+                    _ => {
+                        let r = unsafe { std::arch::x86_64::__cpuid_count(function, cpuid_ctx.Rcx as u32) };
+                        (r.eax, r.ebx, r.ecx, r.edx)
+                    }
+                };
+                let reg_names = [
+                    WHvX64RegisterRax, WHvX64RegisterRbx,
+                    WHvX64RegisterRcx, WHvX64RegisterRdx,
+                    WHvX64RegisterRip,
+                ];
+                let new_rip = exit_context.VpContext.Rip
+                    + exit_context.VpContext._bitfield as u64;
+                let reg_values = [
+                    reg64_value(eax as u64), reg64_value(ebx as u64),
+                    reg64_value(ecx as u64), reg64_value(edx as u64),
+                    reg64_value(new_rip),
+                ];
+                self.set_registers(&reg_names, &reg_values)?;
                 Ok(cpu::VmExit::Ignore)
             }
 

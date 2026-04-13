@@ -22,7 +22,7 @@ use vm_memory::bitmap::AtomicBitmap;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const GUEST_MEM_SIZE: usize = 256 << 20; // 256 MiB
+const GUEST_MEM_SIZE: usize = 512 << 20; // 512 MiB
 const SERIAL_PORT: u64 = 0x3F8;
 const DEBUG_EXIT_PORT: u64 = 0x501;
 
@@ -118,6 +118,22 @@ pub fn run() -> anyhow::Result<()> {
         }
 
         println!("Created IOAPIC with WHP interrupt injection");
+
+        // Map a RAM page at 0xFEC00000 with the IOAPIC version register pre-populated.
+        // WHP doesn't generate MMIO exits for unmapped GPA regions (returns 0 silently).
+        // The kernel reads the IOAPIC version register to determine the number of pins.
+        let ioapic_page_layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
+        let ioapic_host = unsafe { std::alloc::alloc_zeroed(ioapic_page_layout) };
+        if !ioapic_host.is_null() {
+            unsafe {
+                // IOREGSEL=1 (version), IOWIN=version value (24 entries, version 0x11)
+                std::ptr::write_unaligned(ioapic_host as *mut u32, 1);
+                std::ptr::write_unaligned(ioapic_host.add(0x10) as *mut u32, 0x0017_0011u32);
+                let _ = vm.create_user_memory_region(1, 0xFEC0_0000, 4096, ioapic_host, false, false);
+            }
+            println!("  Mapped IOAPIC version page at GPA 0xFEC00000");
+        }
+
         Some(ioapic)
     } else {
         None
@@ -205,10 +221,10 @@ pub fn run() -> anyhow::Result<()> {
                 let mut tick = 0u64;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(1));
-                    // Inject LOCAL_TIMER_VECTOR (0xEF) since WHP's LAPIC timer
-                    // may not fire autonomously. With lapic_timer_frequency set,
-                    // the handler advances jiffies via the clockevent.
-                    let _ = whp.request_interrupt(0xEF, 0);
+                    // No injection — let the kernel boot without interference.
+                    // The kernel reaches init without timer ticks.
+                    // We just sleep to keep the thread alive.
+                    std::thread::sleep(std::time::Duration::from_secs(60));
                     tick += 1;
                     if tick == 1 { eprintln!("[timer] First tick OK"); }
                 }
@@ -811,7 +827,7 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         std::ptr::write_bytes(bp, 0, 4096);
 
         // Write command line
-        let cmdline = b"console=ttyS0 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check noapic tsc=reliable keep_bootcon lapic_timer_frequency=1000000000 rdinit=/init\0";
+        let cmdline = b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check noapictimer noapic tsc=reliable idle=halt rdinit=/init\0";
         std::ptr::copy_nonoverlapping(
             cmdline.as_ptr(),
             host_mem.add(CMDLINE_ADDR as usize),
@@ -984,6 +1000,90 @@ fn setup_acpi_tables(host_mem: *mut u8) {
     }
 
     println!("  MP tables: FP at {MP_FP_ADDR:#X}, config at {MP_TABLE_ADDR:#X}");
+
+    // === ACPI tables: RSDP → XSDT → MADT ===
+    // For kernels with ACPI support (e.g., CH's 6.x kernel).
+    const ACPI_RSDP_ADDR: u64 = 0x000E_0000;
+    const ACPI_TABLES_ADDR: u64 = 0x000E_1000;
+
+    unsafe {
+        // MADT at ACPI_TABLES_ADDR + 64
+        let madt_addr = ACPI_TABLES_ADDR + 64;
+        let madt = host_mem.add(madt_addr as usize);
+        std::ptr::write_bytes(madt, 0, 128);
+        let madt_len: u32 = 44 + 8 + 12; // header + LAPIC + IOAPIC
+
+        std::ptr::copy_nonoverlapping(b"APIC".as_ptr(), madt, 4);
+        w::<u32>(madt, 4, madt_len);
+        *madt.add(8) = 5; // Revision
+        std::ptr::copy_nonoverlapping(b"CLOUDH".as_ptr(), madt.add(10), 6);
+        std::ptr::copy_nonoverlapping(b"CHMADT  ".as_ptr(), madt.add(16), 8);
+        w::<u32>(madt, 24, 1);
+        std::ptr::copy_nonoverlapping(b"CLHV".as_ptr(), madt.add(28), 4);
+        w::<u32>(madt, 32, 1);
+        w::<u32>(madt, 36, 0xFEE0_0000); // Local APIC Address
+        w::<u32>(madt, 40, 1); // Flags: PCAT_COMPAT
+
+        // Local APIC (type 0, 8 bytes)
+        let lapic = madt.add(44);
+        *lapic = 0; *lapic.add(1) = 8; *lapic.add(2) = 0; *lapic.add(3) = 0;
+        w::<u32>(lapic, 4, 1); // Enabled
+
+        // I/O APIC (type 1, 12 bytes)
+        let ioapic_entry = madt.add(52);
+        *ioapic_entry = 1; *ioapic_entry.add(1) = 12; *ioapic_entry.add(2) = 0;
+        w::<u32>(ioapic_entry, 4, 0xFEC0_0000);
+        w::<u32>(ioapic_entry, 8, 0);
+
+        // Checksum
+        let madt_slice = std::slice::from_raw_parts(madt, madt_len as usize);
+        *madt.add(9) = cksum(madt_slice);
+
+        // XSDT at ACPI_TABLES_ADDR
+        let xsdt = host_mem.add(ACPI_TABLES_ADDR as usize);
+        std::ptr::write_bytes(xsdt, 0, 64);
+        let xsdt_len: u32 = 36 + 8;
+        std::ptr::copy_nonoverlapping(b"XSDT".as_ptr(), xsdt, 4);
+        w::<u32>(xsdt, 4, xsdt_len);
+        *xsdt.add(8) = 1;
+        std::ptr::copy_nonoverlapping(b"CLOUDH".as_ptr(), xsdt.add(10), 6);
+        std::ptr::copy_nonoverlapping(b"CHXSDT  ".as_ptr(), xsdt.add(16), 8);
+        w::<u32>(xsdt, 24, 1);
+        std::ptr::copy_nonoverlapping(b"CLHV".as_ptr(), xsdt.add(28), 4);
+        w::<u32>(xsdt, 32, 1);
+        w::<u64>(xsdt, 36, madt_addr);
+        let xsdt_slice = std::slice::from_raw_parts(xsdt, xsdt_len as usize);
+        *xsdt.add(9) = cksum(xsdt_slice);
+
+        // RSDP at ACPI_RSDP_ADDR
+        let rsdp = host_mem.add(ACPI_RSDP_ADDR as usize);
+        std::ptr::write_bytes(rsdp, 0, 36);
+        std::ptr::copy_nonoverlapping(b"RSD PTR ".as_ptr(), rsdp, 8);
+        std::ptr::copy_nonoverlapping(b"CLOUDH".as_ptr(), rsdp.add(9), 6);
+        *rsdp.add(15) = 2; // Revision 2
+        w::<u32>(rsdp, 16, ACPI_TABLES_ADDR as u32); // RSDT addr
+        w::<u32>(rsdp, 20, 36); // Length
+        w::<u64>(rsdp, 24, ACPI_TABLES_ADDR); // XSDT addr
+        let rsdp20 = std::slice::from_raw_parts(rsdp, 20);
+        *rsdp.add(8) = cksum(rsdp20);
+        let rsdp36 = std::slice::from_raw_parts(rsdp, 36);
+        *rsdp.add(32) = cksum(rsdp36);
+
+        // Set acpi_rsdp_addr in boot_params (offset 0x070)
+        let bp = host_mem.add(BOOT_PARAMS_ADDR as usize);
+        w::<u64>(bp, 0x070, ACPI_RSDP_ADDR);
+
+        // Also set in PVH hvm_start_info rsdp_paddr (offset 24)
+        let pvh = host_mem.add(0x6000);
+        w::<u64>(pvh, 24, ACPI_RSDP_ADDR);
+    }
+
+    fn cksum(data: &[u8]) -> u8 {
+        let sum: u8 = data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        (!sum).wrapping_add(1)
+    }
+
+    println!("  ACPI tables: RSDP at {ACPI_RSDP_ADDR:#X}, MADT at {:#X}", ACPI_TABLES_ADDR + 64);
 }
 const PDPTE_ADDR: u64 = 0xB000;
 const PDE_ADDR: u64 = 0xC000; // 4 pages: 0xC000, 0xD000, 0xE000, 0xF000
