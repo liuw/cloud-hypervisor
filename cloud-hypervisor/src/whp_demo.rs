@@ -188,7 +188,7 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     // ── Create vCPU ──────────────────────────────────────────────────────
-    let vm_ops = Arc::new(SerialVmOps::new(ioapic.clone()));
+    let vm_ops = Arc::new(SerialVmOps::new(ioapic.clone(), Some(vm.clone())));
     let vm_ops_clone: Arc<dyn VmOps> = vm_ops.clone();
     let mut vcpu = vm
         .create_vcpu(0, Some(vm_ops_clone))
@@ -1251,10 +1251,12 @@ struct SerialVmOps {
     pic_slave_imr: std::sync::atomic::AtomicU8,
     /// Real IOAPIC device for interrupt routing.
     ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>>,
+    /// VM reference for interrupt injection from PIO handler.
+    vm: Option<Arc<dyn hypervisor::Vm>>,
 }
 
 impl SerialVmOps {
-    fn new(ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>>) -> Self {
+    fn new(ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>>, vm: Option<Arc<dyn hypervisor::Vm>>) -> Self {
         SerialVmOps {
             input: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seen_ports: std::sync::Mutex::new(std::collections::BTreeSet::new()),
@@ -1267,6 +1269,7 @@ impl SerialVmOps {
             pic_master_imr: std::sync::atomic::AtomicU8::new(0xFF),
             pic_slave_imr: std::sync::atomic::AtomicU8::new(0xFF),
             ioapic,
+            vm,
         }
     }
 
@@ -1431,14 +1434,30 @@ impl VmOps for SerialVmOps {
             }
             use std::io::Write;
             let _ = std::io::stdout().flush();
-            // After writing data, THRE becomes empty → set pending
+            // After writing data, THRE becomes empty → inject serial IRQ
             let ier = self.serial_ier.load(std::sync::atomic::Ordering::Relaxed);
             if (ier & 0x02) != 0 {
                 self.serial_thre_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(ref vm) = self.vm {
+                    use hypervisor::whp::WhpVm;
+                    if let Some(whp) = vm.as_any().downcast_ref::<WhpVm>() {
+                        let _ = whp.request_interrupt(0x24, 0); // THRE → IRQ 4
+                    }
+                }
             }
         } else if port == 0x3F9 && !data.is_empty() {
-            // IER write
+            // IER write — track and inject serial IRQ if THRI enabled
+            let old_ier = self.serial_ier.load(std::sync::atomic::Ordering::Relaxed);
             self.serial_ier.store(data[0], std::sync::atomic::Ordering::Relaxed);
+            // If THRI bit (bit 1) just became set, inject serial IRQ 4 (vector 0x24)
+            if (data[0] & 0x02) != 0 && (old_ier & 0x02) == 0 {
+                if let Some(ref vm) = self.vm {
+                    use hypervisor::whp::WhpVm;
+                    if let Some(whp) = vm.as_any().downcast_ref::<WhpVm>() {
+                        let _ = whp.request_interrupt(0x24, 0); // IRQ 4 → vector 0x24
+                    }
+                }
+            }
         } else if port == DEBUG_EXIT_PORT {
             println!();
             println!("--- Guest requested shutdown ---");
