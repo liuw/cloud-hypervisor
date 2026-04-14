@@ -5,6 +5,15 @@
 // This module provides a minimal VMM for Windows, sharing cross-platform
 // submodules (api, config, vm_config) with the Unix implementation.
 
+use std::io;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use log::{error, info, warn};
+use thiserror::Error;
+use platform::{EFD_NONBLOCK, EventFd, EventPoll, PollEvent};
+
 // ── Cross-platform submodules (shared with vmm_impl.rs) ─────────────────────
 pub mod api;
 pub mod config;
@@ -14,3 +23,212 @@ pub mod vm_config;
 // ── Windows-specific submodules ─────────────────────────────────────────────
 #[path = "serial_manager_windows.rs"]
 pub mod serial_manager;
+
+// ── Error types ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("Error creating EventFd")]
+    EventFdCreate(#[source] io::Error),
+
+    #[error("Error reading EventFd")]
+    EventFdRead(#[source] io::Error),
+
+    #[error("Error creating EventPoll")]
+    Epoll(#[source] io::Error),
+
+    #[error("Error receiving API request")]
+    ApiRequestRecv(#[source] std::sync::mpsc::RecvError),
+
+    #[error("Error spawning VMM thread")]
+    VmmThreadSpawn(#[source] io::Error),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+// ── Version info ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct VmmVersionInfo {
+    pub build_version: String,
+    pub version: String,
+}
+
+impl VmmVersionInfo {
+    pub fn new(build_version: &str, version: &str) -> Self {
+        Self {
+            build_version: build_version.to_owned(),
+            version: version.to_owned(),
+        }
+    }
+}
+
+// ── Event dispatch ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum EpollDispatch {
+    Exit = 0,
+    Reset = 1,
+    Api = 2,
+    ActivateVirtioDevices = 3,
+    Unknown,
+}
+
+impl From<u64> for EpollDispatch {
+    fn from(v: u64) -> Self {
+        match v {
+            0 => EpollDispatch::Exit,
+            1 => EpollDispatch::Reset,
+            2 => EpollDispatch::Api,
+            3 => EpollDispatch::ActivateVirtioDevices,
+            _ => EpollDispatch::Unknown,
+        }
+    }
+}
+
+// ── API request type ────────────────────────────────────────────────────────
+
+/// Placeholder API request type for the Windows VMM control loop.
+///
+/// On Unix, `ApiRequest` is a complex closure-based dispatch. On Windows,
+/// we start with a simple enum that can be extended as needed.
+pub type ApiRequest = Box<dyn FnOnce(&mut Vmm) -> Result<bool> + Send>;
+
+// ── VMM struct ──────────────────────────────────────────────────────────────
+
+pub struct Vmm {
+    poll: EventPoll,
+    exit_evt: EventFd,
+    reset_evt: EventFd,
+    api_evt: EventFd,
+    version: VmmVersionInfo,
+    hypervisor: Arc<dyn hypervisor::Hypervisor>,
+    activate_evt: EventFd,
+}
+
+pub struct VmmThreadHandle {
+    pub thread_handle: thread::JoinHandle<Result<()>>,
+}
+
+impl Vmm {
+    fn new(
+        vmm_version: VmmVersionInfo,
+        api_evt: EventFd,
+        exit_evt: EventFd,
+        hypervisor: Arc<dyn hypervisor::Hypervisor>,
+    ) -> Result<Self> {
+        let mut poll = EventPoll::new().map_err(Error::Epoll)?;
+        let reset_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
+        let activate_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
+
+        poll.add_event(&exit_evt, EpollDispatch::Exit as u64)
+            .map_err(Error::Epoll)?;
+        poll.add_event(&reset_evt, EpollDispatch::Reset as u64)
+            .map_err(Error::Epoll)?;
+        poll.add_event(&activate_evt, EpollDispatch::ActivateVirtioDevices as u64)
+            .map_err(Error::Epoll)?;
+        poll.add_event(&api_evt, EpollDispatch::Api as u64)
+            .map_err(Error::Epoll)?;
+
+        Ok(Vmm {
+            poll,
+            exit_evt,
+            reset_evt,
+            api_evt,
+            version: vmm_version,
+            hypervisor,
+            activate_evt,
+        })
+    }
+
+    fn control_loop(&mut self, api_receiver: &Receiver<ApiRequest>) -> Result<()> {
+        const POLL_EVENTS_LEN: usize = 16;
+        let mut events = vec![PollEvent { data: 0, raw_events: 0 }; POLL_EVENTS_LEN];
+
+        info!(
+            "VMM control loop started (version: {} {})",
+            self.version.build_version, self.version.version
+        );
+
+        'outer: loop {
+            let num_events = match self.poll.wait(-1, &mut events[..]) {
+                Ok(res) => res,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(Error::Epoll(e));
+                }
+            };
+
+            for event in events.iter().take(num_events) {
+                let dispatch_event: EpollDispatch = event.data.into();
+                match dispatch_event {
+                    EpollDispatch::Unknown => {
+                        warn!("Unknown VMM loop event: {}", event.data);
+                    }
+                    EpollDispatch::Exit => {
+                        info!("VM exit event");
+                        self.exit_evt.read().map_err(Error::EventFdRead)?;
+                        break 'outer;
+                    }
+                    EpollDispatch::Reset => {
+                        info!("VM reset event");
+                        self.reset_evt.read().map_err(Error::EventFdRead)?;
+                        // TODO: implement VM reboot on Windows
+                        warn!("VM reset not yet implemented on Windows");
+                    }
+                    EpollDispatch::ActivateVirtioDevices => {
+                        let count = self.activate_evt.read().map_err(Error::EventFdRead)?;
+                        info!("Activate virtio devices: count = {count}");
+                        // TODO: activate virtio devices
+                    }
+                    EpollDispatch::Api => {
+                        for _ in 0..self.api_evt.read().map_err(Error::EventFdRead)? {
+                            let api_request =
+                                api_receiver.recv().map_err(Error::ApiRequestRecv)?;
+                            if api_request(self)? {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("VMM control loop exited");
+        Ok(())
+    }
+}
+
+// ── Public entry point ──────────────────────────────────────────────────────
+
+/// Start the VMM thread with the Windows control loop.
+pub fn start_vmm_thread(
+    vmm_version: VmmVersionInfo,
+    api_event: EventFd,
+    api_receiver: Receiver<ApiRequest>,
+    exit_event: EventFd,
+    hypervisor: Arc<dyn hypervisor::Hypervisor>,
+) -> Result<VmmThreadHandle> {
+    let thread = thread::Builder::new()
+        .name("vmm".to_string())
+        .spawn(move || {
+            let mut vmm = Vmm::new(vmm_version, api_event, exit_event, hypervisor)?;
+            vmm.control_loop(&api_receiver)
+        })
+        .map_err(Error::VmmThreadSpawn)?;
+
+    Ok(VmmThreadHandle {
+        thread_handle: thread,
+    })
+}
+
+/// Return the list of enabled features (for display purposes).
+pub fn feature_list() -> Vec<String> {
+    let mut features = Vec::new();
+    #[cfg(feature = "whp")]
+    features.push("whp".to_string());
+    features
+}
