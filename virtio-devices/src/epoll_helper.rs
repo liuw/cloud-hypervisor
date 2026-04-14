@@ -10,6 +10,8 @@
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -73,22 +75,34 @@ impl EpollHelper {
         kill_evt: &EventFd,
         pause_evt: &EventFd,
     ) -> std::result::Result<Self, EpollHelperError> {
-        let poll = EventPoll::new().map_err(EpollHelperError::CreateFd)?;
+        let mut poll = EventPoll::new().map_err(EpollHelperError::CreateFd)?;
 
         let mut helper = Self {
             pause_evt: pause_evt.try_clone().unwrap(),
             poll,
         };
 
-        helper.add_event(kill_evt.as_raw_fd(), EPOLL_HELPER_EVENT_KILL)?;
-        helper.add_event(pause_evt.as_raw_fd(), EPOLL_HELPER_EVENT_PAUSE)?;
+        #[cfg(unix)]
+        {
+            helper.add_event(kill_evt.as_raw_fd(), EPOLL_HELPER_EVENT_KILL)?;
+            helper.add_event(pause_evt.as_raw_fd(), EPOLL_HELPER_EVENT_PAUSE)?;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            helper.add_event(kill_evt.as_raw_handle(), EPOLL_HELPER_EVENT_KILL)?;
+            helper.add_event(pause_evt.as_raw_handle(), EPOLL_HELPER_EVENT_PAUSE)?;
+        }
         Ok(helper)
     }
 
+    // ── Unix API (RawFd + epoll::Events) ────────────────────────────────
+
+    #[cfg(unix)]
     pub fn add_event(&mut self, fd: RawFd, id: u16) -> std::result::Result<(), EpollHelperError> {
         self.add_event_custom(fd, id, epoll::Events::EPOLLIN)
     }
 
+    #[cfg(unix)]
     pub fn add_event_custom(
         &mut self,
         fd: RawFd,
@@ -100,6 +114,7 @@ impl EpollHelper {
             .map_err(EpollHelperError::Ctl)
     }
 
+    #[cfg(unix)]
     pub fn mod_event_custom(
         &mut self,
         fd: RawFd,
@@ -111,6 +126,7 @@ impl EpollHelper {
             .map_err(EpollHelperError::Ctl)
     }
 
+    #[cfg(unix)]
     pub fn del_event_custom(
         &mut self,
         fd: RawFd,
@@ -121,6 +137,31 @@ impl EpollHelper {
             .del_event_raw(fd, evts)
             .map_err(EpollHelperError::Ctl)
     }
+
+    // ── Windows API (RawHandle) ─────────────────────────────────────────
+
+    #[cfg(target_os = "windows")]
+    pub fn add_event(
+        &mut self,
+        handle: RawHandle,
+        id: u16,
+    ) -> std::result::Result<(), EpollHelperError> {
+        self.poll
+            .add_event_raw(handle, id.into())
+            .map_err(EpollHelperError::Ctl)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn del_event(
+        &mut self,
+        handle: RawHandle,
+    ) -> std::result::Result<(), EpollHelperError> {
+        self.poll
+            .del_event_raw(handle)
+            .map_err(EpollHelperError::Ctl)
+    }
+
+    // ── Cross-platform run loop ─────────────────────────────────────────
 
     pub fn run(
         &mut self,
@@ -143,8 +184,6 @@ impl EpollHelper {
         const EPOLL_EVENTS_LEN: usize = 100;
         let mut events = vec![PollEvent { data: 0, raw_events: 0 }; EPOLL_EVENTS_LEN];
 
-        // Before jumping into the epoll loop, check if the device is expected
-        // to be in a paused state.
         while paused.load(Ordering::SeqCst) {
             thread::park();
         }
@@ -179,13 +218,10 @@ impl EpollHelper {
                     }
                     EPOLL_HELPER_EVENT_PAUSE => {
                         info!("PAUSE_EVENT received, pausing epoll loop");
-
                         paused_sync.wait();
-
                         while paused.load(Ordering::SeqCst) {
                             thread::park();
                         }
-
                         let _ = self.pause_evt.read();
                     }
                     _ => {

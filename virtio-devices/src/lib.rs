@@ -23,7 +23,6 @@ pub mod balloon;
 pub mod block;
 #[cfg(unix)]
 mod console;
-#[cfg(unix)]
 pub mod epoll_helper;
 #[cfg(unix)]
 mod iommu;
@@ -65,7 +64,6 @@ pub use self::device::{
     ActivationContext, DmaRemapping, VirtioCommon, VirtioDevice, VirtioInterrupt,
     VirtioInterruptType, VirtioSharedMemoryList,
 };
-#[cfg(unix)]
 pub use self::epoll_helper::{
     EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
 };
