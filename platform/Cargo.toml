@@ -10,6 +10,7 @@ libc = { workspace = true }
 log = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+epoll = { workspace = true }
 signal-hook = { workspace = true }
 vmm-sys-util = { workspace = true }
 

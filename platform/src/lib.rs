@@ -11,11 +11,13 @@
 
 mod event_fd;
 pub mod clock;
+pub mod event_poll;
 pub mod signal;
 pub mod terminal;
 pub mod timer;
 
 pub use event_fd::EventFd;
+pub use event_poll::{EventPoll, PollEvent};
 pub use terminal::{TerminalState, is_terminal, restore_terminal_state, save_terminal_state, set_raw_mode};
 
 /// Constant matching Linux `EFD_NONBLOCK` for use in `EventFd::new()`.
