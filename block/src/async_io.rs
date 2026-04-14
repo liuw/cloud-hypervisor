@@ -8,12 +8,10 @@ use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use thiserror::Error;
-#[cfg(unix)]
 use platform::EventFd;
 
 #[cfg(unix)]
 use crate::BatchRequest;
-#[cfg(unix)]
 use crate::{DiskTopology, SECTOR_SIZE};
 
 #[derive(Error, Debug)]
@@ -158,6 +156,32 @@ pub trait AsyncIo: Send {
     fn submit_batch_requests(&mut self, _batch_request: &[BatchRequest]) -> AsyncIoResult<()> {
         Ok(())
     }
+    fn alignment(&self) -> u64 {
+        SECTOR_SIZE
+    }
+}
+
+/// Windows version of AsyncIo using simple (offset, ptr, len) parameters
+/// instead of Unix-specific iovec/off_t types.
+#[cfg(target_os = "windows")]
+pub trait AsyncIo: Send {
+    fn notifier(&self) -> &EventFd;
+    fn read_vectored(
+        &mut self,
+        offset: i64,
+        bufs: &[(u64, u64)], // (ptr, len) pairs
+        user_data: u64,
+    ) -> AsyncIoResult<()>;
+    fn write_vectored(
+        &mut self,
+        offset: i64,
+        bufs: &[(u64, u64)], // (ptr, len) pairs
+        user_data: u64,
+    ) -> AsyncIoResult<()>;
+    fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()>;
+    fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
+    fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()>;
+    fn next_completed_request(&mut self) -> Option<(u64, i32)>;
     fn alignment(&self) -> u64 {
         SECTOR_SIZE
     }

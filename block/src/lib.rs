@@ -35,6 +35,9 @@ pub mod raw_async_aio;
 mod raw_async_io_tests;
 #[cfg(unix)]
 pub mod raw_sync;
+#[cfg(target_os = "windows")]
+#[path = "raw_sync_windows.rs"]
+pub mod raw_sync;
 #[cfg(unix)]
 pub mod vhd;
 #[cfg(unix)]
@@ -1314,6 +1317,19 @@ pub fn query_device_size(file: &File) -> io::Result<(u64, u64)> {
     }
 }
 
+/// Windows: query file size. Returns (logical, physical) — both equal file length.
+#[cfg(target_os = "windows")]
+pub fn query_device_size(file: &File) -> io::Result<(u64, u64)> {
+    let len = file.metadata()?.len();
+    Ok((len, len))
+}
+
+/// Windows: sparse operations are not supported yet.
+#[cfg(target_os = "windows")]
+pub fn probe_sparse_support(_file: &File) -> bool {
+    false
+}
+
 #[cfg(unix)]
 #[derive(Copy, Clone)]
 enum BlockSize {
@@ -1437,6 +1453,13 @@ impl DiskTopology {
             minimum_io_size: Self::query_block_size(f, BlockSize::MinimumIo)?,
             optimal_io_size: Self::query_block_size(f, BlockSize::OptimalIo)?,
         })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl DiskTopology {
+    pub fn probe(_f: &File) -> std::io::Result<Self> {
+        Ok(DiskTopology::default())
     }
 }
 

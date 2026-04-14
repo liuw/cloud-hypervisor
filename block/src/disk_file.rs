@@ -38,7 +38,8 @@ use std::fmt::Debug;
 use std::io;
 
 #[cfg(unix)]
-use crate::async_io::{self, AsyncIo, BorrowedDiskFd};
+use crate::async_io::{self, BorrowedDiskFd};
+use crate::async_io::AsyncIo;
 #[cfg(unix)]
 use crate::error::{BlockError, BlockErrorKind};
 use crate::{BlockResult, DiskTopology};
@@ -122,7 +123,6 @@ impl<T: DiskFile + PhysicalSize + DiskFd + SparseCapable + Resizable> FullDiskFi
 ///
 /// Adds cloning and async I/O construction on top of [`DiskFile`].
 /// `Unpin` is required so trait objects can be moved freely.
-#[cfg(unix)]
 pub trait AsyncDiskFile: DiskFile + Unpin {
     /// Creates an independent handle for a queue worker.
     ///
