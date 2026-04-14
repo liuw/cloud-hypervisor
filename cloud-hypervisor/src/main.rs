@@ -68,13 +68,6 @@ fn main() {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(512) << 20; // Default 512 MiB
 
-        // Send VmCreate API request to the VMM thread, get back VM + memory
-        let (response_sender, response_receiver) = sync_channel::<
-            vmm::Result<(
-                std::sync::Arc<dyn hypervisor::Vm>,
-                std::sync::Arc<std::sync::Mutex<vmm::memory_manager::MemoryManager>>,
-            )>,
-        >(1);
         let vm_config = vmm::vm_config::VmConfig {
             cpus: vmm::vm_config::CpusConfig::default(),
             memory: vmm::vm_config::MemoryConfig {
@@ -116,45 +109,63 @@ fn main() {
             ivshmem: None,
         };
 
+        // ── VmCreate API request ─────────────────────────────────────────
+        let (create_sender, create_receiver) = sync_channel::<vmm::Result<()>>(1);
+
         api_sender
             .send(Box::new(move |vmm: &mut vmm::Vmm| {
-                let result = vmm.vm_create(vm_config).map(|()| {
-                    (
-                        vmm.vm().unwrap().clone(),
-                        vmm.memory_manager().unwrap().clone(),
-                    )
-                });
-                response_sender.send(result).ok();
-                Ok(false) // don't exit the control loop
+                create_sender.send(vmm.vm_create(vm_config)).ok();
+                Ok(false)
             }))
             .expect("Failed to send VmCreate request");
         api_evt.write(1).unwrap();
 
-        // Wait for VM creation to complete
-        let (vm, memory_manager) = match response_receiver.recv() {
-            Ok(Ok(handles)) => {
-                println!("VM created via VMM control loop");
-                handles
-            }
+        match create_receiver.recv() {
+            Ok(Ok(())) => println!("VM created"),
             Ok(Err(e)) => {
                 eprintln!("VmCreate failed: {e:#}");
                 std::process::exit(1);
             }
             Err(e) => {
-                eprintln!("VmCreate response error: {e}");
+                eprintln!("VmCreate channel error: {e}");
                 std::process::exit(1);
             }
-        };
-
-        // Run the WHP demo with the VM and memory from the VMM.
-        if let Err(e) = whp_demo::run(exit_evt, payload, disk_path, vm, memory_manager) {
-            eprintln!("Error: {e:#}");
-            std::process::exit(1);
         }
 
-        // Wait for VMM thread to finish
-        if let Err(e) = vmm_thread.thread_handle.join() {
-            eprintln!("VMM thread error: {e:?}");
+        // ── VmBoot API request ──────────────────────────────────────────
+        let (boot_sender, boot_receiver) = sync_channel::<vmm::Result<()>>(1);
+
+        api_sender
+            .send(Box::new(move |vmm: &mut vmm::Vmm| {
+                let result = vmm.vm_boot(|exit_evt, vm, mm| {
+                    whp_demo::boot(exit_evt, payload, disk_path, vm, mm)
+                });
+                boot_sender.send(result).ok();
+                Ok(false)
+            }))
+            .expect("Failed to send VmBoot request");
+        api_evt.write(1).unwrap();
+
+        match boot_receiver.recv() {
+            Ok(Ok(())) => println!("VM booted — vCPU running"),
+            Ok(Err(e)) => {
+                eprintln!("VmBoot failed: {e:#}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("VmBoot channel error: {e}");
+                std::process::exit(1);
+            }
+        }
+
+        // ── Wait for VMM control loop to exit ───────────────────────────
+        // The vCPU thread signals exit_evt on shutdown, which causes
+        // the control loop to break.
+        println!("--- Guest running, waiting for shutdown... ---");
+        match vmm_thread.thread_handle.join() {
+            Ok(Ok(())) => println!("VMM exited cleanly"),
+            Ok(Err(e)) => eprintln!("VMM error: {e:#}"),
+            Err(e) => eprintln!("VMM thread panic: {e:?}"),
         }
     }
 

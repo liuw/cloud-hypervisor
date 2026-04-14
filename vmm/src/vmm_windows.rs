@@ -50,6 +50,9 @@ pub enum Error {
 
     #[error("Error in memory manager")]
     MemoryManager(#[source] memory_manager::Error),
+
+    #[error("Error booting VM")]
+    VmBoot(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -187,6 +190,33 @@ impl Vmm {
     /// Get the exit event (for signaling shutdown from vCPU threads).
     pub fn exit_evt(&self) -> &EventFd {
         &self.exit_evt
+    }
+
+    /// Boot the VM using the provided boot function.
+    ///
+    /// The boot function receives the exit_evt, VM handle, and memory manager,
+    /// and is responsible for loading the payload, creating devices, and
+    /// starting the vCPU thread. It must return immediately (not block).
+    pub fn vm_boot<F>(&self, boot_fn: F) -> Result<()>
+    where
+        F: FnOnce(EventFd, Arc<dyn hypervisor::Vm>, Arc<Mutex<memory_manager::MemoryManager>>) -> std::result::Result<(), anyhow::Error>,
+    {
+        let vm = self.vm.as_ref().ok_or_else(|| {
+            Error::VmBoot("VM not created — call vm_create first".into())
+        })?;
+        let mm = self.memory_manager.as_ref().ok_or_else(|| {
+            Error::VmBoot("Memory manager not available".into())
+        })?;
+
+        boot_fn(
+            self.exit_evt.try_clone().map_err(Error::EventFdCreate)?,
+            vm.clone(),
+            mm.clone(),
+        )
+        .map_err(|e| Error::VmBoot(format!("{e:#}")))?;
+
+        info!("VM booted");
+        Ok(())
     }
 
     fn control_loop(&mut self, api_receiver: &Receiver<ApiRequest>) -> Result<()> {

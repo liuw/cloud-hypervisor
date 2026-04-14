@@ -89,7 +89,12 @@ const KERNEL_LOAD_ADDR: u64 = 0x100000; // 1 MiB — protected-mode kernel
 
 type GuestMem = GuestMemoryMmap<AtomicBitmap>;
 
-pub fn run(
+/// Boot the VM: load payload, create devices, start vCPU and helper threads.
+///
+/// Returns immediately after starting all threads. The vCPU thread will
+/// signal `exit_evt` when the guest shuts down, which causes the VMM
+/// control loop to exit.
+pub fn boot(
     exit_evt: platform::EventFd,
     payload: vmm::vm_config::PayloadConfig,
     disk_path: Option<String>,
@@ -345,8 +350,9 @@ pub fn run(
 
     // ── Run vCPU in a dedicated thread ─────────────────────────────────
     let vcpu_exit_evt = exit_evt.try_clone().unwrap();
+    let terminal_state_for_vcpu = terminal_state.clone();
     let debug_kernel = std::env::var("CH_DEBUG").is_ok();
-    let vcpu_thread = std::thread::Builder::new()
+    let _vcpu_thread = std::thread::Builder::new()
         .name("vcpu-0".to_string())
         .spawn(move || {
             let mut exit_count = 0u64;
@@ -394,21 +400,17 @@ pub fn run(
             }
             // Signal the VMM control loop to exit
             vcpu_exit_evt.write(1).ok();
+
+            // Restore terminal state from vCPU thread
+            if let Some(ref state) = terminal_state_for_vcpu {
+                let _ = platform::restore_terminal_state(0, state);
+            }
+            println!("WHP VM stopped.");
         })
         .context("Failed to spawn vCPU thread")?;
 
-    // Wait for vCPU thread to finish
-    vcpu_thread.join().unwrap_or_else(|e| {
-        eprintln!("vCPU thread panicked: {e:?}");
-        exit_evt.write(1).ok();
-    });
-
-    // ── Restore terminal state ─────────────────────────────────────────────
-    if let Some(ref state) = terminal_state {
-        let _ = platform::restore_terminal_state(0, state);
-    }
-
-    println!("WHP demo complete.");
+    // Don't join the vCPU thread — return immediately.
+    // The VMM control loop will handle the exit event.
     Ok(())
 }
 
