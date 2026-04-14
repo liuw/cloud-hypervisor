@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write as _};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, anyhow};
@@ -24,7 +24,6 @@ use vm_memory::bitmap::AtomicBitmap;
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const GUEST_MEM_SIZE: usize = 512 << 20; // 512 MiB
-const SERIAL_PORT: u64 = 0x3F8;
 const DEBUG_EXIT_PORT: u64 = 0x501;
 
 // PCI configuration I/O ports
@@ -278,8 +277,25 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
+    // ── Create serial device using the devices crate 16550 UART ────────
+    // This replaces the ad-hoc serial emulation with a proper UART that handles
+    // DLAB, baud rate, LCR, MCR, MSR, SCR, FIFO, and interrupt-driven I/O.
+    let serial_irq = Arc::new(WhpFixedVectorInterrupt { vm: vm.clone(), vector: 0x34 });
+    let serial_dev = devices::legacy::serial::Serial::new_out(
+        "serial0".to_string(),
+        serial_irq,
+        Box::new(std::io::stdout()),
+        None,
+    );
+    let serial = Arc::new(Mutex::new(serial_dev));
+
     // ── Create vCPU ──────────────────────────────────────────────────────
-    let vm_ops = Arc::new(SerialVmOps::new(ioapic.clone(), Some(vm.clone()), pci_blk.clone()));
+    let vm_ops = Arc::new(SerialVmOps::new(
+        ioapic.clone(),
+        Some(vm.clone()),
+        pci_blk.clone(),
+        serial.clone(),
+    ));
     let vm_ops_clone: Arc<dyn VmOps> = vm_ops.clone();
     let mut vcpu = vm
         .create_vcpu(0, Some(vm_ops_clone))
@@ -312,11 +328,10 @@ pub fn run() -> anyhow::Result<()> {
                 let mut tick = 0u64;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(1));
-                    // Inject timer vectors:
+                    // Inject timer vector only; serial interrupt is now handled
+                    // by the Serial device directly via queue_input_bytes().
                     // 0x30 = PIT timer (IRQ 0 via IOAPIC), advances jiffies
-                    // 0x34 = serial IRQ 4 via IOAPIC (IRQ 0 gets 0x30, IRQ 4 should be 0x34)
                     let _ = whp.request_interrupt(0x30, 0);
-                    let _ = whp.request_interrupt(0x34, 0);
                     tick += 1;
                     if tick == 1 { eprintln!("[timer] First tick OK"); }
                 }
@@ -324,8 +339,10 @@ pub fn run() -> anyhow::Result<()> {
             .context("Failed to spawn timer thread")?;
     }
 
-    // Start a stdin reader thread that feeds input to the serial port
-    let vm_ops_for_stdin = vm_ops.clone();
+    // Start a stdin reader thread that feeds input to the serial device.
+    // queue_input_bytes() triggers an RX interrupt immediately, giving instant
+    // response to keystrokes without waiting for the timer tick.
+    let serial_for_stdin = serial.clone();
     std::thread::Builder::new()
         .name("stdin-reader".to_string())
         .spawn(move || {
@@ -334,7 +351,7 @@ pub fn run() -> anyhow::Result<()> {
             let mut buf = [0u8; 1];
             loop {
                 if stdin.lock().read(&mut buf).unwrap_or(0) > 0 {
-                    vm_ops_for_stdin.feed_input(&buf);
+                    let _ = serial_for_stdin.lock().unwrap().queue_input_bytes(&buf);
                 }
             }
         })
@@ -1350,6 +1367,42 @@ impl InterruptSourceGroup for WhpInterruptSourceGroup {
     }
 }
 
+/// Simple interrupt source that injects a fixed vector via WHvRequestInterrupt.
+/// Used for devices with known vector assignments (e.g., serial port on IRQ 4 → vector 0x34).
+struct WhpFixedVectorInterrupt {
+    vm: Arc<dyn hypervisor::Vm>,
+    vector: u8,
+}
+
+impl InterruptSourceGroup for WhpFixedVectorInterrupt {
+    fn trigger(&self, _index: InterruptIndex) -> std::io::Result<()> {
+        use hypervisor::whp::WhpVm;
+        let whp = self.vm.as_any().downcast_ref::<WhpVm>()
+            .ok_or_else(|| std::io::Error::other("not WhpVm"))?;
+        whp.request_interrupt(self.vector, 0)
+            .map_err(|e| std::io::Error::other(format!("WHvRequestInterrupt: {e}")))?;
+        Ok(())
+    }
+
+    fn notifier(&self, _index: InterruptIndex) -> Option<platform::EventFd> {
+        None
+    }
+
+    fn update(
+        &self,
+        _index: InterruptIndex,
+        _config: InterruptSourceConfig,
+        _masked: bool,
+        _set_gsi: bool,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn set_gsi(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 // ── PCI virtio-blk device ────────────────────────────────────────────────────
 
 /// Static PCI config space for the host bridge (device 0).
@@ -1984,10 +2037,9 @@ fn align_up(val: u64, align: u64) -> u64 {
     (val + align - 1) & !(align - 1)
 }
 
-// ── VmOps: serial I/O handler ────────────────────────────────────────────────
+// ── VmOps: I/O handler ───────────────────────────────────────────────────────
 
 struct SerialVmOps {
-    input: std::sync::Mutex<std::collections::VecDeque<u8>>,
     seen_ports: std::sync::Mutex<std::collections::BTreeSet<u64>>,
     debug: bool,
     /// Tracks the start time for PIT counter decrement emulation.
@@ -1996,10 +2048,6 @@ struct SerialVmOps {
     pit_reload: AtomicU16,
     /// Port 0x61 (NMI Status and Control) register value.
     port61: AtomicU8,
-    /// Serial IER (Interrupt Enable Register) at port 0x3F9.
-    serial_ier: AtomicU8,
-    /// Serial interrupt pending flag (set when THRE interrupt should fire).
-    serial_thre_pending: AtomicBool,
     /// PIC master IMR (port 0x21) — track writes for probe detection.
     pic_master_imr: AtomicU8,
     /// PIC slave IMR (port 0xA1).
@@ -2008,6 +2056,8 @@ struct SerialVmOps {
     ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>>,
     /// VM reference for interrupt injection from PIO handler.
     vm: Option<Arc<dyn hypervisor::Vm>>,
+    /// 16550 UART serial device (proper DLAB, FIFO, interrupt handling).
+    serial: Arc<Mutex<devices::legacy::serial::Serial>>,
     /// PCI config address register (port 0xCF8).
     pci_config_address: AtomicU32,
     /// PCI virtio-blk device.
@@ -2021,39 +2071,23 @@ impl SerialVmOps {
         ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>>,
         vm: Option<Arc<dyn hypervisor::Vm>>,
         pci_blk: Option<Arc<Mutex<PciBlkDevice>>>,
+        serial: Arc<Mutex<devices::legacy::serial::Serial>>,
     ) -> Self {
         SerialVmOps {
-            input: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seen_ports: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             debug: std::env::var("CH_DEBUG").is_ok(),
             pit_start: std::time::Instant::now(),
             pit_reload: AtomicU16::new(0xFFFF),
             port61: AtomicU8::new(0),
-            serial_ier: AtomicU8::new(0),
-            serial_thre_pending: AtomicBool::new(false),
             pic_master_imr: AtomicU8::new(0xFF),
             pic_slave_imr: AtomicU8::new(0xFF),
             ioapic,
             vm,
+            serial,
             pci_config_address: AtomicU32::new(0),
             pci_blk,
             host_bridge_config: host_bridge_config(),
         }
-    }
-
-    fn feed_input(&self, data: &[u8]) {
-        let mut buf = self.input.lock().unwrap();
-        buf.extend(data);
-    }
-
-    fn has_input(&self) -> bool {
-        let buf = self.input.lock().unwrap();
-        !buf.is_empty()
-    }
-
-    fn read_input(&self) -> Option<u8> {
-        let mut buf = self.input.lock().unwrap();
-        buf.pop_front()
     }
 }
 
@@ -2109,38 +2143,10 @@ impl VmOps for SerialVmOps {
             }
         }
         match port {
-            // Serial data register — return next input byte
-            0x3F8 => {
-                data[0] = self.read_input().unwrap_or(0);
-            }
-            // Serial IER (Interrupt Enable Register) — read back
-            0x3F9 => {
-                data[0] = self.serial_ier.load(Ordering::Relaxed);
-            }
-            // Serial IIR (Interrupt Identification Register)
-            0x3FA => {
-                let ier = self.serial_ier.load(Ordering::Relaxed);
-                if self.serial_thre_pending.load(Ordering::Relaxed) && (ier & 0x02) != 0 {
-                    // THRE interrupt pending
-                    data[0] = 0x02; // IIR: THRE interrupt
-                    self.serial_thre_pending.store(false, Ordering::Relaxed);
-                } else if self.has_input() && (ier & 0x01) != 0 {
-                    // Data available interrupt
-                    data[0] = 0x04; // IIR: received data available
-                } else {
-                    data[0] = 0x01; // IIR: no interrupt pending
-                }
-                data[0] |= 0xC0; // FIFO enabled bits
-            }
-            // Serial MCR
-            0x3FC => { data[0] = 0x08; /* MCR: AUX output 2 (interrupt enable) */ }
-            // Serial Line Status Register
-            0x3FD => {
-                let mut lsr = 0x60; // THR empty + Transmitter idle
-                if self.has_input() {
-                    lsr |= 0x01; // Data ready
-                }
-                data[0] = lsr;
+            // Serial UART registers (0x3F8-0x3FF) — delegate to 16550 device
+            0x3F8..=0x3FF => {
+                use vm_device::BusDevice;
+                self.serial.lock().unwrap().read(0x3F8, port - 0x3F8, data);
             }
             // PIT counter 2 data port — return simulated decrementing counter
             0x42 => {
@@ -2258,34 +2264,10 @@ impl VmOps for SerialVmOps {
             }
         }
         match port {
-            p if p == SERIAL_PORT && !data.is_empty() => {
-                let ch = data[0];
-                if ch.is_ascii() {
-                    print!("{}", ch as char);
-                }
-                let _ = std::io::stdout().flush();
-                let ier = self.serial_ier.load(Ordering::Relaxed);
-                if (ier & 0x02) != 0 {
-                    self.serial_thre_pending.store(true, Ordering::Relaxed);
-                    if let Some(ref vm) = self.vm {
-                        use hypervisor::whp::WhpVm;
-                        if let Some(whp) = vm.as_any().downcast_ref::<WhpVm>() {
-                            let _ = whp.request_interrupt(0x24, 0);
-                        }
-                    }
-                }
-            }
-            0x3F9 if !data.is_empty() => {
-                let old_ier = self.serial_ier.load(Ordering::Relaxed);
-                self.serial_ier.store(data[0], Ordering::Relaxed);
-                if (data[0] & 0x02) != 0 && (old_ier & 0x02) == 0 {
-                    if let Some(ref vm) = self.vm {
-                        use hypervisor::whp::WhpVm;
-                        if let Some(whp) = vm.as_any().downcast_ref::<WhpVm>() {
-                            let _ = whp.request_interrupt(0x24, 0);
-                        }
-                    }
-                }
+            // Serial UART registers (0x3F8-0x3FF) — delegate to 16550 device
+            0x3F8..=0x3FF => {
+                use vm_device::BusDevice;
+                self.serial.lock().unwrap().write(0x3F8, port - 0x3F8, data);
             }
             p if p == DEBUG_EXIT_PORT => {
                 println!();
