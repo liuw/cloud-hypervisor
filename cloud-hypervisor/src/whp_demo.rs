@@ -1459,7 +1459,7 @@ struct PciBlkDevice {
 
     // Block device
     capacity: u64, // in 512-byte sectors
-    disk_file: File,
+    disk_file: block::raw_sync::RawFileDiskSync,
 
     // Guest memory for virtqueue access
     guest_mem: GuestMem,
@@ -1483,12 +1483,16 @@ impl PciBlkDevice {
         vm: Arc<dyn hypervisor::Vm>,
         msix_table_host: *mut u8,
     ) -> anyhow::Result<Self> {
-        let disk_file = std::fs::OpenOptions::new()
+        use block::disk_file::DiskSize;
+
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(disk_path)
             .with_context(|| format!("Failed to open disk: {disk_path}"))?;
-        let disk_size = disk_file.metadata()?.len();
+        let disk_file = block::raw_sync::RawFileDiskSync::new(file);
+        let disk_size = disk_file.logical_size()
+            .map_err(|e| anyhow!("Failed to query disk size: {e}"))?;
         let capacity = disk_size / 512;
 
         let mut config = [0u8; 256];
@@ -1929,10 +1933,10 @@ impl PciBlkDevice {
                             ok = false; break;
                         }
                         let mut buf = vec![0u8; len as usize];
-                        if self.disk_file.seek(SeekFrom::Start(disk_offset)).is_err() {
+                        if self.disk_file.file_mut().seek(SeekFrom::Start(disk_offset)).is_err() {
                             ok = false; break;
                         }
-                        if self.disk_file.read_exact(&mut buf).is_err() {
+                        if self.disk_file.file_mut().read_exact(&mut buf).is_err() {
                             ok = false; break;
                         }
                         if self.guest_mem.write(&buf, GuestAddress(addr)).is_err() {
@@ -1959,10 +1963,10 @@ impl PciBlkDevice {
                         if self.guest_mem.read(&mut buf, GuestAddress(addr)).is_err() {
                             ok = false; break;
                         }
-                        if self.disk_file.seek(SeekFrom::Start(disk_offset)).is_err() {
+                        if self.disk_file.file_mut().seek(SeekFrom::Start(disk_offset)).is_err() {
                             ok = false; break;
                         }
-                        if self.disk_file.write_all(&buf).is_err() {
+                        if self.disk_file.file_mut().write_all(&buf).is_err() {
                             ok = false; break;
                         }
                         disk_offset += len as u64;
@@ -1971,7 +1975,7 @@ impl PciBlkDevice {
                 }
             }
             VIRTIO_BLK_T_FLUSH => {
-                if self.disk_file.sync_all().is_ok() {
+                if self.disk_file.file_mut().sync_all().is_ok() {
                     VIRTIO_BLK_S_OK
                 } else {
                     VIRTIO_BLK_S_IOERR

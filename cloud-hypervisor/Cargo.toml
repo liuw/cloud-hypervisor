@@ -23,6 +23,7 @@ required-features = ["kvm"]
 [dependencies]
 anyhow = { workspace = true }
 arch = { path = "../arch" }
+block = { path = "../block" }
 clap = { workspace = true, features = ["string"] }
 dhat = { workspace = true, optional = true }
 devices = { path = "../devices" }

@@ -29,6 +29,11 @@ impl RawFileDiskSync {
     pub fn new(file: File) -> Self {
         RawFileDiskSync { file }
     }
+
+    /// Get a mutable reference to the underlying file for direct I/O.
+    pub fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
 }
 
 impl disk_file::DiskSize for RawFileDiskSync {
