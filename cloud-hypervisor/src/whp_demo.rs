@@ -307,6 +307,28 @@ pub fn run() -> anyhow::Result<()> {
     println!("vCPU 0 ready, RIP={entry_point:#x}. Running...");
     println!("--- Guest serial output ---");
 
+    // ── Set terminal to raw mode for interactive serial console ──────────
+    // Save the terminal state so we can restore it on exit. In raw mode,
+    // keystrokes are sent immediately (no line buffering, no echo).
+    let terminal_state = if platform::is_terminal(0) {
+        let state = platform::save_terminal_state(0)
+            .context("Failed to save terminal state")?;
+        platform::set_raw_mode(0).context("Failed to set raw mode")?;
+        Some(state)
+    } else {
+        None
+    };
+
+    // Ensure terminal is restored even on panic
+    let terminal_state_for_panic = terminal_state.clone();
+    let prev_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(ref state) = terminal_state_for_panic {
+            let _ = platform::restore_terminal_state(0, state);
+        }
+        prev_panic(info);
+    }));
+
     // Start a timer interrupt injection thread for kernel boot.
     // The kernel needs periodic timer interrupts (IRQ 0) to run the scheduler.
     // We inject a fixed interrupt at vector 0x20 (standard PIT→PIC mapping) at ~100 Hz.
@@ -383,7 +405,12 @@ pub fn run() -> anyhow::Result<()> {
                 break;
             }
             Err(e) => {
-                eprintln!("\nvCPU run error: {e}");
+                let msg = format!("{e}");
+                if msg.contains("Guest requested shutdown") {
+                    println!("\n--- Guest requested shutdown ---");
+                } else {
+                    eprintln!("\nvCPU run error: {e}");
+                }
                 break;
             }
         }
@@ -397,6 +424,11 @@ pub fn run() -> anyhow::Result<()> {
             }
             last_rip_dump = std::time::Instant::now();
         }
+    }
+
+    // ── Restore terminal state ─────────────────────────────────────────────
+    if let Some(ref state) = terminal_state {
+        let _ = platform::restore_terminal_state(0, state);
     }
 
     println!("WHP demo complete.");
@@ -2270,9 +2302,11 @@ impl VmOps for SerialVmOps {
                 self.serial.lock().unwrap().write(0x3F8, port - 0x3F8, data);
             }
             p if p == DEBUG_EXIT_PORT => {
-                println!();
-                println!("--- Guest requested shutdown ---");
-                std::process::exit(0);
+                // Signal shutdown via error; the run loop will break and
+                // terminal state will be properly restored.
+                return Err(HypervisorVmError::SetVcpuState(anyhow::anyhow!(
+                    "Guest requested shutdown via debug exit port"
+                )));
             }
             0x42 if !data.is_empty() => {
                 self.pit_reload.store(data[0] as u16, Ordering::Relaxed);
