@@ -13,6 +13,9 @@ pub mod disk_file;
 pub mod error;
 #[cfg(unix)]
 pub mod fcntl;
+#[cfg(target_os = "windows")]
+#[path = "fcntl_windows.rs"]
+pub mod fcntl;
 #[cfg(unix)]
 pub mod fixed_vhd;
 #[cfg(feature = "io_uring")]
@@ -97,6 +100,8 @@ use vmm_sys_util::{aio, ioctl_io_nr, ioctl_ior_nr};
 
 #[cfg(unix)]
 use crate::async_io::{AsyncIo, AsyncIoResult};
+#[cfg(target_os = "windows")]
+use crate::async_io::AsyncIo;
 use crate::async_io::AsyncIoError;
 use crate::error::{BlockError, BlockErrorKind, BlockResult, ErrorOp};
 #[cfg(unix)]
@@ -190,6 +195,18 @@ pub fn build_serial(disk_path: &Path) -> Vec<u8> {
         }
     }
     default_serial
+}
+
+#[cfg(target_os = "windows")]
+pub fn build_serial(disk_path: &Path) -> Vec<u8> {
+    let mut serial = vec![0u8; VIRTIO_BLK_ID_BYTES as usize];
+    // Use disk filename as simple serial identifier
+    if let Some(name) = disk_path.file_name().and_then(|n| n.to_str()) {
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(VIRTIO_BLK_ID_BYTES as usize);
+        serial[..len].copy_from_slice(&bytes[..len]);
+    }
+    serial
 }
 
 #[derive(Error, Debug)]
@@ -323,6 +340,11 @@ pub struct ExecuteAsync {
     pub async_complete: bool,
     // request need to be batched for submission if any
     pub batch_request: Option<BatchRequest>,
+}
+
+#[cfg(target_os = "windows")]
+pub struct ExecuteAsync {
+    pub async_complete: bool,
 }
 
 #[derive(Debug)]
@@ -818,6 +840,98 @@ impl Request {
 
     pub fn set_writeback(&mut self, writeback: bool) {
         self.writeback = writeback;
+    }
+
+    /// Windows execute_async: simpler version without O_DIRECT alignment
+    /// or batch request support.
+    #[cfg(target_os = "windows")]
+    pub fn execute_async<B: Bitmap + 'static>(
+        &mut self,
+        mem: &vm_memory::GuestMemoryMmap<B>,
+        disk_nsectors: u64,
+        disk_image: &mut dyn AsyncIo,
+        serial: &[u8],
+        disable_sector0_writes: bool,
+        user_data: u64,
+    ) -> result::Result<ExecuteAsync, ExecuteError> {
+        let sector = self.sector;
+        let request_type = self.request_type;
+        let offset = (sector << SECTOR_SHIFT) as i64;
+
+        let mut bufs: SmallVec<[(u64, u64); DEFAULT_DESCRIPTOR_VEC_SIZE]> =
+            SmallVec::with_capacity(self.data_descriptors.len());
+
+        for &(data_addr, data_len) in &self.data_descriptors {
+            if data_len == 0 {
+                continue;
+            }
+            let mut top = u64::from(data_len) / SECTOR_SIZE;
+            if u64::from(data_len) % SECTOR_SIZE != 0 {
+                top += 1;
+            }
+            top = top.checked_add(sector)
+                .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
+            if top > disk_nsectors {
+                return Err(ExecuteError::BadRequest(Error::InvalidOffset));
+            }
+
+            let slice = mem.get_slice(data_addr, data_len as usize)
+                .map_err(ExecuteError::GetHostAddress)?;
+            let guard = slice.ptr_guard();
+            bufs.push((guard.as_ptr() as u64, data_len as u64));
+        }
+
+        let mut ret = ExecuteAsync { async_complete: true };
+
+        match request_type {
+            RequestType::In => {
+                for (data_addr, data_len) in &self.data_descriptors {
+                    mem.get_slice(*data_addr, *data_len as usize)
+                        .map_err(ExecuteError::GetHostAddress)?
+                        .bitmap()
+                        .mark_dirty(0, *data_len as usize);
+                }
+                disk_image.read_vectored(offset, &bufs, user_data)
+                    .map_err(ExecuteError::AsyncRead)?;
+            }
+            RequestType::Out => {
+                if sector == 0 && disable_sector0_writes {
+                    return Err(ExecuteError::BadRequest(Error::InvalidOffset));
+                }
+                disk_image.write_vectored(offset, &bufs, user_data)
+                    .map_err(ExecuteError::AsyncWrite)?;
+            }
+            RequestType::Flush => {
+                disk_image.fsync(Some(user_data))
+                    .map_err(ExecuteError::AsyncFlush)?;
+            }
+            RequestType::GetDeviceId => {
+                let (data_addr, data_len) = if self.data_descriptors.len() == 1 {
+                    (self.data_descriptors[0].0, self.data_descriptors[0].1)
+                } else {
+                    return Err(ExecuteError::BadRequest(Error::TooManyDescriptors));
+                };
+                if (data_len as usize) < serial.len() {
+                    return Err(ExecuteError::BadRequest(Error::InvalidOffset));
+                }
+                mem.write_slice(serial, data_addr)
+                    .map_err(ExecuteError::Write)?;
+                ret.async_complete = false;
+                return Ok(ret);
+            }
+            RequestType::Discard | RequestType::WriteZeroes => {
+                return Err(ExecuteError::Unsupported(0));
+            }
+            RequestType::Unsupported(t) => return Err(ExecuteError::Unsupported(t)),
+        }
+
+        Ok(ret)
+    }
+
+    /// Windows complete_async: no alignment buffer handling needed.
+    #[cfg(target_os = "windows")]
+    pub fn complete_async(&mut self) -> result::Result<(), Error> {
+        Ok(())
     }
 }
 

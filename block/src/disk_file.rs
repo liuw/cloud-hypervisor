@@ -282,6 +282,16 @@ impl DiskBackend {
         false
     }
 
+    pub fn physical_size(&mut self) -> BlockResult<u64> {
+        self.logical_size()
+    }
+
+    pub fn fd(&self) -> crate::async_io::BorrowedDiskFd<'_> {
+        // No file descriptor on Windows — return a dummy.
+        // This is only used for file locking which is stubbed.
+        crate::async_io::BorrowedDiskFd::new(-1)
+    }
+
     pub fn resize(&mut self, _new_size: u64) -> BlockResult<()> {
         Err(BlockError::new(
             BlockErrorKind::UnsupportedFeature,

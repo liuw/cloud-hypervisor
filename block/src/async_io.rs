@@ -65,6 +65,23 @@ impl AsRawFd for BorrowedDiskFd<'_> {
     }
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Copy, Clone, Debug)]
+pub struct BorrowedDiskFd<'fd> {
+    raw_handle: i64,
+    _lifetime: std::marker::PhantomData<&'fd ()>,
+}
+
+#[cfg(target_os = "windows")]
+impl BorrowedDiskFd<'_> {
+    pub(super) fn new(raw_handle: i64) -> Self {
+        Self {
+            raw_handle,
+            _lifetime: std::marker::PhantomData,
+        }
+    }
+}
+
 /// Abstraction over the effective [`File`] backing up a block device,
 /// with support for synchronous and asynchronous I/O.
 ///
