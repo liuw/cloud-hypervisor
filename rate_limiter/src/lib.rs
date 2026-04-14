@@ -47,6 +47,8 @@
 use std::io;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -515,6 +517,14 @@ impl AsRawFd for RateLimiter {
     fn as_raw_fd(&self) -> RawFd {
         let guard = self.inner.lock().unwrap();
         guard.timer.as_raw_fd()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl AsRawHandle for RateLimiter {
+    fn as_raw_handle(&self) -> RawHandle {
+        let guard = self.inner.lock().unwrap();
+        guard.timer.as_raw_handle()
     }
 }
 

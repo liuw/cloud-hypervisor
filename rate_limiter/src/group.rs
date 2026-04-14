@@ -5,14 +5,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use core::panic::AssertUnwindSafe;
-use std::fs::File;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::sync::{Arc, Mutex};
 use std::{io, result, thread};
 
 use log::{error, info, warn};
 use thiserror::Error;
-use platform::EventFd;
+use platform::{EventFd, EventPoll, PollEvent};
 
 use crate::{RateLimiter, TokenType};
 
@@ -102,9 +104,17 @@ impl Clone for RateLimiterGroupHandle {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for RateLimiterGroupHandle {
     fn as_raw_fd(&self) -> RawFd {
         self.eventfd.as_raw_fd()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl AsRawHandle for RateLimiterGroupHandle {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.eventfd.as_raw_handle()
     }
 }
 
@@ -113,7 +123,7 @@ impl Drop for RateLimiterGroupHandle {
         let mut handles = self.inner.handles.lock().unwrap();
         let index = handles
             .iter()
-            .position(|handle| handle.as_raw_fd() == self.eventfd.as_raw_fd())
+            .position(|handle| Arc::ptr_eq(handle, &self.eventfd))
             .expect("RateLimiterGroupHandle must be subscribed to RateLimiterGroup");
         handles.remove(index);
     }
@@ -129,7 +139,7 @@ struct RateLimiterGroupInner {
 /// the aggregate io consumption of multiple consumers.
 pub struct RateLimiterGroup {
     inner: Arc<RateLimiterGroupInner>,
-    epoll_file: File,
+    poll: Option<EventPoll>,
     kill_evt: EventFd,
     epoll_thread: Option<thread::JoinHandle<()>>,
 }
@@ -174,28 +184,14 @@ impl RateLimiterGroup {
         )
         .map_err(Error::RateLimiter)?;
 
-        let epoll_fd = epoll::create(true).map_err(Error::Epoll)?;
+        let mut poll = EventPoll::new().map_err(Error::Epoll)?;
         let kill_evt = EventFd::new(0).map_err(Error::EventFd)?;
 
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_ADD,
-            kill_evt.as_raw_fd(),
-            epoll::Event::new(epoll::Events::EPOLLIN, EpollDispatch::Kill as u64),
-        )
-        .map_err(Error::Epoll)?;
+        poll.add_event(&kill_evt, EpollDispatch::Kill as u64)
+            .map_err(Error::Epoll)?;
 
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_ADD,
-            rate_limiter.as_raw_fd(),
-            epoll::Event::new(epoll::Events::EPOLLIN, EpollDispatch::Unblocked as u64),
-        )
-        .map_err(Error::Epoll)?;
-
-        // Use 'File' to enforce closing on 'epoll_fd'
-        // SAFETY: epoll_fd is valid
-        let epoll_file = unsafe { File::from_raw_fd(epoll_fd) };
+        poll.add_event(&rate_limiter, EpollDispatch::Unblocked as u64)
+            .map_err(Error::Epoll)?;
 
         Ok(Self {
             inner: Arc::new(RateLimiterGroupInner {
@@ -203,7 +199,7 @@ impl RateLimiterGroup {
                 rate_limiter,
                 handles: Mutex::new(Vec::new()),
             }),
-            epoll_file,
+            poll: Some(poll),
             kill_evt,
             epoll_thread: None,
         })
@@ -218,18 +214,20 @@ impl RateLimiterGroup {
     /// when the RateLimiter becomes unblocked.
     pub fn start_thread(&mut self, exit_evt: EventFd) -> result::Result<(), Error> {
         let inner = self.inner.clone();
-        let epoll_fd = self.epoll_file.as_raw_fd();
+        let poll = self.poll.take().ok_or(Error::Epoll(io::Error::new(
+            io::ErrorKind::Other,
+            "EventPoll already taken by start_thread",
+        )))?;
         thread::Builder::new()
             .name(format!("rate-limit-group-{}", inner.id))
             .spawn(move || {
                 let res = std::panic::catch_unwind(AssertUnwindSafe(move || {
-                    const EPOLL_EVENTS_LEN: usize = 2;
+                    const POLL_EVENTS_LEN: usize = 2;
 
-                    let mut events =
-                        [epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
+                    let mut events = [PollEvent { data: 0 }; POLL_EVENTS_LEN];
 
                     loop {
-                        let num_events = match epoll::wait(epoll_fd, -1, &mut events[..]) {
+                        let num_events = match poll.wait(-1, &mut events[..]) {
                             Ok(res) => res,
                             Err(e) => {
                                 if e.kind() == io::ErrorKind::Interrupted {
