@@ -33,7 +33,6 @@ pub mod net;
 #[cfg(unix)]
 #[cfg(unix)]
 mod pmem;
-#[cfg(unix)]
 mod rng;
 #[cfg(unix)]
 pub mod seccomp_filters;
@@ -74,7 +73,6 @@ pub use self::mem::{BlocksState, Mem, VIRTIO_MEM_ALIGN_SIZE, VirtioMemMappingSou
 pub use self::net::{Net, NetCtrlEpollHandler};
 #[cfg(unix)]
 pub use self::pmem::Pmem;
-#[cfg(unix)]
 pub use self::rng::Rng;
 #[cfg(unix)]
 pub use self::vdpa::{Vdpa, VdpaDmaMapping};
