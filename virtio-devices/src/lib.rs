@@ -31,12 +31,12 @@ pub mod mem;
 #[cfg(unix)]
 pub mod net;
 #[cfg(unix)]
+#[cfg(unix)]
 mod pmem;
 #[cfg(unix)]
 mod rng;
 #[cfg(unix)]
 pub mod seccomp_filters;
-#[cfg(unix)]
 mod thread_helper;
 #[cfg(unix)]
 pub mod transport;
@@ -51,7 +51,6 @@ pub mod watchdog;
 
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{GuestAddress, GuestMemory};
-#[cfg(unix)]
 use vm_virtio::VirtioDeviceType;
 
 #[cfg(unix)]

@@ -7,13 +7,16 @@ use std::panic::AssertUnwindSafe;
 use std::thread::{self, JoinHandle};
 
 use log::error;
+#[cfg(unix)]
 use seccompiler::{SeccompAction, apply_filter};
 use platform::EventFd;
 
 use crate::ActivateError;
 use crate::epoll_helper::EpollHelperError;
+#[cfg(unix)]
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 
+#[cfg(unix)]
 pub(crate) fn spawn_virtio_thread<F>(
     name: &str,
     seccomp_action: &SeccompAction,
@@ -44,6 +47,46 @@ where
                 thread_exit_evt.write(1).ok();
                 return;
             }
+            match std::panic::catch_unwind(AssertUnwindSafe(f)) {
+                Err(_) => {
+                    error!("{thread_name} thread panicked");
+                    thread_exit_evt.write(1).ok();
+                }
+                Ok(r) => {
+                    if let Err(e) = r {
+                        error!("Error running worker: {e:?}");
+                        thread_exit_evt.write(1).ok();
+                    }
+                }
+            }
+        })
+        .map(|thread| epoll_threads.push(thread))
+        .map_err(|e| {
+            error!("Failed to spawn thread for {name}: {e}");
+            ActivateError::ThreadSpawn(e)
+        })
+}
+
+/// Windows version: spawn a virtio worker thread without seccomp filtering.
+#[cfg(target_os = "windows")]
+pub(crate) fn spawn_virtio_thread_simple<F>(
+    name: &str,
+    epoll_threads: &mut Vec<JoinHandle<()>>,
+    exit_evt: &EventFd,
+    f: F,
+) -> Result<(), ActivateError>
+where
+    F: FnOnce() -> std::result::Result<(), EpollHelperError>,
+    F: Send + 'static,
+{
+    let thread_exit_evt = exit_evt
+        .try_clone()
+        .map_err(ActivateError::CloneExitEventFd)?;
+    let thread_name = name.to_string();
+
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
             match std::panic::catch_unwind(AssertUnwindSafe(f)) {
                 Err(_) => {
                     error!("{thread_name} thread panicked");
