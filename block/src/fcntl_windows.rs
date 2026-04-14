@@ -3,7 +3,6 @@
 // Windows stubs for file locking types.
 // File locking is not implemented on Windows yet.
 
-use std::fmt::Debug;
 use std::io;
 use std::str::FromStr;
 
@@ -14,7 +13,7 @@ pub enum LockError {
     #[error("The file is already locked")]
     AlreadyLocked,
     #[error("Setting file lock failed")]
-    SetLock(#[source] io::Error),
+    Io(#[source] io::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,14 +26,14 @@ pub enum LockType {
 #[derive(Debug, Clone, Copy)]
 pub enum LockGranularity {
     WholeFile,
-    ByteRange { start: u64, len: u64 },
+    ByteRange(u64, u64),
 }
 
-// Needed for pattern matching in block.rs
-impl LockGranularity {
-    pub fn byte_range(start: u64, len: u64) -> Self {
-        Self::ByteRange { start, len }
-    }
+#[derive(Debug, Clone, Copy)]
+pub enum LockState {
+    Unlocked,
+    Read,
+    Write,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -60,24 +59,20 @@ impl FromStr for LockGranularityChoice {
     }
 }
 
-/// Stub: file locking not implemented on Windows.
-pub fn get_lock_state(_file: &std::fs::File) -> Result<Option<LockType>, LockError> {
-    Ok(None)
-}
-
-/// Stub: acquiring file locks not implemented on Windows.
-pub fn try_acquire_lock(
-    _file: &std::fs::File,
-    _lock_type: LockType,
-    _granularity: LockGranularity,
+pub fn try_acquire_lock<F>(
+    _file: &F, _lock_type: LockType, _granularity: LockGranularity,
 ) -> Result<(), LockError> {
     Ok(())
 }
 
-/// Stub: clearing file locks not implemented on Windows.
-pub fn clear_lock(
-    _file: &std::fs::File,
-    _granularity: LockGranularity,
+pub fn clear_lock<F>(
+    _file: &F, _granularity: LockGranularity,
 ) -> Result<(), LockError> {
     Ok(())
+}
+
+pub fn get_lock_state<F>(
+    _file: &F, _granularity: LockGranularity,
+) -> Result<LockState, LockError> {
+    Ok(LockState::Unlocked)
 }

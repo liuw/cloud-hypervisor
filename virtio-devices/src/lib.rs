@@ -19,7 +19,6 @@ use thiserror::Error;
 mod device;
 #[cfg(unix)]
 pub mod balloon;
-#[cfg(unix)]
 pub mod block;
 #[cfg(unix)]
 mod console;
@@ -51,7 +50,6 @@ use vm_virtio::VirtioDeviceType;
 
 #[cfg(unix)]
 pub use self::balloon::Balloon;
-#[cfg(unix)]
 pub use self::block::{Block, BlockState};
 #[cfg(unix)]
 pub use self::console::{Console, ConsoleResizer, Endpoint};

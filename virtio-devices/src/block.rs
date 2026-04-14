@@ -9,10 +9,15 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::cmp::max;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+#[cfg(unix)]
+use std::collections::BTreeMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::Wrapping;
 use std::ops::Deref;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -24,13 +29,16 @@ use block::disk_file::DiskBackend;
 use block::error::BlockError;
 use block::fcntl::{LockError, LockGranularity, LockGranularityChoice, LockType, get_lock_state};
 use block::{
-    ExecuteAsync, ExecuteError, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType,
-    VirtioBlockConfig, build_serial, fcntl,
+    ExecuteError, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType, VirtioBlockConfig,
+    build_serial, fcntl,
 };
 use event_monitor::event;
 use log::{debug, error, info, warn};
+#[cfg(unix)]
 use rate_limiter::TokenType;
+#[cfg(unix)]
 use rate_limiter::group::{RateLimiterGroup, RateLimiterGroupHandle};
+#[cfg(unix)]
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -48,8 +56,12 @@ use super::{
     EpollHelperHandler, Error as DeviceError, VirtioCommon, VirtioDevice, VirtioDeviceType,
     VirtioInterruptType,
 };
+#[cfg(unix)]
 use crate::seccomp_filters::Thread;
+#[cfg(unix)]
 use crate::thread_helper::spawn_virtio_thread;
+#[cfg(target_os = "windows")]
+use crate::thread_helper::spawn_virtio_thread_simple;
 use crate::{GuestMemoryMmap, VirtioInterrupt};
 
 const SECTOR_SHIFT: u8 = 9;
@@ -60,6 +72,7 @@ const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 // New completed tasks are pending on the completion ring.
 const COMPLETION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
 // New 'wake up' event from the rate limiter
+#[cfg(unix)]
 const RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
 
 // latency scale, for reduce precision loss in calculate.
@@ -160,8 +173,10 @@ struct BlockEpollHandler {
     counters: BlockCounters,
     queue_evt: EventFd,
     inflight_requests: VecDeque<(u16, Request)>,
+    #[cfg(unix)]
     rate_limiter: Option<RateLimiterGroupHandle>,
     access_platform: Option<Arc<dyn AccessPlatform>>,
+    #[cfg(unix)]
     host_cpus: Option<Vec<usize>>,
     acked_features: u64,
     disable_sector0_writes: bool,
@@ -235,6 +250,7 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
             return Ok(());
         }
         let queue = &mut self.queue;
+        #[cfg(unix)]
         let mut batch_requests = Vec::new();
         let mut batch_inflight_requests = Vec::new();
 
@@ -276,6 +292,7 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
                 continue;
             }
 
+            #[cfg(unix)]
             if let Some(rate_limiter) = &mut self.rate_limiter {
                 // If limiter.consume() fails it means there is no more TokenType::Ops
                 // budget and rate limiting is in effect.
@@ -318,30 +335,38 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
                 desc_chain.head_index() as u64,
             );
 
-            if let Ok(ExecuteAsync {
-                async_complete: true,
-                batch_request,
-            }) = result
-            {
-                if let Some(batch_request) = batch_request {
-                    match batch_request.request_type {
-                        RequestType::In | RequestType::Out => batch_requests.push(batch_request),
-                        _ => {
-                            unreachable!(
+            #[cfg_attr(target_os = "windows", allow(unused_mut))]
+            if let Ok(mut exec_result) = result {
+                if exec_result.async_complete {
+                    #[cfg(unix)]
+                    if let Some(batch_request) = exec_result.take_batch_request() {
+                        match batch_request.request_type {
+                            RequestType::In | RequestType::Out => {
+                                batch_requests.push(batch_request)
+                            }
+                            _ => unreachable!(
                                 "Unexpected batch request type: {:?}",
                                 request.request_type
-                            )
+                            ),
                         }
                     }
+                    batch_inflight_requests.push((desc_chain.head_index(), request));
+                } else {
+                    desc_chain
+                        .memory()
+                        .write_obj(VIRTIO_BLK_S_OK as u8, request.status_addr)
+                        .map_err(Error::RequestStatus)?;
+                    queue
+                        .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
+                        .map_err(Error::QueueAddUsed)?;
+                    queue
+                        .enable_notification(self.mem.memory().deref())
+                        .map_err(Error::QueueEnableNotification)?;
                 }
-                batch_inflight_requests.push((desc_chain.head_index(), request));
-            } else {
-                let status = match result {
-                    Ok(_) => VIRTIO_BLK_S_OK,
-                    Err(e) => {
-                        warn!("Request failed: {request:x?} {e:?}");
-                        e.status() as u32
-                    }
+            } else if let Err(e) = result {
+                let status = {
+                    warn!("Request failed: {request:x?} {e:?}");
+                    e.status() as u32
                 };
 
                 desc_chain
@@ -360,6 +385,7 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
             }
         }
 
+        #[cfg(unix)]
         match self.disk_image.submit_batch_requests(&batch_requests) {
             Ok(()) => {
                 self.inflight_requests.extend(batch_inflight_requests);
@@ -381,6 +407,8 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
                 }
             }
         }
+        #[cfg(target_os = "windows")]
+        self.inflight_requests.extend(batch_inflight_requests);
 
         Ok(())
     }
@@ -577,6 +605,7 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
             })
     }
 
+    #[cfg(unix)]
     fn set_queue_thread_affinity(&self) {
         // Prepare the CPU set the current queue thread is expected to run onto.
         let cpuset = self.host_cpus.as_ref().map(|host_cpus| {
@@ -618,11 +647,20 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
         paused_sync: &Barrier,
     ) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
-        helper.add_event(self.queue_evt.as_raw_fd(), QUEUE_AVAIL_EVENT)?;
-        helper.add_event(self.disk_image.notifier().as_raw_fd(), COMPLETION_EVENT)?;
-        if let Some(rate_limiter) = &self.rate_limiter {
-            helper.add_event(rate_limiter.as_raw_fd(), RATE_LIMITER_EVENT)?;
+        #[cfg(unix)]
+        {
+            helper.add_event(self.queue_evt.as_raw_fd(), QUEUE_AVAIL_EVENT)?;
+            helper.add_event(self.disk_image.notifier().as_raw_fd(), COMPLETION_EVENT)?;
+            if let Some(rate_limiter) = &self.rate_limiter {
+                helper.add_event(rate_limiter.as_raw_fd(), RATE_LIMITER_EVENT)?;
+            }
         }
+        #[cfg(target_os = "windows")]
+        {
+            helper.add_event(self.queue_evt.as_raw_handle(), QUEUE_AVAIL_EVENT)?;
+            helper.add_event(self.disk_image.notifier().as_raw_handle(), COMPLETION_EVENT)?;
+        }
+        #[cfg(unix)]
         self.set_queue_thread_affinity();
         helper.run(paused, paused_sync, self)?;
 
@@ -643,7 +681,10 @@ impl EpollHelperHandler for BlockEpollHandler {
                     EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {e:?}"))
                 })?;
 
+                #[cfg(unix)]
                 let rate_limit_reached = self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked());
+                #[cfg(target_os = "windows")]
+                let rate_limit_reached = false;
 
                 // Process the queue only when the rate limit is not reached
                 if !rate_limit_reached {
@@ -663,13 +704,17 @@ impl EpollHelperHandler for BlockEpollHandler {
 
                 self.try_signal_used_queue()?;
 
+                #[cfg(unix)]
                 let rate_limit_reached = self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked());
+                #[cfg(target_os = "windows")]
+                let rate_limit_reached = false;
 
                 // Process the queue only when the rate limit is not reached
                 if !rate_limit_reached {
                     self.process_queue_submit_and_signal()?;
                 }
             }
+            #[cfg(unix)]
             RATE_LIMITER_EVENT => {
                 if let Some(rate_limiter) = &mut self.rate_limiter {
                     // Upon rate limiter event, call the rate limiter handler
@@ -707,10 +752,13 @@ pub struct Block {
     config: VirtioBlockConfig,
     writeback: Arc<AtomicBool>,
     counters: BlockCounters,
+    #[cfg(unix)]
     seccomp_action: SeccompAction,
+    #[cfg(unix)]
     rate_limiter: Option<Arc<RateLimiterGroup>>,
     exit_evt: EventFd,
     serial: Vec<u8>,
+    #[cfg(unix)]
     queue_affinity: BTreeMap<u16, Vec<usize>>,
     disable_sector0_writes: bool,
     lock_granularity_choice: LockGranularityChoice,
@@ -738,11 +786,11 @@ impl Block {
         num_queues: usize,
         queue_size: u16,
         serial: Option<String>,
-        seccomp_action: SeccompAction,
-        rate_limiter: Option<Arc<RateLimiterGroup>>,
+        #[cfg(unix)] seccomp_action: SeccompAction,
+        #[cfg(unix)] rate_limiter: Option<Arc<RateLimiterGroup>>,
         exit_evt: EventFd,
         state: Option<BlockState>,
-        queue_affinity: BTreeMap<u16, Vec<usize>>,
+        #[cfg(unix)] queue_affinity: BTreeMap<u16, Vec<usize>>,
         sparse: bool,
         disable_sector0_writes: bool,
         lock_granularity: LockGranularityChoice,
@@ -869,10 +917,13 @@ impl Block {
             config,
             writeback: Arc::new(AtomicBool::new(true)),
             counters: BlockCounters::default(),
+            #[cfg(unix)]
             seccomp_action,
+            #[cfg(unix)]
             rate_limiter,
             exit_evt,
             serial,
+            #[cfg(unix)]
             queue_affinity,
             disable_sector0_writes,
             lock_granularity_choice: lock_granularity,
@@ -1134,6 +1185,7 @@ impl VirtioDevice for Block {
                 // This gives head room for systems with slower I/O without
                 // compromising the cost of the reallocation or memory overhead
                 inflight_requests: VecDeque::with_capacity(64),
+                #[cfg(unix)]
                 rate_limiter: self
                     .rate_limiter
                     .as_ref()
@@ -1141,6 +1193,7 @@ impl VirtioDevice for Block {
                     .transpose()
                     .unwrap(),
                 access_platform: self.common.access_platform.clone(),
+                #[cfg(unix)]
                 host_cpus: self.queue_affinity.get(&queue_idx).cloned(),
                 acked_features: self.common.acked_features,
                 disable_sector0_writes: self.disable_sector0_writes,
@@ -1150,10 +1203,18 @@ impl VirtioDevice for Block {
             let paused = self.common.paused.clone();
             let paused_sync = self.common.paused_sync.clone();
 
+            #[cfg(unix)]
             spawn_virtio_thread(
                 &format!("{}_q{}", self.id.clone(), i),
                 &self.seccomp_action,
                 Thread::VirtioBlock,
+                &mut epoll_threads,
+                &self.exit_evt,
+                move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            )?;
+            #[cfg(target_os = "windows")]
+            spawn_virtio_thread_simple(
+                &format!("{}_q{}", self.id.clone(), i),
                 &mut epoll_threads,
                 &self.exit_evt,
                 move || handler.run(&paused, paused_sync.as_ref().unwrap()),

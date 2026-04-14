@@ -336,15 +336,26 @@ pub struct BatchRequest {
 
 #[cfg(unix)]
 pub struct ExecuteAsync {
-    // `true` if the execution will complete asynchronously
     pub async_complete: bool,
-    // request need to be batched for submission if any
-    pub batch_request: Option<BatchRequest>,
+    batch_request: Option<BatchRequest>,
 }
 
 #[cfg(target_os = "windows")]
 pub struct ExecuteAsync {
     pub async_complete: bool,
+}
+
+impl ExecuteAsync {
+    /// Take the batch request, if any. Returns None on Windows.
+    #[cfg(unix)]
+    pub fn take_batch_request(&mut self) -> Option<BatchRequest> {
+        self.batch_request.take()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn take_batch_request(&mut self) -> Option<()> {
+        None
+    }
 }
 
 #[derive(Debug)]
