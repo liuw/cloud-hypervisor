@@ -89,7 +89,7 @@ const KERNEL_LOAD_ADDR: u64 = 0x100000; // 1 MiB — protected-mode kernel
 
 type GuestMem = GuestMemoryMmap<AtomicBitmap>;
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(exit_evt: platform::EventFd) -> anyhow::Result<()> {
     // Parse CLI using VMM config types
     let args: Vec<String> = std::env::args().collect();
     let get_arg = |name: &str| -> Option<String> {
@@ -368,10 +368,9 @@ pub fn run() -> anyhow::Result<()> {
             .context("Failed to spawn timer thread")?;
     }
 
+    // Use the exit_evt passed from the VMM control loop.
     // Start the serial manager which reads from stdin and feeds input
     // to the serial device via queue_input_bytes().
-    let exit_evt = platform::EventFd::new(platform::EFD_NONBLOCK)
-        .context("Failed to create exit EventFd")?;
     let mut serial_mgr = vmm::serial_manager::SerialManager::new(serial.clone())
         .context("Failed to create serial manager")?;
     if let Some(ref mut mgr) = serial_mgr {
@@ -379,52 +378,65 @@ pub fn run() -> anyhow::Result<()> {
             .context("Failed to start serial manager")?;
     }
 
-    // ── Run loop ─────────────────────────────────────────────────────────
-    let mut exit_count = 0u64;
-    let start = std::time::Instant::now();
-    let mut last_rip_dump = std::time::Instant::now();
+    // ── Run vCPU in a dedicated thread ─────────────────────────────────
+    let vcpu_exit_evt = exit_evt.try_clone().unwrap();
     let debug_kernel = std::env::var("CH_DEBUG").is_ok();
-    loop {
-        match vcpu.run() {
-            Ok(hypervisor::VmExit::Ignore) => {}
-            Ok(hypervisor::VmExit::Shutdown) => {
-                println!("\n--- Guest halted (after {exit_count} exits, {:.1}s) ---",
-                         start.elapsed().as_secs_f64());
-                // Dump final RIP
-                if let Ok(regs) = vcpu.get_regs() {
-                    println!("  Final RIP = {:#X}", regs.get_rip());
+    let vcpu_thread = std::thread::Builder::new()
+        .name("vcpu-0".to_string())
+        .spawn(move || {
+            let mut exit_count = 0u64;
+            let start = std::time::Instant::now();
+            let mut last_rip_dump = std::time::Instant::now();
+            loop {
+                match vcpu.run() {
+                    Ok(hypervisor::VmExit::Ignore) => {}
+                    Ok(hypervisor::VmExit::Shutdown) => {
+                        println!("\n--- Guest halted (after {exit_count} exits, {:.1}s) ---",
+                                 start.elapsed().as_secs_f64());
+                        if let Ok(regs) = vcpu.get_regs() {
+                            println!("  Final RIP = {:#X}", regs.get_rip());
+                        }
+                        break;
+                    }
+                    Ok(hypervisor::VmExit::Reset) => {
+                        println!("\n--- Guest reset ---");
+                        break;
+                    }
+                    Ok(exit) => {
+                        println!("\n--- Unhandled VM exit: {exit:?} ---");
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        if msg.contains("Guest requested shutdown") {
+                            println!("\n--- Guest requested shutdown ---");
+                        } else {
+                            eprintln!("\nvCPU run error: {e}");
+                        }
+                        break;
+                    }
                 }
-                break;
-            }
-            Ok(hypervisor::VmExit::Reset) => {
-                println!("\n--- Guest reset ---");
-                break;
-            }
-            Ok(exit) => {
-                println!("\n--- Unhandled VM exit: {exit:?} ---");
-                break;
-            }
-            Err(e) => {
-                let msg = format!("{e}");
-                if msg.contains("Guest requested shutdown") {
-                    println!("\n--- Guest requested shutdown ---");
-                } else {
-                    eprintln!("\nvCPU run error: {e}");
-                }
-                break;
-            }
-        }
-        exit_count += 1;
+                exit_count += 1;
 
-        // Periodic RIP dump for debugging
-        if debug_kernel && last_rip_dump.elapsed().as_secs() >= 2 {
-            if let Ok(regs) = vcpu.get_regs() {
-                eprintln!("[{:.1}s] exits={exit_count} RIP={:#X}",
-                          start.elapsed().as_secs_f64(), regs.get_rip());
+                // Periodic RIP dump for debugging
+                if debug_kernel && last_rip_dump.elapsed().as_secs() >= 2 {
+                    if let Ok(regs) = vcpu.get_regs() {
+                        eprintln!("[{:.1}s] exits={exit_count} RIP={:#X}",
+                                  start.elapsed().as_secs_f64(), regs.get_rip());
+                    }
+                    last_rip_dump = std::time::Instant::now();
+                }
             }
-            last_rip_dump = std::time::Instant::now();
-        }
-    }
+            // Signal the VMM control loop to exit
+            vcpu_exit_evt.write(1).ok();
+        })
+        .context("Failed to spawn vCPU thread")?;
+
+    // Wait for vCPU thread to finish
+    vcpu_thread.join().unwrap_or_else(|e| {
+        eprintln!("vCPU thread panicked: {e:?}");
+        exit_evt.write(1).ok();
+    });
 
     // ── Restore terminal state ─────────────────────────────────────────────
     if let Some(ref state) = terminal_state {
