@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod cli;
+
 #[cfg(unix)]
 #[path = "main_unix.rs"]
 mod main_impl;
@@ -15,8 +17,30 @@ fn main() {
     {
         use std::sync::mpsc::{channel, sync_channel};
         use platform::{EFD_NONBLOCK, EventFd};
+        use vmm::config::VmParams;
 
-        // Create the exit event and hypervisor
+        // Parse CLI using shared arg definitions
+        let (default_vcpus, default_memory, default_rng) = cli::prepare_default_values();
+        let app = cli::create_app(default_vcpus, default_memory, default_rng);
+        let cmd_arguments = app.get_matches();
+
+        if cmd_arguments.get_flag("version") {
+            println!("cloud-hypervisor v{}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+
+        // Build VmConfig from parsed args
+        let vm_params = VmParams::from_arg_matches(&cmd_arguments);
+        let vm_config = vmm::vm_config::VmConfig::parse(vm_params)
+            .expect("Failed to parse VM configuration");
+
+        let payload = vm_config.payload.clone();
+        let disk_path = vm_config.disks.as_ref()
+            .and_then(|d| d.first())
+            .and_then(|d| d.path.as_ref())
+            .map(|p| p.to_string_lossy().into_owned());
+
+        // Create hypervisor and VMM thread
         let exit_evt = EventFd::new(EFD_NONBLOCK).expect("Failed to create exit EventFd");
         let api_evt = EventFd::new(EFD_NONBLOCK).expect("Failed to create API EventFd");
         let hypervisor = hypervisor::new().expect("No hypervisor found. Is WHP enabled?");
@@ -33,7 +57,6 @@ fn main() {
 
         let (api_sender, api_receiver) = channel::<vmm::ApiRequest>();
 
-        // Start the VMM control loop thread
         let vmm_thread = vmm::start_vmm_thread(
             vmm::VmmVersionInfo::new(env!("BUILD_VERSION"), env!("CARGO_PKG_VERSION")),
             api_evt.try_clone().unwrap(),
@@ -42,72 +65,6 @@ fn main() {
             hypervisor,
         )
         .expect("Failed to start VMM thread");
-
-        // Parse CLI and build VmConfig
-        let args: Vec<String> = std::env::args().collect();
-        let get_arg = |name: &str| -> Option<String> {
-            args.windows(2)
-                .find(|w| w[0] == format!("--{name}"))
-                .map(|w| w[1].clone())
-        };
-
-        let payload = vmm::vm_config::PayloadConfig {
-            kernel: get_arg("kernel").map(std::path::PathBuf::from),
-            initramfs: get_arg("initramfs").map(std::path::PathBuf::from),
-            cmdline: get_arg("cmdline"),
-            firmware: None,
-            #[cfg(feature = "igvm")]
-            igvm: None,
-            #[cfg(feature = "sev_snp")]
-            host_data: None,
-            #[cfg(feature = "fw_cfg")]
-            fw_cfg_config: None,
-        };
-        let disk_path = get_arg("disk");
-        let mem_size = get_arg("memory")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(512) << 20; // Default 512 MiB
-
-        let vm_config = vmm::vm_config::VmConfig {
-            cpus: vmm::vm_config::CpusConfig::default(),
-            memory: vmm::vm_config::MemoryConfig {
-                size: mem_size,
-                ..Default::default()
-            },
-            payload: Some(payload.clone()),
-            rate_limit_groups: None,
-            disks: None,
-            net: None,
-            rng: vmm::vm_config::RngConfig::default(),
-            balloon: None,
-            generic_vhost_user: None,
-            fs: None,
-            pmem: None,
-            serial: vmm::vm_config::default_serial(),
-            console: vmm::vm_config::default_console(),
-            #[cfg(target_arch = "x86_64")]
-            debug_console: vmm::vm_config::DebugConsoleConfig::default(),
-            devices: None,
-            user_devices: None,
-            vdpa: None,
-            vsock: None,
-            #[cfg(feature = "pvmemcontrol")]
-            pvmemcontrol: None,
-            pvpanic: false,
-            iommu: false,
-            numa: None,
-            watchdog: false,
-            #[cfg(feature = "guest_debug")]
-            gdb: false,
-            pci_segments: None,
-            platform: None,
-            tpm: None,
-            preserved_fds: None,
-            landlock_enable: false,
-            landlock_rules: None,
-            #[cfg(feature = "ivshmem")]
-            ivshmem: None,
-        };
 
         // ── VmCreate API request ─────────────────────────────────────────
         let (create_sender, create_receiver) = sync_channel::<vmm::Result<()>>(1);
@@ -138,7 +95,13 @@ fn main() {
         api_sender
             .send(Box::new(move |vmm: &mut vmm::Vmm| {
                 let result = vmm.vm_boot(|exit_evt, vm, mm| {
-                    whp_demo::boot(exit_evt, payload, disk_path, vm, mm)
+                    let p = payload.unwrap_or(vmm::vm_config::PayloadConfig {
+                        firmware: None, kernel: None, cmdline: None, initramfs: None,
+                        #[cfg(feature = "igvm")] igvm: None,
+                        #[cfg(feature = "sev_snp")] host_data: None,
+                        #[cfg(feature = "fw_cfg")] fw_cfg_config: None,
+                    });
+                    whp_demo::boot(exit_evt, p, disk_path, vm, mm)
                 });
                 boot_sender.send(result).ok();
                 Ok(false)
