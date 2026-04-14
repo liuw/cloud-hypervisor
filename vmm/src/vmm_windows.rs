@@ -23,6 +23,8 @@ pub mod vm_config;
 // ── Windows-specific submodules ─────────────────────────────────────────────
 #[path = "serial_manager_windows.rs"]
 pub mod serial_manager;
+#[path = "memory_manager_windows.rs"]
+pub mod memory_manager;
 
 // ── Error types ─────────────────────────────────────────────────────────────
 
@@ -42,6 +44,12 @@ pub enum Error {
 
     #[error("Error spawning VMM thread")]
     VmmThreadSpawn(#[source] io::Error),
+
+    #[error("Error creating VM")]
+    VmCreate(#[source] hypervisor::HypervisorError),
+
+    #[error("Error in memory manager")]
+    MemoryManager(#[source] memory_manager::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -105,6 +113,9 @@ pub struct Vmm {
     version: VmmVersionInfo,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     activate_evt: EventFd,
+    vm: Option<Arc<dyn hypervisor::Vm>>,
+    memory_manager: Option<Arc<Mutex<memory_manager::MemoryManager>>>,
+    vm_config: Option<Arc<Mutex<vm_config::VmConfig>>>,
 }
 
 pub struct VmmThreadHandle {
@@ -139,7 +150,43 @@ impl Vmm {
             version: vmm_version,
             hypervisor,
             activate_evt,
+            vm: None,
+            memory_manager: None,
+            vm_config: None,
         })
+    }
+
+    /// Create a VM with the given configuration.
+    ///
+    /// Allocates guest memory and maps it to the hypervisor.
+    pub fn vm_create(&mut self, config: vm_config::VmConfig) -> Result<()> {
+        let hv_config = hypervisor::HypervisorVmConfig::default();
+        let vm = self.hypervisor.create_vm(hv_config).map_err(Error::VmCreate)?;
+
+        let mm = memory_manager::MemoryManager::new(vm.clone(), &config.memory)
+            .map_err(Error::MemoryManager)?;
+
+        self.vm = Some(vm);
+        self.memory_manager = Some(mm);
+        self.vm_config = Some(Arc::new(Mutex::new(config)));
+
+        info!("VM created");
+        Ok(())
+    }
+
+    /// Get the VM handle (if created).
+    pub fn vm(&self) -> Option<&Arc<dyn hypervisor::Vm>> {
+        self.vm.as_ref()
+    }
+
+    /// Get the memory manager (if created).
+    pub fn memory_manager(&self) -> Option<&Arc<Mutex<memory_manager::MemoryManager>>> {
+        self.memory_manager.as_ref()
+    }
+
+    /// Get the exit event (for signaling shutdown from vCPU threads).
+    pub fn exit_evt(&self) -> &EventFd {
+        &self.exit_evt
     }
 
     fn control_loop(&mut self, api_receiver: &Receiver<ApiRequest>) -> Result<()> {

@@ -89,57 +89,22 @@ const KERNEL_LOAD_ADDR: u64 = 0x100000; // 1 MiB — protected-mode kernel
 
 type GuestMem = GuestMemoryMmap<AtomicBitmap>;
 
-pub fn run(exit_evt: platform::EventFd) -> anyhow::Result<()> {
-    // Parse CLI using VMM config types
-    let args: Vec<String> = std::env::args().collect();
-    let get_arg = |name: &str| -> Option<String> {
-        args.windows(2)
-            .find(|w| w[0] == format!("--{name}"))
-            .map(|w| w[1].clone())
-    };
-
-    let payload = vmm::vm_config::PayloadConfig {
-        kernel: get_arg("kernel").map(std::path::PathBuf::from),
-        initramfs: get_arg("initramfs").map(std::path::PathBuf::from),
-        cmdline: get_arg("cmdline"),
-        firmware: None,
-        #[cfg(feature = "igvm")]
-        igvm: None,
-        #[cfg(feature = "sev_snp")]
-        host_data: None,
-        #[cfg(feature = "fw_cfg")]
-        fw_cfg_config: None,
-    };
-    let disk_path = get_arg("disk");
-
-    println!("cloud-hypervisor (Windows / WHP backend)");
-    println!();
-
-    // ── Create hypervisor and VM ─────────────────────────────────────────
-    let hv = hypervisor::new().context("No hypervisor found. Is WHP enabled?")?;
-    println!(
-        "Hypervisor: {:?}  (max vCPUs: {})",
-        hv.hypervisor_type(),
-        hv.get_max_vcpus()
-    );
-
-    let config = hypervisor::HypervisorVmConfig::default();
-    let vm = hv.create_vm(config).context("Failed to create VM")?;
-
-    // ── Allocate guest memory via GuestMemoryMmap ────────────────────────
-    let guest_mem: GuestMem = GuestMemoryMmap::from_ranges(
-        &[(GuestAddress(0), GUEST_MEM_SIZE)]
-    ).context("Failed to allocate guest memory")?;
-
-    // Get host pointer for WHP mapping
-    let host_mem = guest_mem.get_host_address(GuestAddress(0))
+pub fn run(
+    exit_evt: platform::EventFd,
+    payload: vmm::vm_config::PayloadConfig,
+    disk_path: Option<String>,
+    vm: Arc<dyn hypervisor::Vm>,
+    memory_manager: Arc<Mutex<vmm::memory_manager::MemoryManager>>,
+) -> anyhow::Result<()> {
+    // ── Get guest memory from the VMM's memory manager ───────────────────
+    let mm = memory_manager.lock().unwrap();
+    let guest_mem = mm.guest_memory().clone();
+    let host_mem = mm.host_address(GuestAddress(0))
         .map_err(|e| anyhow!("get_host_address: {e:?}"))?;
-    // SAFETY: GuestMemoryMmap owns the memory and it remains valid.
-    unsafe {
-        vm.create_user_memory_region(0, 0, GUEST_MEM_SIZE, host_mem, false, false)
-            .context("Failed to map guest memory")?;
-    }
-    println!("Mapped {} MiB guest RAM at GPA 0x0", GUEST_MEM_SIZE >> 20);
+    let ram_size = mm.ram_size();
+    drop(mm);
+
+    println!("Using VMM-managed memory: {} MiB at GPA 0x0", ram_size >> 20);
 
     // Create the I/O APIC using the existing devices crate implementation.
     // This provides functional interrupt routing (PIT IRQ 0 → LAPIC → timer calibration).
