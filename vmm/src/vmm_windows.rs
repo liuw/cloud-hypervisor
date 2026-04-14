@@ -10,3 +10,7 @@ pub mod api;
 pub mod config;
 pub mod device_tree;
 pub mod vm_config;
+
+// ── Windows-specific submodules ─────────────────────────────────────────────
+#[path = "serial_manager_windows.rs"]
+pub mod serial_manager;

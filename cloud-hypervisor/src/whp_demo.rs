@@ -361,34 +361,16 @@ pub fn run() -> anyhow::Result<()> {
             .context("Failed to spawn timer thread")?;
     }
 
-    // Start a stdin reader thread that feeds input to the serial device.
-    // queue_input_bytes() triggers an RX interrupt immediately, giving instant
-    // response to keystrokes without waiting for the timer tick.
-    let serial_for_stdin = serial.clone();
-    let vm_for_stdin = vm.clone();
-    std::thread::Builder::new()
-        .name("stdin-reader".to_string())
-        .spawn(move || {
-            use std::io::Read;
-            let stdin = std::io::stdin();
-            let mut buf = [0u8; 1];
-            loop {
-                match stdin.lock().read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let _ = serial_for_stdin.lock().unwrap().queue_input_bytes(&buf);
-                        // Cancel the vCPU run so it picks up the new data immediately
-                        // instead of waiting for the next natural PIO exit.
-                        use hypervisor::whp::WhpVm;
-                        if let Some(whp) = vm_for_stdin.as_any().downcast_ref::<WhpVm>() {
-                            let _ = whp.cancel_run(0);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        })
-        .context("Failed to spawn stdin reader")?;
+    // Start the serial manager which reads from stdin and feeds input
+    // to the serial device via queue_input_bytes().
+    let exit_evt = platform::EventFd::new(platform::EFD_NONBLOCK)
+        .context("Failed to create exit EventFd")?;
+    let mut serial_mgr = vmm::serial_manager::SerialManager::new(serial.clone())
+        .context("Failed to create serial manager")?;
+    if let Some(ref mut mgr) = serial_mgr {
+        mgr.start_thread(exit_evt.try_clone().unwrap())
+            .context("Failed to start serial manager")?;
+    }
 
     // ── Run loop ─────────────────────────────────────────────────────────
     let mut exit_count = 0u64;
