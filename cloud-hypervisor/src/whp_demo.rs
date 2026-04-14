@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom, Write as _};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, anyhow};
@@ -25,6 +26,62 @@ use vm_memory::bitmap::AtomicBitmap;
 const GUEST_MEM_SIZE: usize = 512 << 20; // 512 MiB
 const SERIAL_PORT: u64 = 0x3F8;
 const DEBUG_EXIT_PORT: u64 = 0x501;
+
+// PCI configuration I/O ports
+const PCI_CONFIG_ADDR_PORT: u64 = 0xCF8;
+const PCI_CONFIG_DATA_PORT: u64 = 0xCFC;
+
+// PCI device slots
+const PCI_HOST_BRIDGE_SLOT: u32 = 0;
+const PCI_BLK_SLOT: u32 = 1;
+
+// Default I/O BAR address for virtio-blk (may be reprogrammed by kernel)
+const VIRTIO_BLK_IO_BAR_DEFAULT: u32 = 0xC000;
+const VIRTIO_BLK_IO_BAR_SIZE: u32 = 64;
+
+// MSI-X table MMIO BAR
+const MSIX_BAR_GPA: u64 = 0xFEA0_0000;
+const MSIX_BAR_SIZE: u32 = 4096;
+const MSIX_TABLE_ENTRIES: u16 = 2; // config + requestq
+
+// Legacy virtio register offsets (within I/O BAR)
+const VIRTIO_PCI_HOST_FEATURES: u16 = 0;
+const VIRTIO_PCI_GUEST_FEATURES: u16 = 4;
+const VIRTIO_PCI_QUEUE_PFN: u16 = 8;
+const VIRTIO_PCI_QUEUE_NUM: u16 = 12;
+const VIRTIO_PCI_QUEUE_SEL: u16 = 14;
+const VIRTIO_PCI_QUEUE_NOTIFY: u16 = 16;
+const VIRTIO_PCI_STATUS: u16 = 18;
+const VIRTIO_PCI_ISR: u16 = 19;
+const VIRTIO_PCI_MSIX_CONFIG_VECTOR: u16 = 20;
+const VIRTIO_PCI_MSIX_QUEUE_VECTOR: u16 = 22;
+const VIRTIO_PCI_CONFIG_OFF: u16 = 24; // device config starts here (with MSI-X)
+
+// Virtio device status bits
+const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
+const VIRTIO_STATUS_DRIVER: u8 = 2;
+const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
+const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
+
+// Virtio block request types
+const VIRTIO_BLK_T_IN: u32 = 0;
+const VIRTIO_BLK_T_OUT: u32 = 1;
+const VIRTIO_BLK_T_FLUSH: u32 = 4;
+const VIRTIO_BLK_T_GET_ID: u32 = 8;
+
+// Virtio block status
+const VIRTIO_BLK_S_OK: u8 = 0;
+const VIRTIO_BLK_S_IOERR: u8 = 1;
+const VIRTIO_BLK_S_UNSUPP: u8 = 2;
+
+// Virtio descriptor flags
+const VRING_DESC_F_NEXT: u16 = 1;
+const VRING_DESC_F_WRITE: u16 = 2;
+
+// Virtio MSI-X no vector
+const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF;
+
+const BLK_QUEUE_SIZE: u16 = 128;
 
 // Linux boot protocol addresses
 const BOOT_PARAMS_ADDR: u64 = 0x7000;
@@ -43,6 +100,10 @@ pub fn run() -> anyhow::Result<()> {
     let initramfs_path = args
         .windows(2)
         .find(|w| w[0] == "--initramfs")
+        .map(|w| w[1].clone());
+    let disk_path = args
+        .windows(2)
+        .find(|w| w[0] == "--disk")
         .map(|w| w[1].clone());
 
     println!("cloud-hypervisor (Windows / WHP backend)");
@@ -139,9 +200,39 @@ pub fn run() -> anyhow::Result<()> {
         None
     };
 
+    // ── Create PCI virtio-blk device if disk is provided ─────────────────
+    let pci_blk: Option<Arc<Mutex<PciBlkDevice>>> = if let Some(ref path) = disk_path {
+        // Allocate and map MSI-X table page in guest address space
+        let msix_page_layout = std::alloc::Layout::from_size_align(MSIX_BAR_SIZE as usize, 4096).unwrap();
+        let msix_host = unsafe { std::alloc::alloc_zeroed(msix_page_layout) };
+        if msix_host.is_null() {
+            return Err(anyhow!("Failed to allocate MSI-X table page"));
+        }
+        // Initialize all MSI-X entries as masked
+        unsafe {
+            for i in 0..MSIX_TABLE_ENTRIES as usize {
+                let entry = msix_host.add(i * 16);
+                // Vector Control: bit 0 = masked
+                std::ptr::write_unaligned(entry.add(12) as *mut u32, 1);
+            }
+        }
+        unsafe {
+            vm.create_user_memory_region(2, MSIX_BAR_GPA, MSIX_BAR_SIZE as usize, msix_host, false, false)
+                .context("Failed to map MSI-X BAR")?;
+        }
+        println!("Mapped MSI-X table at GPA {MSIX_BAR_GPA:#X}");
+
+        let dev = PciBlkDevice::new(path, guest_mem.clone(), vm.clone(), msix_host)?;
+        println!("Created virtio-blk PCI device: {} sectors ({:.1} MiB), disk={path}",
+                 dev.capacity, (dev.capacity * 512) as f64 / (1024.0 * 1024.0));
+        Some(Arc::new(Mutex::new(dev)))
+    } else {
+        None
+    };
+
     // ── Load payload ─────────────────────────────────────────────────────
     let entry_point = if let Some(ref path) = kernel_path {
-        load_kernel(host_mem, path)?
+        load_kernel(host_mem, path, disk_path.is_some())?
     } else {
         load_demo_payload(host_mem)
     };
@@ -188,7 +279,7 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     // ── Create vCPU ──────────────────────────────────────────────────────
-    let vm_ops = Arc::new(SerialVmOps::new(ioapic.clone(), Some(vm.clone())));
+    let vm_ops = Arc::new(SerialVmOps::new(ioapic.clone(), Some(vm.clone()), pci_blk.clone()));
     let vm_ops_clone: Arc<dyn VmOps> = vm_ops.clone();
     let mut vcpu = vm
         .create_vcpu(0, Some(vm_ops_clone))
@@ -381,7 +472,7 @@ fn load_demo_payload(host_mem: *mut u8) -> u64 {
 
 // ── Kernel loading ───────────────────────────────────────────────────────────
 
-fn load_kernel(host_mem: *mut u8, path: &str) -> anyhow::Result<u64> {
+fn load_kernel(host_mem: *mut u8, path: &str, has_disk: bool) -> anyhow::Result<u64> {
     let mut file = File::open(path).context("Failed to open kernel image")?;
     let metadata = file.metadata()?;
     let file_size = metadata.len() as usize;
@@ -394,12 +485,12 @@ fn load_kernel(host_mem: *mut u8, path: &str) -> anyhow::Result<u64> {
 
     if &header[0..4] == b"\x7FELF" {
         println!("  Format: ELF");
-        load_elf(host_mem, &mut file)
+        load_elf(host_mem, &mut file, has_disk)
     } else if header_len > 0x206 && &header[0x202..0x206] == b"HdrS" {
         println!("  Format: bzImage");
         let mut data = vec![0u8; file_size];
         file.read_exact(&mut data)?;
-        load_bzimage(host_mem, &data)
+        load_bzimage(host_mem, &data, has_disk)
     } else {
         println!("  Format: flat binary");
         let mut data = vec![0u8; file_size];
@@ -408,7 +499,7 @@ fn load_kernel(host_mem: *mut u8, path: &str) -> anyhow::Result<u64> {
     }
 }
 
-fn load_elf(host_mem: *mut u8, file: &mut File) -> anyhow::Result<u64> {
+fn load_elf(host_mem: *mut u8, file: &mut File, has_disk: bool) -> anyhow::Result<u64> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     // Read ELF header to find entry point and program headers
@@ -459,7 +550,7 @@ fn load_elf(host_mem: *mut u8, file: &mut File) -> anyhow::Result<u64> {
     write_pm_bootstrap(host_mem);
 
     // Set up boot_params (zero page) for Linux boot protocol
-    setup_linux_boot_params(host_mem);
+    setup_linux_boot_params(host_mem, has_disk);
 
     // Override the bootstrap's kernel address.
     // The bootstrap uses `mov rax, <8-byte addr>` to load the kernel entry.
@@ -563,7 +654,7 @@ fn write_pm_bootstrap_to_entry(host_mem: *mut u8, entry: u64) {
     println!("  Bootstrap ({} bytes) at {BOOTSTRAP_ADDR:#X} → 64-bit jmp to {entry:#x}", code.len());
 }
 
-fn load_bzimage(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
+fn load_bzimage(host_mem: *mut u8, data: &[u8], has_disk: bool) -> anyhow::Result<u64> {
     // Parse bzImage header
     let setup_sects = if data[0x1F1] == 0 { 4 } else { data[0x1F1] as usize };
     let setup_size = (setup_sects + 1) * 512;
@@ -600,8 +691,12 @@ fn load_bzimage(host_mem: *mut u8, data: &[u8]) -> anyhow::Result<u64> {
         );
     }
 
-    // Write command line
-    let cmdline = b"console=ttyS0 earlyprintk=serial noapic noacpi pci=off\0";
+    // Write command line — adjust for PCI if disk is available
+    let cmdline: Vec<u8> = if has_disk {
+        b"console=ttyS0 earlyprintk=serial noapic noacpi root=/dev/vda rw rootwait\0".to_vec()
+    } else {
+        b"console=ttyS0 earlyprintk=serial noapic noacpi pci=off\0".to_vec()
+    };
     // SAFETY: Writing within allocated guest memory bounds.
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -815,7 +910,7 @@ const PML4_ADDR: u64 = 0xA000;
 
 /// Set up Linux boot parameters for ELF vmlinux.
 /// Creates a boot_params "zero page" at BOOT_PARAMS_ADDR and a PVH hvm_start_info at 0x6000.
-fn setup_linux_boot_params(host_mem: *mut u8) {
+fn setup_linux_boot_params(host_mem: *mut u8, has_disk: bool) {
     /// Write a value at an unaligned offset within guest memory.
     unsafe fn w<T: Copy>(base: *mut u8, offset: usize, val: T) {
         std::ptr::write_unaligned(base.add(offset) as *mut T, val);
@@ -827,8 +922,12 @@ fn setup_linux_boot_params(host_mem: *mut u8) {
         let bp = host_mem.add(BOOT_PARAMS_ADDR as usize);
         std::ptr::write_bytes(bp, 0, 4096);
 
-        // Write command line
-        let cmdline = b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check tsc=reliable idle=halt rdinit=/init\0";
+        // Write command line — adjust based on whether disk is available
+        let cmdline: Vec<u8> = if has_disk {
+            b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check tsc=reliable idle=halt root=/dev/vda rw rootwait\0".to_vec()
+        } else {
+            b"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 nomodules lpj=1000000 no_timer_check tsc=reliable idle=halt rdinit=/init\0".to_vec()
+        };
         std::ptr::copy_nonoverlapping(
             cmdline.as_ptr(),
             host_mem.add(CMDLINE_ADDR as usize),
@@ -1230,6 +1329,625 @@ impl InterruptSourceGroup for WhpInterruptSourceGroup {
     }
 }
 
+// ── PCI virtio-blk device ────────────────────────────────────────────────────
+
+/// Static PCI config space for the host bridge (device 0).
+fn host_bridge_config() -> [u8; 256] {
+    let mut cfg = [0u8; 256];
+    // Vendor ID: Intel (0x8086)
+    cfg[0x00] = 0x86; cfg[0x01] = 0x80;
+    // Device ID: i440FX (0x1237)
+    cfg[0x02] = 0x37; cfg[0x03] = 0x12;
+    // Command: 0
+    // Status: 0
+    // Class: Host bridge (0x060000)
+    cfg[0x09] = 0x00; // prog_if
+    cfg[0x0A] = 0x00; // subclass
+    cfg[0x0B] = 0x06; // class
+    // Header type: 0 (standard)
+    cfg[0x0E] = 0x00;
+    cfg
+}
+
+/// A self-contained legacy virtio-PCI block device.
+struct PciBlkDevice {
+    config: [u8; 256],
+
+    // BAR tracking
+    io_bar_base: u32,
+    io_bar_sizing: bool,
+    msix_bar_base: u32,
+    msix_bar_sizing: bool,
+
+    // Virtio state
+    device_features: u32,
+    guest_features: u32,
+    device_status: u8,
+    isr_status: u8,
+    queue_select: u16,
+    msix_config_vector: u16,
+
+    // Queue 0 (requestq) state
+    queue_pfn: u32,
+    queue_msix_vector: u16,
+    last_avail_idx: u16,
+
+    // Block device
+    capacity: u64, // in 512-byte sectors
+    disk_file: File,
+
+    // Guest memory for virtqueue access
+    guest_mem: GuestMem,
+
+    // MSI-X table host pointer (direct access to the mapped page)
+    msix_table_host: *mut u8,
+
+    // VM for interrupt injection
+    vm: Arc<dyn hypervisor::Vm>,
+}
+
+// SAFETY: msix_table_host points to a page that lives for the VM lifetime.
+unsafe impl Send for PciBlkDevice {}
+
+impl PciBlkDevice {
+    fn new(
+        disk_path: &str,
+        guest_mem: GuestMem,
+        vm: Arc<dyn hypervisor::Vm>,
+        msix_table_host: *mut u8,
+    ) -> anyhow::Result<Self> {
+        let disk_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(disk_path)
+            .with_context(|| format!("Failed to open disk: {disk_path}"))?;
+        let disk_size = disk_file.metadata()?.len();
+        let capacity = disk_size / 512;
+
+        let mut config = [0u8; 256];
+
+        // Vendor ID: Red Hat (0x1AF4)
+        config[0x00] = 0xF4; config[0x01] = 0x1A;
+        // Device ID: transitional virtio-blk (0x1001)
+        config[0x02] = 0x01; config[0x03] = 0x10;
+        // Command: I/O space enable (bit 0) + Memory space enable (bit 1) + Bus master (bit 2)
+        config[0x04] = 0x07; config[0x05] = 0x00;
+        // Status: Capabilities list (bit 4)
+        config[0x06] = 0x10; config[0x07] = 0x00;
+        // Revision ID
+        config[0x08] = 0x00;
+        // Class: Mass storage (0x01), subclass other (0x80), prog_if 0
+        config[0x09] = 0x00; // prog_if
+        config[0x0A] = 0x00; // subclass: SCSI (or 0x80 for other)
+        config[0x0B] = 0x01; // class: mass storage
+        // Header type: standard (0x00)
+        config[0x0E] = 0x00;
+        // Subsystem Vendor ID: Red Hat (0x1AF4)
+        config[0x2C] = 0xF4; config[0x2D] = 0x1A;
+        // Subsystem ID: block (0x0002)
+        config[0x2E] = 0x02; config[0x2F] = 0x00;
+        // Capabilities pointer → MSI-X cap at 0x40
+        config[0x34] = 0x40;
+        // Interrupt Pin: INTA# (1)
+        config[0x3D] = 0x01;
+
+        // BAR 0: I/O space at default address
+        let bar0_val = VIRTIO_BLK_IO_BAR_DEFAULT | 0x01; // bit 0 = I/O indicator
+        config[0x10..0x14].copy_from_slice(&bar0_val.to_le_bytes());
+
+        // BAR 1: Memory space at MSIX_BAR_GPA
+        let bar1_val = MSIX_BAR_GPA as u32; // bits 2:1 = 00 (32-bit), bit 0 = 0 (memory)
+        config[0x14..0x18].copy_from_slice(&bar1_val.to_le_bytes());
+
+        // MSI-X Capability at offset 0x40 (12 bytes)
+        config[0x40] = 0x11; // Cap ID = MSI-X
+        config[0x41] = 0x00; // Next cap = none
+        // Message Control: table size = MSIX_TABLE_ENTRIES - 1
+        let msg_ctrl = (MSIX_TABLE_ENTRIES - 1) as u16; // bit 15 (enable) = 0 initially
+        config[0x42..0x44].copy_from_slice(&msg_ctrl.to_le_bytes());
+        // Table Offset/BIR: offset=0, BIR=1 (BAR 1)
+        let table_bir: u32 = 0x0000_0001; // offset 0, BIR 1
+        config[0x44..0x48].copy_from_slice(&table_bir.to_le_bytes());
+        // PBA Offset/BIR: offset=0x800, BIR=1
+        let pba_bir: u32 = 0x0000_0801; // offset 0x800, BIR 1
+        config[0x48..0x4C].copy_from_slice(&pba_bir.to_le_bytes());
+
+        Ok(PciBlkDevice {
+            config,
+            io_bar_base: VIRTIO_BLK_IO_BAR_DEFAULT,
+            io_bar_sizing: false,
+            msix_bar_base: MSIX_BAR_GPA as u32,
+            msix_bar_sizing: false,
+            device_features: 0, // no special features for now; minimal legacy device
+            guest_features: 0,
+            device_status: 0,
+            isr_status: 0,
+            queue_select: 0,
+            msix_config_vector: VIRTIO_MSI_NO_VECTOR,
+            queue_pfn: 0,
+            queue_msix_vector: VIRTIO_MSI_NO_VECTOR,
+            last_avail_idx: 0,
+            capacity,
+            disk_file,
+            guest_mem,
+            msix_table_host,
+            vm,
+        })
+    }
+
+    /// Read a PCI config register (4-byte aligned).
+    fn read_config(&self, reg: usize) -> u32 {
+        if reg >= 64 { return 0; } // 256 bytes / 4
+        // Handle BAR sizing
+        match reg {
+            4 => { // BAR 0
+                if self.io_bar_sizing {
+                    // Return size mask: ~(size-1) with I/O bit
+                    return !(VIRTIO_BLK_IO_BAR_SIZE - 1) | 0x01;
+                }
+            }
+            5 => { // BAR 1
+                if self.msix_bar_sizing {
+                    // Return size mask for MMIO BAR
+                    return !(MSIX_BAR_SIZE - 1);
+                }
+            }
+            _ => {}
+        }
+        u32::from_le_bytes(self.config[reg * 4..reg * 4 + 4].try_into().unwrap())
+    }
+
+    /// Write to PCI config space. `reg` is the 4-byte register index.
+    /// `offset` is byte offset within the register (0-3), `data` is the bytes to write.
+    fn write_config(&mut self, reg: usize, offset: u64, data: &[u8]) {
+        if reg >= 64 { return; }
+        let byte_offset = reg * 4 + offset as usize;
+
+        match reg {
+            1 => {
+                // Command register (0x04-0x05): allow writes to lower byte
+                if offset == 0 && !data.is_empty() {
+                    self.config[0x04] = data[0] & 0x07; // I/O, Mem, BusMaster
+                }
+            }
+            4 => {
+                // BAR 0 (I/O)
+                let mut bar_val = u32::from_le_bytes(self.config[0x10..0x14].try_into().unwrap());
+                // Apply write
+                for (i, &b) in data.iter().enumerate() {
+                    let pos = offset as usize + i;
+                    if pos < 4 {
+                        bar_val = (bar_val & !(0xFF << (pos * 8))) | ((b as u32) << (pos * 8));
+                    }
+                }
+                if bar_val == 0xFFFFFFFF || (bar_val & !0x03) == 0xFFFFFFFC {
+                    self.io_bar_sizing = true;
+                    self.config[0x10..0x14].copy_from_slice(&bar_val.to_le_bytes());
+                } else {
+                    self.io_bar_sizing = false;
+                    // Keep I/O indicator bit, align to BAR size
+                    let addr = bar_val & !(VIRTIO_BLK_IO_BAR_SIZE - 1) & !0x03;
+                    self.io_bar_base = addr;
+                    let new_bar = addr | 0x01;
+                    self.config[0x10..0x14].copy_from_slice(&new_bar.to_le_bytes());
+                }
+                return;
+            }
+            5 => {
+                // BAR 1 (MMIO) — read-only; MSI-X backing page is fixed at MSIX_BAR_GPA
+                // The kernel sizes the BAR by writing 0xFFFFFFFF. We return the size mask
+                // but always restore the original address, preventing relocation.
+                let mut bar_val = u32::from_le_bytes(self.config[0x14..0x18].try_into().unwrap());
+                for (i, &b) in data.iter().enumerate() {
+                    let pos = offset as usize + i;
+                    if pos < 4 {
+                        bar_val = (bar_val & !(0xFF << (pos * 8))) | ((b as u32) << (pos * 8));
+                    }
+                }
+                if bar_val == 0xFFFFFFFF || (bar_val & !0x0F) == 0xFFFFFFF0 {
+                    self.msix_bar_sizing = true;
+                    self.config[0x14..0x18].copy_from_slice(&bar_val.to_le_bytes());
+                } else {
+                    self.msix_bar_sizing = false;
+                    // Always restore fixed address — backing page cannot be relocated
+                    let fixed_bar = MSIX_BAR_GPA as u32;
+                    self.config[0x14..0x18].copy_from_slice(&fixed_bar.to_le_bytes());
+                }
+                return;
+            }
+            _ => {
+                // MSI-X Message Control at config offset 0x42-0x43 (reg 16, offset 2-3)
+                if byte_offset == 0x42 || byte_offset == 0x43 {
+                    for (i, &b) in data.iter().enumerate() {
+                        let pos = byte_offset + i;
+                        if pos == 0x42 || pos == 0x43 {
+                            self.config[pos] = b;
+                        }
+                    }
+                    return;
+                }
+                // Other registers: allow writes to writable areas
+                for (i, &b) in data.iter().enumerate() {
+                    let pos = byte_offset + i;
+                    if pos < 256 {
+                        self.config[pos] = b;
+                    }
+                }
+            }
+        }
+    }
+
+    fn msix_enabled(&self) -> bool {
+        let msg_ctrl = u16::from_le_bytes(self.config[0x42..0x44].try_into().unwrap());
+        (msg_ctrl & 0x8000) != 0
+    }
+
+    fn msix_function_masked(&self) -> bool {
+        let msg_ctrl = u16::from_le_bytes(self.config[0x42..0x44].try_into().unwrap());
+        (msg_ctrl & 0x4000) != 0
+    }
+
+    /// Read from the virtio I/O BAR.
+    fn io_read(&mut self, offset: u16, data: &mut [u8]) {
+        match offset {
+            VIRTIO_PCI_HOST_FEATURES => {
+                if data.len() >= 4 {
+                    data[..4].copy_from_slice(&self.device_features.to_le_bytes());
+                }
+            }
+            VIRTIO_PCI_GUEST_FEATURES => {
+                if data.len() >= 4 {
+                    data[..4].copy_from_slice(&self.guest_features.to_le_bytes());
+                }
+            }
+            VIRTIO_PCI_QUEUE_PFN => {
+                if data.len() >= 4 {
+                    data[..4].copy_from_slice(&self.queue_pfn.to_le_bytes());
+                }
+            }
+            VIRTIO_PCI_QUEUE_NUM => {
+                if data.len() >= 2 {
+                    let size = if self.queue_select == 0 { BLK_QUEUE_SIZE } else { 0 };
+                    data[..2].copy_from_slice(&size.to_le_bytes());
+                }
+            }
+            VIRTIO_PCI_QUEUE_SEL => {
+                if data.len() >= 2 {
+                    data[..2].copy_from_slice(&self.queue_select.to_le_bytes());
+                }
+            }
+            VIRTIO_PCI_STATUS => {
+                data[0] = self.device_status;
+            }
+            VIRTIO_PCI_ISR => {
+                data[0] = self.isr_status;
+                self.isr_status = 0; // read-clear
+            }
+            VIRTIO_PCI_MSIX_CONFIG_VECTOR => {
+                if data.len() >= 2 {
+                    data[..2].copy_from_slice(&self.msix_config_vector.to_le_bytes());
+                }
+            }
+            VIRTIO_PCI_MSIX_QUEUE_VECTOR => {
+                if data.len() >= 2 {
+                    let vec = if self.queue_select == 0 { self.queue_msix_vector } else { VIRTIO_MSI_NO_VECTOR };
+                    data[..2].copy_from_slice(&vec.to_le_bytes());
+                }
+            }
+            _ => {
+                // Device-specific config at VIRTIO_PCI_CONFIG_OFF
+                if offset >= VIRTIO_PCI_CONFIG_OFF {
+                    let cfg_off = (offset - VIRTIO_PCI_CONFIG_OFF) as usize;
+                    let cap_bytes = self.capacity.to_le_bytes();
+                    for (i, d) in data.iter_mut().enumerate() {
+                        let pos = cfg_off + i;
+                        if pos < cap_bytes.len() {
+                            *d = cap_bytes[pos];
+                        } else {
+                            *d = 0;
+                        }
+                    }
+                } else {
+                    data.fill(0);
+                }
+            }
+        }
+    }
+
+    /// Write to the virtio I/O BAR.
+    fn io_write(&mut self, offset: u16, data: &[u8]) {
+        match offset {
+            VIRTIO_PCI_GUEST_FEATURES => {
+                if data.len() >= 4 {
+                    self.guest_features = u32::from_le_bytes(data[..4].try_into().unwrap());
+                }
+            }
+            VIRTIO_PCI_QUEUE_PFN => {
+                if data.len() >= 4 {
+                    let pfn = u32::from_le_bytes(data[..4].try_into().unwrap());
+                    if self.queue_select == 0 {
+                        self.queue_pfn = pfn;
+                        if pfn == 0 {
+                            // Queue disabled
+                            self.last_avail_idx = 0;
+                        }
+                    }
+                }
+            }
+            VIRTIO_PCI_QUEUE_SEL => {
+                if data.len() >= 2 {
+                    self.queue_select = u16::from_le_bytes(data[..2].try_into().unwrap());
+                }
+            }
+            VIRTIO_PCI_QUEUE_NOTIFY => {
+                if data.len() >= 2 {
+                    let queue_idx = u16::from_le_bytes(data[..2].try_into().unwrap());
+                    if queue_idx == 0 && self.device_status & VIRTIO_STATUS_DRIVER_OK != 0 && self.queue_pfn != 0 {
+                        self.process_queue();
+                    }
+                }
+            }
+            VIRTIO_PCI_STATUS => {
+                if data.is_empty() { return; }
+                let new_status = data[0];
+                if new_status == 0 {
+                    // Device reset
+                    self.device_status = 0;
+                    self.guest_features = 0;
+                    self.queue_pfn = 0;
+                    self.queue_select = 0;
+                    self.last_avail_idx = 0;
+                    self.isr_status = 0;
+                    self.msix_config_vector = VIRTIO_MSI_NO_VECTOR;
+                    self.queue_msix_vector = VIRTIO_MSI_NO_VECTOR;
+                    return;
+                }
+                self.device_status = new_status;
+            }
+            VIRTIO_PCI_MSIX_CONFIG_VECTOR => {
+                if data.len() >= 2 {
+                    self.msix_config_vector = u16::from_le_bytes(data[..2].try_into().unwrap());
+                }
+            }
+            VIRTIO_PCI_MSIX_QUEUE_VECTOR => {
+                if data.len() >= 2 && self.queue_select == 0 {
+                    self.queue_msix_vector = u16::from_le_bytes(data[..2].try_into().unwrap());
+                }
+            }
+            _ => {} // Ignore writes to read-only or unknown registers
+        }
+    }
+
+    /// Process pending requests in the virtqueue.
+    fn process_queue(&mut self) {
+        if self.queue_pfn == 0 { return; }
+
+        let queue_addr = (self.queue_pfn as u64) * 4096;
+        let desc_table = queue_addr;
+        let avail_ring = queue_addr + (BLK_QUEUE_SIZE as u64) * 16;
+        let used_ring = align_up(avail_ring + 6 + 2 * BLK_QUEUE_SIZE as u64, 4096);
+
+        // Read avail index
+        let avail_idx: u16 = self.guest_mem
+            .read_obj(GuestAddress(avail_ring + 2))
+            .unwrap_or(0);
+
+        let mut processed = 0u32;
+
+        while self.last_avail_idx != avail_idx {
+            let avail_slot = (self.last_avail_idx % BLK_QUEUE_SIZE) as u64;
+            let desc_idx: u16 = self.guest_mem
+                .read_obj(GuestAddress(avail_ring + 4 + avail_slot * 2))
+                .unwrap_or(0);
+
+            let bytes_written = self.process_descriptor_chain(desc_table, desc_idx);
+
+            // Update used ring
+            let used_idx: u16 = self.guest_mem
+                .read_obj(GuestAddress(used_ring + 2))
+                .unwrap_or(0);
+            let used_slot = (used_idx % BLK_QUEUE_SIZE) as u64;
+            let used_elem_addr = used_ring + 4 + used_slot * 8;
+            // Write used element: {id: u32, len: u32}
+            let _ = self.guest_mem.write_obj(desc_idx as u32, GuestAddress(used_elem_addr));
+            let _ = self.guest_mem.write_obj(bytes_written, GuestAddress(used_elem_addr + 4));
+            // Increment used index
+            let _ = self.guest_mem.write_obj(used_idx.wrapping_add(1), GuestAddress(used_ring + 2));
+
+            self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
+            processed += 1;
+        }
+
+        if processed > 0 {
+            self.isr_status |= 0x01; // Used buffer notification
+            self.inject_interrupt();
+        }
+    }
+
+    /// Process a single descriptor chain. Returns total bytes written to device-writable descriptors.
+    fn process_descriptor_chain(&mut self, desc_table: u64, first_idx: u16) -> u32 {
+        // Walk the chain to collect header, data descriptors, and status descriptor
+        let mut descs: Vec<(u64, u32, u16)> = Vec::new(); // (addr, len, flags)
+        let mut idx = first_idx;
+        let mut chain_len = 0u32;
+
+        loop {
+            if chain_len >= BLK_QUEUE_SIZE as u32 { break; } // prevent infinite loops
+            let desc_addr = desc_table + (idx as u64) * 16;
+
+            let addr: u64 = self.guest_mem.read_obj(GuestAddress(desc_addr)).unwrap_or(0);
+            let len: u32 = self.guest_mem.read_obj(GuestAddress(desc_addr + 8)).unwrap_or(0);
+            let flags: u16 = self.guest_mem.read_obj(GuestAddress(desc_addr + 12)).unwrap_or(0);
+            let next: u16 = self.guest_mem.read_obj(GuestAddress(desc_addr + 14)).unwrap_or(0);
+
+            descs.push((addr, len, flags));
+            chain_len += 1;
+
+            if flags & VRING_DESC_F_NEXT == 0 { break; }
+            idx = next;
+        }
+
+        if descs.len() < 2 {
+            // Need at least header + status
+            return 0;
+        }
+
+        // First descriptor: virtio_blk_req header (16 bytes, read-only)
+        let (hdr_addr, hdr_len, hdr_flags) = descs[0];
+        if hdr_len < 16 || (hdr_flags & VRING_DESC_F_WRITE) != 0 {
+            // Invalid header
+            self.write_status_byte(&descs, VIRTIO_BLK_S_IOERR);
+            return 1;
+        }
+
+        let req_type: u32 = self.guest_mem.read_obj(GuestAddress(hdr_addr)).unwrap_or(u32::MAX);
+        let sector: u64 = self.guest_mem.read_obj(GuestAddress(hdr_addr + 8)).unwrap_or(0);
+
+        // Last descriptor: status byte (1 byte, write-only)
+        let (status_addr, status_len, status_flags) = descs[descs.len() - 1];
+        if status_len < 1 || (status_flags & VRING_DESC_F_WRITE) == 0 {
+            return 0; // Invalid status descriptor
+        }
+
+        // Middle descriptors: data buffers
+        let data_descs = &descs[1..descs.len() - 1];
+        let mut total_written = 0u32;
+
+        let status = match req_type {
+            VIRTIO_BLK_T_IN => {
+                // Read from disk to guest
+                let mut disk_offset = sector * 512;
+                if sector >= self.capacity {
+                    VIRTIO_BLK_S_IOERR
+                } else {
+                    let mut ok = true;
+                    for &(addr, len, flags) in data_descs {
+                        if flags & VRING_DESC_F_WRITE == 0 {
+                            ok = false; break; // data must be writable for reads
+                        }
+                        if disk_offset + len as u64 > self.capacity * 512 {
+                            ok = false; break;
+                        }
+                        let mut buf = vec![0u8; len as usize];
+                        if self.disk_file.seek(SeekFrom::Start(disk_offset)).is_err() {
+                            ok = false; break;
+                        }
+                        if self.disk_file.read_exact(&mut buf).is_err() {
+                            ok = false; break;
+                        }
+                        if self.guest_mem.write(&buf, GuestAddress(addr)).is_err() {
+                            ok = false; break;
+                        }
+                        disk_offset += len as u64;
+                        total_written += len;
+                    }
+                    if ok { VIRTIO_BLK_S_OK } else { VIRTIO_BLK_S_IOERR }
+                }
+            }
+            VIRTIO_BLK_T_OUT => {
+                // Write from guest to disk
+                let mut disk_offset = sector * 512;
+                if sector >= self.capacity {
+                    VIRTIO_BLK_S_IOERR
+                } else {
+                    let mut ok = true;
+                    for &(addr, len, _flags) in data_descs {
+                        if disk_offset + len as u64 > self.capacity * 512 {
+                            ok = false; break;
+                        }
+                        let mut buf = vec![0u8; len as usize];
+                        if self.guest_mem.read(&mut buf, GuestAddress(addr)).is_err() {
+                            ok = false; break;
+                        }
+                        if self.disk_file.seek(SeekFrom::Start(disk_offset)).is_err() {
+                            ok = false; break;
+                        }
+                        if self.disk_file.write_all(&buf).is_err() {
+                            ok = false; break;
+                        }
+                        disk_offset += len as u64;
+                    }
+                    if ok { VIRTIO_BLK_S_OK } else { VIRTIO_BLK_S_IOERR }
+                }
+            }
+            VIRTIO_BLK_T_FLUSH => {
+                if self.disk_file.sync_all().is_ok() {
+                    VIRTIO_BLK_S_OK
+                } else {
+                    VIRTIO_BLK_S_IOERR
+                }
+            }
+            VIRTIO_BLK_T_GET_ID => {
+                // Write device ID string (up to 20 bytes) to data buffer
+                let id = b"virtio-blk-whp\0\0\0\0\0\0";
+                for &(addr, len, flags) in data_descs {
+                    if flags & VRING_DESC_F_WRITE != 0 {
+                        let write_len = (len as usize).min(id.len());
+                        let _ = self.guest_mem.write(&id[..write_len], GuestAddress(addr));
+                        total_written += write_len as u32;
+                    }
+                }
+                VIRTIO_BLK_S_OK
+            }
+            _ => VIRTIO_BLK_S_UNSUPP,
+        };
+
+        // Write status byte
+        let _ = self.guest_mem.write_obj(status, GuestAddress(status_addr));
+        total_written += 1; // status byte
+
+        total_written
+    }
+
+    fn write_status_byte(&self, descs: &[(u64, u32, u16)], status: u8) {
+        if let Some(&(addr, _, _)) = descs.last() {
+            let _ = self.guest_mem.write_obj(status, GuestAddress(addr));
+        }
+    }
+
+    /// Inject an interrupt via MSI-X (if enabled) or set ISR for polling.
+    fn inject_interrupt(&self) {
+        if !self.msix_enabled() || self.msix_function_masked() {
+            return;
+        }
+
+        let vector_idx = self.queue_msix_vector;
+        if vector_idx == VIRTIO_MSI_NO_VECTOR || vector_idx >= MSIX_TABLE_ENTRIES {
+            return;
+        }
+
+        // Read MSI-X table entry from guest memory (mapped as host page)
+        // Entry format: addr_lo(4) + addr_hi(4) + data(4) + vector_ctrl(4)
+        let entry_offset = (vector_idx as usize) * 16;
+        let (addr_lo, data, vector_ctrl) = unsafe {
+            let entry = self.msix_table_host.add(entry_offset);
+            let a = std::ptr::read_unaligned(entry as *const u32);
+            let d = std::ptr::read_unaligned(entry.add(8) as *const u32);
+            let c = std::ptr::read_unaligned(entry.add(12) as *const u32);
+            (a, d, c)
+        };
+
+        // Check if this entry is masked
+        if vector_ctrl & 1 != 0 {
+            return;
+        }
+
+        let vector = (data & 0xFF) as u8;
+        let destination = (addr_lo >> 12) & 0xFF;
+
+        if vector == 0 { return; }
+
+        use hypervisor::whp::WhpVm;
+        if let Some(whp) = self.vm.as_any().downcast_ref::<WhpVm>() {
+            let _ = whp.request_interrupt(vector, destination);
+        }
+    }
+}
+
+fn align_up(val: u64, align: u64) -> u64 {
+    (val + align - 1) & !(align - 1)
+}
+
 // ── VmOps: serial I/O handler ────────────────────────────────────────────────
 
 struct SerialVmOps {
@@ -1239,38 +1957,51 @@ struct SerialVmOps {
     /// Tracks the start time for PIT counter decrement emulation.
     pit_start: std::time::Instant,
     /// PIT counter 2 reload value.
-    pit_reload: std::sync::atomic::AtomicU16,
+    pit_reload: AtomicU16,
     /// Port 0x61 (NMI Status and Control) register value.
-    port61: std::sync::atomic::AtomicU8,
+    port61: AtomicU8,
     /// Serial IER (Interrupt Enable Register) at port 0x3F9.
-    serial_ier: std::sync::atomic::AtomicU8,
+    serial_ier: AtomicU8,
     /// Serial interrupt pending flag (set when THRE interrupt should fire).
-    serial_thre_pending: std::sync::atomic::AtomicBool,
+    serial_thre_pending: AtomicBool,
     /// PIC master IMR (port 0x21) — track writes for probe detection.
-    pic_master_imr: std::sync::atomic::AtomicU8,
+    pic_master_imr: AtomicU8,
     /// PIC slave IMR (port 0xA1).
-    pic_slave_imr: std::sync::atomic::AtomicU8,
+    pic_slave_imr: AtomicU8,
     /// Real IOAPIC device for interrupt routing.
     ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>>,
     /// VM reference for interrupt injection from PIO handler.
     vm: Option<Arc<dyn hypervisor::Vm>>,
+    /// PCI config address register (port 0xCF8).
+    pci_config_address: AtomicU32,
+    /// PCI virtio-blk device.
+    pci_blk: Option<Arc<Mutex<PciBlkDevice>>>,
+    /// Host bridge config space (static).
+    host_bridge_config: [u8; 256],
 }
 
 impl SerialVmOps {
-    fn new(ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>>, vm: Option<Arc<dyn hypervisor::Vm>>) -> Self {
+    fn new(
+        ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>>,
+        vm: Option<Arc<dyn hypervisor::Vm>>,
+        pci_blk: Option<Arc<Mutex<PciBlkDevice>>>,
+    ) -> Self {
         SerialVmOps {
             input: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seen_ports: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             debug: std::env::var("CH_DEBUG").is_ok(),
             pit_start: std::time::Instant::now(),
-            pit_reload: std::sync::atomic::AtomicU16::new(0xFFFF),
-            port61: std::sync::atomic::AtomicU8::new(0),
-            serial_ier: std::sync::atomic::AtomicU8::new(0),
-            serial_thre_pending: std::sync::atomic::AtomicBool::new(false),
-            pic_master_imr: std::sync::atomic::AtomicU8::new(0xFF),
-            pic_slave_imr: std::sync::atomic::AtomicU8::new(0xFF),
+            pit_reload: AtomicU16::new(0xFFFF),
+            port61: AtomicU8::new(0),
+            serial_ier: AtomicU8::new(0),
+            serial_thre_pending: AtomicBool::new(false),
+            pic_master_imr: AtomicU8::new(0xFF),
+            pic_slave_imr: AtomicU8::new(0xFF),
             ioapic,
             vm,
+            pci_config_address: AtomicU32::new(0),
+            pci_blk,
+            host_bridge_config: host_bridge_config(),
         }
     }
 
@@ -1348,11 +2079,10 @@ impl VmOps for SerialVmOps {
             }
             // Serial IER (Interrupt Enable Register) — read back
             0x3F9 => {
-                data[0] = self.serial_ier.load(std::sync::atomic::Ordering::Relaxed);
+                data[0] = self.serial_ier.load(Ordering::Relaxed);
             }
             // Serial IIR (Interrupt Identification Register)
             0x3FA => {
-                use std::sync::atomic::Ordering;
                 let ier = self.serial_ier.load(Ordering::Relaxed);
                 if self.serial_thre_pending.load(Ordering::Relaxed) && (ier & 0x02) != 0 {
                     // THRE interrupt pending
@@ -1378,7 +2108,6 @@ impl VmOps for SerialVmOps {
             }
             // PIT counter 2 data port — return simulated decrementing counter
             0x42 => {
-                use std::sync::atomic::Ordering;
                 // PIT runs at ~1.193182 MHz. Simulate counter decrement based on elapsed time.
                 let elapsed_us = self.pit_start.elapsed().as_micros() as u64;
                 // ~1.19 ticks per microsecond
@@ -1394,7 +2123,6 @@ impl VmOps for SerialVmOps {
             // Port 0x61: NMI Status and Control Register
             // Bit 5 = Timer Counter 2 output (toggles based on PIT counter 2)
             0x61 => {
-                use std::sync::atomic::Ordering;
                 let val = self.port61.load(Ordering::Relaxed);
                 let elapsed_us = self.pit_start.elapsed().as_micros() as u64;
                 let reload = self.pit_reload.load(Ordering::Relaxed) as u64;
@@ -1411,13 +2139,78 @@ impl VmOps for SerialVmOps {
             // PIC (8259) emulation — track IMR for probe detection
             0x20 => { data[0] = 0x00; } // Master PIC CMD: IRR = no pending
             0x21 => {
-                data[0] = self.pic_master_imr.load(std::sync::atomic::Ordering::Relaxed);
+                data[0] = self.pic_master_imr.load(Ordering::Relaxed);
             }
             0xA0 => { data[0] = 0x00; } // Slave PIC CMD
             0xA1 => {
-                data[0] = self.pic_slave_imr.load(std::sync::atomic::Ordering::Relaxed);
+                data[0] = self.pic_slave_imr.load(Ordering::Relaxed);
             }
-            _ => data.fill(0xFF),
+            // PCI Config Address port
+            0xCF8..=0xCFB => {
+                let addr = self.pci_config_address.load(Ordering::Relaxed);
+                let off = (port - 0xCF8) as usize;
+                for (i, d) in data.iter_mut().enumerate() {
+                    let pos = off + i;
+                    if pos < 4 {
+                        *d = (addr >> (pos * 8)) as u8;
+                    }
+                }
+            }
+            // PCI Config Data port
+            0xCFC..=0xCFF => {
+                let config_addr = self.pci_config_address.load(Ordering::Relaxed);
+                let enabled = (config_addr & 0x8000_0000) != 0;
+                if !enabled {
+                    data.fill(0xFF);
+                } else {
+                    let bus = (config_addr >> 16) & 0xFF;
+                    let device = (config_addr >> 11) & 0x1F;
+                    let function = (config_addr >> 8) & 0x07;
+                    let reg = ((config_addr >> 2) & 0x3F) as usize;
+
+                    if bus != 0 || function != 0 {
+                        data.fill(0xFF);
+                    } else {
+                        let reg_val = match device {
+                            PCI_HOST_BRIDGE_SLOT => {
+                                if reg < 64 {
+                                    u32::from_le_bytes(self.host_bridge_config[reg*4..reg*4+4].try_into().unwrap())
+                                } else {
+                                    0xFFFFFFFF
+                                }
+                            }
+                            PCI_BLK_SLOT => {
+                                if let Some(ref blk) = self.pci_blk {
+                                    blk.lock().unwrap().read_config(reg)
+                                } else {
+                                    0xFFFFFFFF
+                                }
+                            }
+                            _ => 0xFFFFFFFF,
+                        };
+                        let byte_off = (port - 0xCFC) as usize;
+                        for (i, d) in data.iter_mut().enumerate() {
+                            let pos = byte_off + i;
+                            if pos < 4 {
+                                *d = (reg_val >> (pos * 8)) as u8;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Check if port is in the virtio-blk I/O BAR range
+                if let Some(ref blk) = self.pci_blk {
+                    let mut blk = blk.lock().unwrap();
+                    let bar_base = blk.io_bar_base as u64;
+                    let bar_end = bar_base + VIRTIO_BLK_IO_BAR_SIZE as u64;
+                    if port >= bar_base && port < bar_end {
+                        blk.io_read((port - bar_base) as u16, data);
+                        return Ok(());
+                    }
+                }
+                data.fill(0xFF);
+            }
         }
         Ok(())
     }
@@ -1428,55 +2221,96 @@ impl VmOps for SerialVmOps {
                 eprintln!("[PIO] write port {port:#X} data={data:02X?}");
             }
         }
-        if port == SERIAL_PORT && !data.is_empty() {
-            let ch = data[0];
-            if ch.is_ascii() {
-                print!("{}", ch as char);
-            }
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-            // After writing data, THRE becomes empty → inject serial IRQ
-            let ier = self.serial_ier.load(std::sync::atomic::Ordering::Relaxed);
-            if (ier & 0x02) != 0 {
-                self.serial_thre_pending.store(true, std::sync::atomic::Ordering::Relaxed);
-                if let Some(ref vm) = self.vm {
-                    use hypervisor::whp::WhpVm;
-                    if let Some(whp) = vm.as_any().downcast_ref::<WhpVm>() {
-                        let _ = whp.request_interrupt(0x24, 0); // THRE → IRQ 4
+        match port {
+            p if p == SERIAL_PORT && !data.is_empty() => {
+                let ch = data[0];
+                if ch.is_ascii() {
+                    print!("{}", ch as char);
+                }
+                let _ = std::io::stdout().flush();
+                let ier = self.serial_ier.load(Ordering::Relaxed);
+                if (ier & 0x02) != 0 {
+                    self.serial_thre_pending.store(true, Ordering::Relaxed);
+                    if let Some(ref vm) = self.vm {
+                        use hypervisor::whp::WhpVm;
+                        if let Some(whp) = vm.as_any().downcast_ref::<WhpVm>() {
+                            let _ = whp.request_interrupt(0x24, 0);
+                        }
                     }
                 }
             }
-        } else if port == 0x3F9 && !data.is_empty() {
-            // IER write — track and inject serial IRQ if THRI enabled
-            let old_ier = self.serial_ier.load(std::sync::atomic::Ordering::Relaxed);
-            self.serial_ier.store(data[0], std::sync::atomic::Ordering::Relaxed);
-            // If THRI bit (bit 1) just became set, inject serial IRQ 4 (vector 0x24)
-            if (data[0] & 0x02) != 0 && (old_ier & 0x02) == 0 {
-                if let Some(ref vm) = self.vm {
-                    use hypervisor::whp::WhpVm;
-                    if let Some(whp) = vm.as_any().downcast_ref::<WhpVm>() {
-                        let _ = whp.request_interrupt(0x24, 0); // IRQ 4 → vector 0x24
+            0x3F9 if !data.is_empty() => {
+                let old_ier = self.serial_ier.load(Ordering::Relaxed);
+                self.serial_ier.store(data[0], Ordering::Relaxed);
+                if (data[0] & 0x02) != 0 && (old_ier & 0x02) == 0 {
+                    if let Some(ref vm) = self.vm {
+                        use hypervisor::whp::WhpVm;
+                        if let Some(whp) = vm.as_any().downcast_ref::<WhpVm>() {
+                            let _ = whp.request_interrupt(0x24, 0);
+                        }
                     }
                 }
             }
-        } else if port == DEBUG_EXIT_PORT {
-            println!();
-            println!("--- Guest requested shutdown ---");
-            std::process::exit(0);
-        } else if port == 0x42 && !data.is_empty() {
-            // PIT counter 2 data — reload value
-            use std::sync::atomic::Ordering;
-            self.pit_reload.store(data[0] as u16, Ordering::Relaxed);
-        } else if port == 0x61 && !data.is_empty() {
-            // NMI Status and Control
-            use std::sync::atomic::Ordering;
-            self.port61.store(data[0], Ordering::Relaxed);
-        } else if port == 0x21 && !data.is_empty() {
-            // PIC master IMR write
-            self.pic_master_imr.store(data[0], std::sync::atomic::Ordering::Relaxed);
-        } else if port == 0xA1 && !data.is_empty() {
-            // PIC slave IMR write
-            self.pic_slave_imr.store(data[0], std::sync::atomic::Ordering::Relaxed);
+            p if p == DEBUG_EXIT_PORT => {
+                println!();
+                println!("--- Guest requested shutdown ---");
+                std::process::exit(0);
+            }
+            0x42 if !data.is_empty() => {
+                self.pit_reload.store(data[0] as u16, Ordering::Relaxed);
+            }
+            0x61 if !data.is_empty() => {
+                self.port61.store(data[0], Ordering::Relaxed);
+            }
+            0x21 if !data.is_empty() => {
+                self.pic_master_imr.store(data[0], Ordering::Relaxed);
+            }
+            0xA1 if !data.is_empty() => {
+                self.pic_slave_imr.store(data[0], Ordering::Relaxed);
+            }
+            // PCI Config Address port
+            0xCF8..=0xCFB => {
+                let mut addr = self.pci_config_address.load(Ordering::Relaxed);
+                let off = (port - 0xCF8) as usize;
+                for (i, &b) in data.iter().enumerate() {
+                    let pos = off + i;
+                    if pos < 4 {
+                        addr = (addr & !(0xFF << (pos * 8))) | ((b as u32) << (pos * 8));
+                    }
+                }
+                self.pci_config_address.store(addr, Ordering::Relaxed);
+            }
+            // PCI Config Data port
+            0xCFC..=0xCFF => {
+                let config_addr = self.pci_config_address.load(Ordering::Relaxed);
+                let enabled = (config_addr & 0x8000_0000) != 0;
+                if !enabled { return Ok(()); }
+
+                let bus = (config_addr >> 16) & 0xFF;
+                let device = (config_addr >> 11) & 0x1F;
+                let function = (config_addr >> 8) & 0x07;
+                let reg = ((config_addr >> 2) & 0x3F) as usize;
+                let byte_off = port - 0xCFC;
+
+                if bus == 0 && function == 0 && device == PCI_BLK_SLOT {
+                    if let Some(ref blk) = self.pci_blk {
+                        blk.lock().unwrap().write_config(reg, byte_off, data);
+                    }
+                }
+                // Host bridge config writes are ignored (read-only)
+            }
+            _ => {
+                // Check if port is in the virtio-blk I/O BAR range
+                if let Some(ref blk) = self.pci_blk {
+                    let mut blk = blk.lock().unwrap();
+                    let bar_base = blk.io_bar_base as u64;
+                    let bar_end = bar_base + VIRTIO_BLK_IO_BAR_SIZE as u64;
+                    if port >= bar_base && port < bar_end {
+                        blk.io_write((port - bar_base) as u16, data);
+                        return Ok(());
+                    }
+                }
+            }
         }
         Ok(())
     }
