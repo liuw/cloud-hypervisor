@@ -16,6 +16,7 @@ pub mod terminal;
 pub mod timer;
 
 pub use event_fd::EventFd;
+pub use terminal::{TerminalState, is_terminal, restore_terminal_state, save_terminal_state, set_raw_mode};
 
 /// Constant matching Linux `EFD_NONBLOCK` for use in `EventFd::new()`.
 /// Value 0x800 mirrors the Linux definition; on Windows this is interpreted

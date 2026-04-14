@@ -2304,7 +2304,7 @@ impl VmOps for SerialVmOps {
             p if p == DEBUG_EXIT_PORT => {
                 // Signal shutdown via error; the run loop will break and
                 // terminal state will be properly restored.
-                return Err(HypervisorVmError::SetVcpuState(anyhow::anyhow!(
+                return Err(HypervisorVmError::IoBusWrite(anyhow::anyhow!(
                     "Guest requested shutdown via debug exit port"
                 )));
             }

@@ -17,7 +17,7 @@ mod gpio_pl061;
 mod i8042;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
-mod serial;
+pub mod serial;
 #[cfg(target_arch = "aarch64")]
 mod uart_pl011;
 
