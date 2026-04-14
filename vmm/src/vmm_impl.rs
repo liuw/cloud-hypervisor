@@ -1599,7 +1599,7 @@ impl Vmm {
     ) -> Result<()> {
         const POLL_EVENTS_LEN: usize = 100;
 
-        let mut events = vec![platform::PollEvent { data: 0 }; POLL_EVENTS_LEN];
+        let mut events = vec![platform::PollEvent { data: 0, raw_events: 0 }; POLL_EVENTS_LEN];
 
         'outer: loop {
             let num_events = match self.epoll.poll.wait(-1, &mut events[..]) {

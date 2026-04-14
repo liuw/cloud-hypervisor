@@ -224,7 +224,7 @@ impl RateLimiterGroup {
                 let res = std::panic::catch_unwind(AssertUnwindSafe(move || {
                     const POLL_EVENTS_LEN: usize = 2;
 
-                    let mut events = [PollEvent { data: 0 }; POLL_EVENTS_LEN];
+                    let mut events = [PollEvent { data: 0, raw_events: 0 }; POLL_EVENTS_LEN];
 
                     loop {
                         let num_events = match poll.wait(-1, &mut events[..]) {

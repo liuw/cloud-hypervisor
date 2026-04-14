@@ -8,19 +8,19 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
-use std::fs::File;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use log::info;
 use thiserror::Error;
-use platform::EventFd;
+use platform::{EventFd, EventPoll, PollEvent};
 
 pub struct EpollHelper {
     pause_evt: EventFd,
-    epoll_file: File,
+    poll: EventPoll,
 }
 
 #[derive(Error, Debug)]
@@ -46,36 +46,23 @@ pub const EPOLL_HELPER_EVENT_KILL: u16 = 1;
 pub const EPOLL_HELPER_EVENT_LAST: u16 = 15;
 
 pub trait EpollHelperHandler {
-    // Handle one event at a time. The EpollHelper iterates over a list of
-    // events that have been returned by epoll_wait(). For each event, the
-    // current method is invoked to let the implementation decide how to process
-    // the incoming event.
+    // Handle one event at a time.
     fn handle_event(
         &mut self,
         helper: &mut EpollHelper,
-        event: &epoll::Event,
+        event: &PollEvent,
     ) -> Result<(), EpollHelperError>;
 
-    // This method is only invoked if the EpollHelper was configured to call
-    // epoll_wait() with a valid timeout (different from -1), meaning the call
-    // won't block forever. When the timeout is reached, and if no even has been
-    // triggered, this function will be called to let the implementation decide
-    // how to interpret such situation. By default, it provides a no-op
-    // implementation.
+    // Called when epoll_wait times out (only if timeout != -1).
     fn handle_timeout(&mut self, _helper: &mut EpollHelper) -> Result<(), EpollHelperError> {
         Ok(())
     }
 
-    // In some situations, it might be useful to know the full list of events
-    // triggered while waiting on epoll_wait(). And having this list provided
-    // prior to the iterations over each event might help make some informed
-    // decisions. This function should not replace handle_event(), otherwise it
-    // would completely defeat the purpose of having the loop being factorized
-    // through the EpollHelper structure.
+    // Called with the full list of events before individual dispatch.
     fn event_list(
         &mut self,
         _helper: &mut EpollHelper,
-        _events: &[epoll::Event],
+        _events: &[PollEvent],
     ) -> Result<(), EpollHelperError> {
         Ok(())
     }
@@ -86,15 +73,11 @@ impl EpollHelper {
         kill_evt: &EventFd,
         pause_evt: &EventFd,
     ) -> std::result::Result<Self, EpollHelperError> {
-        // Create the epoll file descriptor
-        let epoll_fd = epoll::create(true).map_err(EpollHelperError::CreateFd)?;
-        // Use 'File' to enforce closing on 'epoll_fd'
-        // SAFETY: epoll_fd is a valid fd
-        let epoll_file = unsafe { File::from_raw_fd(epoll_fd) };
+        let poll = EventPoll::new().map_err(EpollHelperError::CreateFd)?;
 
         let mut helper = Self {
             pause_evt: pause_evt.try_clone().unwrap(),
-            epoll_file,
+            poll,
         };
 
         helper.add_event(kill_evt.as_raw_fd(), EPOLL_HELPER_EVENT_KILL)?;
@@ -112,13 +95,9 @@ impl EpollHelper {
         id: u16,
         evts: epoll::Events,
     ) -> std::result::Result<(), EpollHelperError> {
-        epoll::ctl(
-            self.epoll_file.as_raw_fd(),
-            epoll::ControlOptions::EPOLL_CTL_ADD,
-            fd,
-            epoll::Event::new(evts, id.into()),
-        )
-        .map_err(EpollHelperError::Ctl)
+        self.poll
+            .add_event_raw(fd, id.into(), evts)
+            .map_err(EpollHelperError::Ctl)
     }
 
     pub fn mod_event_custom(
@@ -127,13 +106,9 @@ impl EpollHelper {
         id: u16,
         evts: epoll::Events,
     ) -> std::result::Result<(), EpollHelperError> {
-        epoll::ctl(
-            self.epoll_file.as_raw_fd(),
-            epoll::ControlOptions::EPOLL_CTL_MOD,
-            fd,
-            epoll::Event::new(evts, id.into()),
-        )
-        .map_err(EpollHelperError::Ctl)
+        self.poll
+            .mod_event_raw(fd, id.into(), evts)
+            .map_err(EpollHelperError::Ctl)
     }
 
     pub fn del_event_custom(
@@ -142,13 +117,9 @@ impl EpollHelper {
         id: u16,
         evts: epoll::Events,
     ) -> std::result::Result<(), EpollHelperError> {
-        epoll::ctl(
-            self.epoll_file.as_raw_fd(),
-            epoll::ControlOptions::EPOLL_CTL_DEL,
-            fd,
-            epoll::Event::new(evts, id.into()),
-        )
-        .map_err(EpollHelperError::Ctl)
+        self.poll
+            .del_event_raw(fd, evts)
+            .map_err(EpollHelperError::Ctl)
     }
 
     pub fn run(
@@ -170,38 +141,26 @@ impl EpollHelper {
         enable_event_list: bool,
     ) -> std::result::Result<(), EpollHelperError> {
         const EPOLL_EVENTS_LEN: usize = 100;
-        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
+        let mut events = vec![PollEvent { data: 0, raw_events: 0 }; EPOLL_EVENTS_LEN];
 
         // Before jumping into the epoll loop, check if the device is expected
-        // to be in a paused state. This is helpful for the restore code path
-        // as the device thread should not start processing anything before the
-        // device has been resumed.
+        // to be in a paused state.
         while paused.load(Ordering::SeqCst) {
             thread::park();
         }
 
         loop {
-            let num_events =
-                match epoll::wait(self.epoll_file.as_raw_fd(), timeout, &mut events[..]) {
-                    Ok(res) => res,
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::Interrupted {
-                            // It's well defined from the epoll_wait() syscall
-                            // documentation that the epoll loop can be interrupted
-                            // before any of the requested events occurred or the
-                            // timeout expired. In both those cases, epoll_wait()
-                            // returns an error of type EINTR, but this should not
-                            // be considered as a regular error. Instead it is more
-                            // appropriate to retry, by calling into epoll_wait().
-                            continue;
-                        }
-                        return Err(EpollHelperError::Wait(e));
+            let num_events = match self.poll.wait(timeout, &mut events[..]) {
+                Ok(res) => res,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
                     }
-                };
+                    return Err(EpollHelperError::Wait(e));
+                }
+            };
 
             if num_events == 0 {
-                // This case happens when the timeout is reached before any of
-                // the registered events is triggered.
                 handler.handle_timeout(self)?;
                 continue;
             }
@@ -221,20 +180,12 @@ impl EpollHelper {
                     EPOLL_HELPER_EVENT_PAUSE => {
                         info!("PAUSE_EVENT received, pausing epoll loop");
 
-                        // Acknowledge the pause is effective by using the
-                        // paused_sync barrier.
                         paused_sync.wait();
 
-                        // We loop here to handle spurious park() returns.
-                        // Until we have not resumed, the paused boolean will
-                        // be true.
                         while paused.load(Ordering::SeqCst) {
                             thread::park();
                         }
 
-                        // Drain pause event after the device has been resumed.
-                        // This ensures the pause event has been seen by each
-                        // thread related to this virtio device.
                         let _ = self.pause_evt.read();
                     }
                     _ => {
@@ -246,8 +197,6 @@ impl EpollHelper {
     }
 
     #[cfg(fuzzing)]
-    // Require to have a 'queue_evt' being kicked before calling
-    // and return when no epoll events are active
     pub fn run_with_timeout(
         &mut self,
         paused: &AtomicBool,
@@ -257,27 +206,19 @@ impl EpollHelper {
         _enable_event_list: bool,
     ) -> std::result::Result<(), EpollHelperError> {
         const EPOLL_EVENTS_LEN: usize = 100;
-        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
+        let mut events = vec![PollEvent { data: 0, raw_events: 0 }; EPOLL_EVENTS_LEN];
 
         loop {
-            let num_events = match epoll::wait(self.epoll_file.as_raw_fd(), 0, &mut events[..]) {
+            let num_events = match self.poll.wait(0, &mut events[..]) {
                 Ok(res) => res,
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::Interrupted {
-                        // It's well defined from the epoll_wait() syscall
-                        // documentation that the epoll loop can be interrupted
-                        // before any of the requested events occurred or the
-                        // timeout expired. In both those cases, epoll_wait()
-                        // returns an error of type EINTR, but this should not
-                        // be considered as a regular error. Instead it is more
-                        // appropriate to retry, by calling into epoll_wait().
                         continue;
                     }
                     return Err(EpollHelperError::Wait(e));
                 }
             };
 
-            // Return when no epoll events are active
             if num_events == 0 {
                 return Ok(());
             }
@@ -292,21 +233,10 @@ impl EpollHelper {
                     }
                     EPOLL_HELPER_EVENT_PAUSE => {
                         info!("PAUSE_EVENT received, pausing epoll loop");
-
-                        // Acknowledge the pause is effective by using the
-                        // paused_sync barrier.
                         paused_sync.wait();
-
-                        // We loop here to handle spurious park() returns.
-                        // Until we have not resumed, the paused boolean will
-                        // be true.
                         while paused.load(Ordering::SeqCst) {
                             thread::park();
                         }
-
-                        // Drain pause event after the device has been resumed.
-                        // This ensures the pause event has been seen by each
-                        // thread related to this virtio device.
                         let _ = self.pause_evt.read();
                     }
                     _ => {
@@ -318,8 +248,9 @@ impl EpollHelper {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for EpollHelper {
     fn as_raw_fd(&self) -> RawFd {
-        self.epoll_file.as_raw_fd()
+        self.poll.as_raw_fd()
     }
 }

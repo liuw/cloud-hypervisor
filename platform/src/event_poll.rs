@@ -16,7 +16,22 @@ use std::io;
 pub struct PollEvent {
     /// User-defined token associated with this event source.
     pub data: u64,
+    /// Raw OS event flags (epoll events on Unix, 0 on Windows).
+    /// Use the `POLL_EVENT_*` constants to inspect these.
+    pub raw_events: u32,
 }
+
+/// Event source is readable.
+#[cfg(unix)]
+pub const POLL_EVENT_IN: u32 = libc::EPOLLIN as u32;
+/// Event source hung up.
+#[cfg(unix)]
+pub const POLL_EVENT_HUP: u32 = libc::EPOLLHUP as u32;
+
+#[cfg(target_os = "windows")]
+pub const POLL_EVENT_IN: u32 = 1;
+#[cfg(target_os = "windows")]
+pub const POLL_EVENT_HUP: u32 = 0;
 
 // ─── Unix implementation ─────────────────────────────────────────────────────
 
@@ -65,6 +80,36 @@ mod unix {
             )
         }
 
+        /// Register an event source by raw file descriptor with custom flags.
+        pub fn add_event_raw(&self, fd: RawFd, token: u64, events: epoll::Events) -> io::Result<()> {
+            epoll::ctl(
+                self.epoll_file.as_raw_fd(),
+                epoll::ControlOptions::EPOLL_CTL_ADD,
+                fd,
+                epoll::Event::new(events, token),
+            )
+        }
+
+        /// Modify event flags for a registered source.
+        pub fn mod_event_raw(&self, fd: RawFd, token: u64, events: epoll::Events) -> io::Result<()> {
+            epoll::ctl(
+                self.epoll_file.as_raw_fd(),
+                epoll::ControlOptions::EPOLL_CTL_MOD,
+                fd,
+                epoll::Event::new(events, token),
+            )
+        }
+
+        /// Remove an event source by raw file descriptor.
+        pub fn del_event_raw(&self, fd: RawFd, events: epoll::Events) -> io::Result<()> {
+            epoll::ctl(
+                self.epoll_file.as_raw_fd(),
+                epoll::ControlOptions::EPOLL_CTL_DEL,
+                fd,
+                epoll::Event::new(events, 0),
+            )
+        }
+
         /// Wait for events.
         ///
         /// Blocks until at least one registered source is ready, or the
@@ -82,6 +127,7 @@ mod unix {
             for i in 0..n {
                 events[i] = PollEvent {
                     data: epoll_events[i].data,
+                    raw_events: epoll_events[i].events as u32,
                 };
             }
 
@@ -190,6 +236,37 @@ mod win {
             }
         }
 
+        /// Register an event source by raw handle.
+        pub fn add_event_raw(&mut self, handle: RawHandle, token: u64) -> io::Result<()> {
+            if self.entries.len() >= MAX_EVENTS {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("EventPoll: too many events (max {})", MAX_EVENTS),
+                ));
+            }
+            self.entries.push(PollEntry {
+                handle: HANDLE(handle),
+                token,
+            });
+            Ok(())
+        }
+
+        /// Remove an event source by raw handle.
+        pub fn del_event_raw(&mut self, handle: RawHandle) -> io::Result<()> {
+            let h = HANDLE(handle);
+            let pos = self.entries.iter().position(|e| e.handle == h);
+            match pos {
+                Some(idx) => {
+                    self.entries.remove(idx);
+                    Ok(())
+                }
+                None => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "EventPoll: handle not found",
+                )),
+            }
+        }
+
         /// Wait for events.
         ///
         /// Blocks until at least one registered handle is signaled, or the
@@ -230,6 +307,7 @@ mod win {
             if count < events.len() {
                 events[count] = PollEvent {
                     data: self.entries[first_idx].token,
+                    raw_events: POLL_EVENT_IN,
                 };
                 count += 1;
             }
@@ -246,6 +324,7 @@ mod win {
                 if r == WAIT_OBJECT_0 {
                     events[count] = PollEvent {
                         data: entry.token,
+                        raw_events: POLL_EVENT_IN,
                     };
                     count += 1;
                 }
