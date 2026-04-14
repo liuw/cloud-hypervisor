@@ -365,6 +365,7 @@ pub fn run() -> anyhow::Result<()> {
     // queue_input_bytes() triggers an RX interrupt immediately, giving instant
     // response to keystrokes without waiting for the timer tick.
     let serial_for_stdin = serial.clone();
+    let vm_for_stdin = vm.clone();
     std::thread::Builder::new()
         .name("stdin-reader".to_string())
         .spawn(move || {
@@ -372,8 +373,18 @@ pub fn run() -> anyhow::Result<()> {
             let stdin = std::io::stdin();
             let mut buf = [0u8; 1];
             loop {
-                if stdin.lock().read(&mut buf).unwrap_or(0) > 0 {
-                    let _ = serial_for_stdin.lock().unwrap().queue_input_bytes(&buf);
+                match stdin.lock().read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let _ = serial_for_stdin.lock().unwrap().queue_input_bytes(&buf);
+                        // Cancel the vCPU run so it picks up the new data immediately
+                        // instead of waiting for the next natural PIO exit.
+                        use hypervisor::whp::WhpVm;
+                        if let Some(whp) = vm_for_stdin.as_any().downcast_ref::<WhpVm>() {
+                            let _ = whp.cancel_run(0);
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
         })
@@ -476,13 +487,13 @@ fn load_demo_payload(host_mem: *mut u8) -> u64 {
         0xB0, b'>', 0xEE,       // mov al,'>'; out dx,al
         0xB0, b' ', 0xEE,       // mov al,' '; out dx,al
 
-        // offset = 60 bytes (0x3C) — echo loop starts here
+        // offset = 63 bytes (0x3F) — echo loop starts here
         // Echo loop:
         //   wait for LSR bit 0 (data ready)
         0xBA, 0xFD, 0x03,       // mov dx, 0x3FD     ; LSR port
         0xEC,                   // in al, dx          ; read LSR
         0xA8, 0x01,             // test al, 1         ; bit 0 = data ready?
-        0x74, 0xFA,             // jz -6              ; loop back to "in al, dx"
+        0x74, 0xFB,             // jz -5              ; loop back to "in al, dx"
 
         //   read character
         0xBA, 0xF8, 0x03,       // mov dx, 0x3F8     ; data port
@@ -490,7 +501,7 @@ fn load_demo_payload(host_mem: *mut u8) -> u64 {
 
         //   check for Ctrl+C
         0x3C, 0x03,             // cmp al, 0x03
-        0x74, 0x0C,             // je shutdown (12 bytes forward)
+        0x74, 0x0A,             // je shutdown (10 bytes forward)
 
         //   echo character
         0xEE,                   // out dx, al
