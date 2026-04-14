@@ -40,7 +40,6 @@ use std::io;
 #[cfg(unix)]
 use crate::async_io::{self, BorrowedDiskFd};
 use crate::async_io::AsyncIo;
-#[cfg(unix)]
 use crate::error::{BlockError, BlockErrorKind};
 use crate::{BlockResult, DiskTopology};
 
@@ -246,5 +245,47 @@ impl DiskBackend {
             }),
             Self::Next(d) => d.resize(new_size),
         }
+    }
+}
+
+/// Windows version: wraps an AsyncDiskFile (no FullDiskFile/DiskFd needed).
+#[cfg(target_os = "windows")]
+pub enum DiskBackend {
+    Next(Box<dyn AsyncDiskFile>),
+}
+
+#[cfg(target_os = "windows")]
+impl DiskBackend {
+    pub fn logical_size(&mut self) -> BlockResult<u64> {
+        match self {
+            Self::Next(d) => d.logical_size(),
+        }
+    }
+
+    pub fn topology(&mut self) -> DiskTopology {
+        match self {
+            Self::Next(d) => d.topology(),
+        }
+    }
+
+    pub fn new_async_io(&self, ring_depth: u32) -> BlockResult<Box<dyn AsyncIo>> {
+        match self {
+            Self::Next(d) => d.new_async_io(ring_depth),
+        }
+    }
+
+    pub fn supports_sparse_operations(&self) -> bool {
+        false
+    }
+
+    pub fn supports_zero_flag(&self) -> bool {
+        false
+    }
+
+    pub fn resize(&mut self, _new_size: u64) -> BlockResult<()> {
+        Err(BlockError::new(
+            BlockErrorKind::UnsupportedFeature,
+            std::io::Error::other("resize not supported on Windows"),
+        ))
     }
 }
