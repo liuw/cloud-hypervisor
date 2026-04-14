@@ -219,6 +219,121 @@ impl_read_write_volatile_for_raw_fd!(std::os::unix::net::UnixStream);
 impl_read_write_volatile_for_raw_fd!(std::os::fd::OwnedFd);
 impl_read_write_volatile_for_raw_fd!(std::os::fd::BorrowedFd<'_>);
 
+// ── Windows implementations ─────────────────────────────────────────────────
+
+/// Reads from a Windows HANDLE into a volatile buffer using ReadFile.
+#[cfg(target_os = "windows")]
+fn read_volatile_handle(
+    handle: std::os::windows::io::RawHandle,
+    buf: &mut VolatileSlice<impl BitmapSlice>,
+) -> Result<usize, VolatileMemoryError> {
+    use std::os::windows::io::AsRawHandle;
+
+    let guard = buf.ptr_guard_mut();
+    let dst = guard.as_ptr();
+    let len = buf.len().min(u32::MAX as usize) as u32;
+    let mut bytes_read: u32 = 0;
+
+    // SAFETY: handle is valid, dst points to buf.len() bytes of writable memory.
+    let ok = unsafe {
+        winapi::um::fileapi::ReadFile(
+            handle as *mut _,
+            dst as *mut _,
+            len,
+            &mut bytes_read,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if ok == 0 {
+        buf.bitmap().mark_dirty(0, buf.len());
+        Err(VolatileMemoryError::IOError(std::io::Error::last_os_error()))
+    } else {
+        let n = bytes_read as usize;
+        buf.bitmap().mark_dirty(0, n);
+        Ok(n)
+    }
+}
+
+/// Writes from a volatile buffer to a Windows HANDLE using WriteFile.
+#[cfg(target_os = "windows")]
+fn write_volatile_handle(
+    handle: std::os::windows::io::RawHandle,
+    buf: &VolatileSlice<impl BitmapSlice>,
+) -> Result<usize, VolatileMemoryError> {
+    let guard = buf.ptr_guard();
+    let src = guard.as_ptr();
+    let len = buf.len().min(u32::MAX as usize) as u32;
+    let mut bytes_written: u32 = 0;
+
+    // SAFETY: handle is valid, src points to buf.len() bytes of readable memory.
+    let ok = unsafe {
+        winapi::um::fileapi::WriteFile(
+            handle as *mut _,
+            src as *const _,
+            len,
+            &mut bytes_written,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if ok == 0 {
+        Err(VolatileMemoryError::IOError(std::io::Error::last_os_error()))
+    } else {
+        Ok(bytes_written as usize)
+    }
+}
+
+macro_rules! impl_read_write_volatile_for_handle {
+    ($handle_ty:ty) => {
+        #[cfg(target_os = "windows")]
+        impl ReadVolatile for $handle_ty {
+            fn read_volatile<B: BitmapSlice>(
+                &mut self,
+                buf: &mut VolatileSlice<B>,
+            ) -> Result<usize, VolatileMemoryError> {
+                use std::os::windows::io::AsRawHandle;
+                read_volatile_handle(self.as_raw_handle(), buf)
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        impl ReadVolatile for &$handle_ty {
+            fn read_volatile<B: BitmapSlice>(
+                &mut self,
+                buf: &mut VolatileSlice<B>,
+            ) -> Result<usize, VolatileMemoryError> {
+                use std::os::windows::io::AsRawHandle;
+                read_volatile_handle(self.as_raw_handle(), buf)
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        impl WriteVolatile for $handle_ty {
+            fn write_volatile<B: BitmapSlice>(
+                &mut self,
+                buf: &VolatileSlice<B>,
+            ) -> Result<usize, VolatileMemoryError> {
+                use std::os::windows::io::AsRawHandle;
+                write_volatile_handle(self.as_raw_handle(), buf)
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        impl WriteVolatile for &$handle_ty {
+            fn write_volatile<B: BitmapSlice>(
+                &mut self,
+                buf: &VolatileSlice<B>,
+            ) -> Result<usize, VolatileMemoryError> {
+                use std::os::windows::io::AsRawHandle;
+                write_volatile_handle(self.as_raw_handle(), buf)
+            }
+        }
+    };
+}
+
+impl_read_write_volatile_for_handle!(std::fs::File);
+
 /// Tries to do a single `read` syscall on the provided file descriptor, storing the data raed in
 /// the given [`VolatileSlice`].
 ///
