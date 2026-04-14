@@ -8,7 +8,10 @@
 
 use std::fs::File;
 use std::mem::size_of;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier};
 use std::{io, result};
@@ -16,6 +19,7 @@ use std::{io, result};
 use anyhow::anyhow;
 use event_monitor::event;
 use log::{error, info};
+#[cfg(unix)]
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -34,8 +38,12 @@ use super::{
     EpollHelperHandler, Error as DeviceError, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1,
     VirtioCommon, VirtioDevice, VirtioDeviceType,
 };
+#[cfg(unix)]
 use crate::seccomp_filters::Thread;
+#[cfg(unix)]
 use crate::thread_helper::spawn_virtio_thread;
+#[cfg(target_os = "windows")]
+use crate::thread_helper::spawn_virtio_thread_simple;
 use crate::{GuestMemoryMmap, VirtioInterrupt, VirtioInterruptType};
 
 const QUEUE_SIZE: u16 = 256;
@@ -221,7 +229,10 @@ impl PmemEpollHandler {
         paused_sync: &Barrier,
     ) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
+        #[cfg(unix)]
         helper.add_event(self.queue_evt.as_raw_fd(), QUEUE_AVAIL_EVENT)?;
+        #[cfg(target_os = "windows")]
+        helper.add_event(self.queue_evt.as_raw_handle(), QUEUE_AVAIL_EVENT)?;
         helper.run(paused, paused_sync, self)?;
 
         Ok(())
@@ -267,6 +278,7 @@ pub struct Pmem {
     disk: Option<File>,
     config: VirtioPmemConfig,
     mapping: UserspaceMapping,
+    #[cfg(unix)]
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
 }
@@ -286,7 +298,7 @@ impl Pmem {
         addr: GuestAddress,
         mapping: UserspaceMapping,
         iommu: bool,
-        seccomp_action: SeccompAction,
+        #[cfg(unix)] seccomp_action: SeccompAction,
         exit_evt: EventFd,
         state: Option<PmemState>,
     ) -> io::Result<Pmem> {
@@ -327,6 +339,7 @@ impl Pmem {
             disk: Some(disk),
             config,
             mapping,
+            #[cfg(unix)]
             seccomp_action,
             exit_evt,
         })
@@ -409,10 +422,18 @@ impl VirtioDevice for Pmem {
             let paused_sync = self.common.paused_sync.clone();
             let mut epoll_threads = Vec::new();
 
+            #[cfg(unix)]
             spawn_virtio_thread(
                 &self.id,
                 &self.seccomp_action,
                 Thread::VirtioPmem,
+                &mut epoll_threads,
+                &self.exit_evt,
+                move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            )?;
+            #[cfg(target_os = "windows")]
+            spawn_virtio_thread_simple(
+                &self.id,
                 &mut epoll_threads,
                 &self.exit_evt,
                 move || handler.run(&paused, paused_sync.as_ref().unwrap()),

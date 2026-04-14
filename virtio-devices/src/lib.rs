@@ -24,14 +24,11 @@ pub mod block;
 #[cfg(unix)]
 mod console;
 pub mod epoll_helper;
-#[cfg(unix)]
 mod iommu;
 #[cfg(unix)]
 pub mod mem;
 #[cfg(unix)]
 pub mod net;
-#[cfg(unix)]
-#[cfg(unix)]
 mod pmem;
 mod rng;
 #[cfg(unix)]
@@ -65,13 +62,11 @@ pub use self::device::{
 pub use self::epoll_helper::{
     EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
 };
-#[cfg(unix)]
 pub use self::iommu::{AccessPlatformMapping, Iommu, IommuMapping};
 #[cfg(unix)]
 pub use self::mem::{BlocksState, Mem, VIRTIO_MEM_ALIGN_SIZE, VirtioMemMappingSource};
 #[cfg(unix)]
 pub use self::net::{Net, NetCtrlEpollHandler};
-#[cfg(unix)]
 pub use self::pmem::Pmem;
 pub use self::rng::Rng;
 #[cfg(unix)]

@@ -4,7 +4,10 @@
 
 use std::collections::BTreeMap;
 use std::mem::size_of;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::{io, result};
@@ -12,6 +15,7 @@ use std::{io, result};
 use anyhow::anyhow;
 use event_monitor::event;
 use log::{debug, error, info};
+#[cfg(unix)]
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -29,8 +33,12 @@ use super::{
     ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
     Error as DeviceError, VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice, VirtioDeviceType,
 };
+#[cfg(unix)]
 use crate::seccomp_filters::Thread;
+#[cfg(unix)]
 use crate::thread_helper::spawn_virtio_thread;
+#[cfg(target_os = "windows")]
+use crate::thread_helper::spawn_virtio_thread_simple;
 use crate::{DmaRemapping, GuestMemoryMmap, VirtioInterrupt, VirtioInterruptType};
 
 /// Queues sizes
@@ -731,7 +739,10 @@ impl IommuEpollHandler {
         paused_sync: &Barrier,
     ) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
+        #[cfg(unix)]
         helper.add_event(self.request_queue_evt.as_raw_fd(), REQUEST_Q_EVENT)?;
+        #[cfg(target_os = "windows")]
+        helper.add_event(self.request_queue_evt.as_raw_handle(), REQUEST_Q_EVENT)?;
         helper.run(paused, paused_sync, self)?;
 
         Ok(())
@@ -878,6 +889,7 @@ pub struct Iommu {
     config: VirtioIommuConfig,
     mapping: Arc<IommuMapping>,
     ext_mapping: Arc<Mutex<BTreeMap<u32, Arc<dyn ExternalDmaMapping>>>>,
+    #[cfg(unix)]
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
     msi_iova_space: (u64, u64),
@@ -897,7 +909,7 @@ pub struct IommuState {
 impl Iommu {
     pub fn new(
         id: String,
-        seccomp_action: SeccompAction,
+        #[cfg(unix)] seccomp_action: SeccompAction,
         exit_evt: EventFd,
         msi_iova_space: (u64, u64),
         address_width_bits: u8,
@@ -970,6 +982,7 @@ impl Iommu {
                 config,
                 mapping: mapping.clone(),
                 ext_mapping: Arc::new(Mutex::new(BTreeMap::new())),
+                #[cfg(unix)]
                 seccomp_action,
                 exit_evt,
                 msi_iova_space,
@@ -1105,10 +1118,18 @@ impl VirtioDevice for Iommu {
         let paused = self.common.paused.clone();
         let paused_sync = self.common.paused_sync.clone();
         let mut epoll_threads = Vec::new();
+        #[cfg(unix)]
         spawn_virtio_thread(
             &self.id,
             &self.seccomp_action,
             Thread::VirtioIommu,
+            &mut epoll_threads,
+            &self.exit_evt,
+            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+        )?;
+        #[cfg(target_os = "windows")]
+        spawn_virtio_thread_simple(
+            &self.id,
             &mut epoll_threads,
             &self.exit_evt,
             move || handler.run(&paused, paused_sync.as_ref().unwrap()),
