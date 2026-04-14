@@ -333,18 +333,14 @@ impl From<u64> for EpollDispatch {
 
 #[cfg(unix)]
 pub struct EpollContext {
-    epoll_file: File,
+    poll: platform::EventPoll,
 }
 
 #[cfg(unix)]
 impl EpollContext {
     pub fn new() -> result::Result<EpollContext, io::Error> {
-        let epoll_fd = epoll::create(true)?;
-        // Use 'File' to enforce closing on 'epoll_fd'
-        // SAFETY: the epoll_fd returned by epoll::create is valid and owned by us.
-        let epoll_file = unsafe { File::from_raw_fd(epoll_fd) };
-
-        Ok(EpollContext { epoll_file })
+        let poll = platform::EventPoll::new()?;
+        Ok(EpollContext { poll })
     }
 
     pub fn add_event<T>(&mut self, fd: &T, token: EpollDispatch) -> result::Result<(), io::Error>
@@ -352,14 +348,7 @@ impl EpollContext {
         T: AsRawFd,
     {
         let dispatch_index = token as u64;
-        epoll::ctl(
-            self.epoll_file.as_raw_fd(),
-            epoll::ControlOptions::EPOLL_CTL_ADD,
-            fd.as_raw_fd(),
-            epoll::Event::new(epoll::Events::EPOLLIN, dispatch_index),
-        )?;
-
-        Ok(())
+        self.poll.add_event(fd, dispatch_index)
     }
 
     #[cfg(fuzzing)]
@@ -373,7 +362,7 @@ impl EpollContext {
         T: AsRawFd,
     {
         epoll::ctl(
-            self.epoll_file.as_raw_fd(),
+            self.poll.as_raw_fd(),
             epoll::ControlOptions::EPOLL_CTL_ADD,
             fd.as_raw_fd(),
             epoll::Event::new(evts, id),
@@ -386,7 +375,7 @@ impl EpollContext {
 #[cfg(unix)]
 impl AsRawFd for EpollContext {
     fn as_raw_fd(&self) -> RawFd {
-        self.epoll_file.as_raw_fd()
+        self.poll.as_raw_fd()
     }
 }
 
@@ -1608,23 +1597,15 @@ impl Vmm {
         api_receiver: &Receiver<ApiRequest>,
         #[cfg(feature = "guest_debug")] gdb_receiver: &Receiver<gdb::GdbRequest>,
     ) -> Result<()> {
-        const EPOLL_EVENTS_LEN: usize = 100;
+        const POLL_EVENTS_LEN: usize = 100;
 
-        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
-        let epoll_fd = self.epoll.as_raw_fd();
+        let mut events = vec![platform::PollEvent { data: 0 }; POLL_EVENTS_LEN];
 
         'outer: loop {
-            let num_events = match epoll::wait(epoll_fd, -1, &mut events[..]) {
+            let num_events = match self.epoll.poll.wait(-1, &mut events[..]) {
                 Ok(res) => res,
                 Err(e) => {
                     if e.kind() == io::ErrorKind::Interrupted {
-                        // It's well defined from the epoll_wait() syscall
-                        // documentation that the epoll loop can be interrupted
-                        // before any of the requested events occurred or the
-                        // timeout expired. In both those cases, epoll_wait()
-                        // returns an error of type EINTR, but this should not
-                        // be considered as a regular error. Instead it is more
-                        // appropriate to retry, by calling into epoll_wait().
                         continue;
                     }
                     return Err(Error::Epoll(e));
