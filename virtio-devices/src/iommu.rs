@@ -742,7 +742,7 @@ impl EpollHelperHandler for IommuEpollHandler {
     fn handle_event(
         &mut self,
         _helper: &mut EpollHelper,
-        event: &epoll::Event,
+        event: &platform::PollEvent,
     ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {

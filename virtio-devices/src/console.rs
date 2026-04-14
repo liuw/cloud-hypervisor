@@ -306,9 +306,9 @@ impl ConsoleEpollHandler {
             helper.add_event(resize_pipe.as_raw_fd(), RESIZE_EVENT)?;
         }
         if let Some(in_file) = self.endpoint.in_file() {
-            let mut events = epoll::Events::EPOLLIN;
+            let mut events = platform::PollEvents::EPOLLIN;
             if self.endpoint.is_pty() {
-                events |= epoll::Events::EPOLLONESHOT;
+                events |= platform::PollEvents::EPOLLONESHOT;
             }
             helper.add_event_custom(in_file.as_raw_fd(), FILE_EVENT, events)?;
             self.file_event_registered = true;
@@ -359,7 +359,7 @@ impl ConsoleEpollHandler {
         helper.mod_event_custom(
             self.endpoint.in_file().unwrap().as_raw_fd(),
             FILE_EVENT,
-            epoll::Events::EPOLLIN | epoll::Events::EPOLLONESHOT,
+            platform::PollEvents::EPOLLIN | platform::PollEvents::EPOLLONESHOT,
         )?;
         self.file_event_registered = true;
 
@@ -371,7 +371,7 @@ impl EpollHelperHandler for ConsoleEpollHandler {
     fn handle_event(
         &mut self,
         helper: &mut EpollHelper,
-        event: &epoll::Event,
+        event: &platform::PollEvent,
     ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
 
@@ -425,7 +425,7 @@ impl EpollHelperHandler for ConsoleEpollHandler {
                 self.resizer.update_console_size();
             }
             FILE_EVENT => {
-                if event.events & libc::EPOLLIN as u32 != 0 {
+                if event.raw_events & libc::EPOLLIN as u32 != 0 {
                     let mut input = [0u8; 64];
                     if let Some(ref mut in_file) = self.endpoint.in_file() {
                         if let Ok(count) = in_file.read(&mut input) {
@@ -449,7 +449,7 @@ impl EpollHelperHandler for ConsoleEpollHandler {
                 }
                 if self.endpoint.is_pty() {
                     self.file_event_registered = false;
-                    if event.events & libc::EPOLLHUP as u32 != 0
+                    if event.raw_events & libc::EPOLLHUP as u32 != 0
                         && let Some(pty_write_out) = &self.write_out
                         && pty_write_out.load(Ordering::Acquire)
                     {
@@ -503,11 +503,11 @@ impl EpollHelperHandler for ConsoleEpollHandler {
     fn event_list(
         &mut self,
         helper: &mut EpollHelper,
-        events: &[epoll::Event],
+        events: &[platform::PollEvent],
     ) -> Result<(), EpollHelperError> {
         if self.file_event_registered {
             for event in events {
-                if event.data as u16 == FILE_EVENT && (event.events & libc::EPOLLHUP as u32) != 0 {
+                if event.data as u16 == FILE_EVENT && (event.raw_events & libc::EPOLLHUP as u32) != 0 {
                     return Ok(());
                 }
             }

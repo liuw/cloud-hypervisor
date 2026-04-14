@@ -231,9 +231,9 @@ where
     fn handle_event(
         &mut self,
         _helper: &mut EpollHelper,
-        event: &epoll::Event,
+        event: &platform::PollEvent,
     ) -> result::Result<(), EpollHelperError> {
-        let evset = match epoll::Events::from_bits(event.events) {
+        let evset = match platform::PollEvents::from_bits(event.events) {
             Some(evset) => evset,
             None => {
                 let evbits = event.events;
@@ -724,8 +724,8 @@ mod unit_tests {
             let test_ctx = TestContext::new();
             let mut ctx = test_ctx.create_epoll_handler_context();
 
-            let events = epoll::Events::EPOLLIN;
-            let event = epoll::Event::new(events, TX_QUEUE_EVENT as u64);
+            let events = platform::PollEvents::EPOLLIN;
+            let event = platform::PollEvent::new(events, TX_QUEUE_EVENT as u64);
             let mut epoll_helper =
                 EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
 
@@ -792,8 +792,8 @@ mod unit_tests {
             let mut ctx = test_ctx.create_epoll_handler_context();
             ctx.handler.backend.write().unwrap().set_pending_rx(false);
 
-            let events = epoll::Events::EPOLLIN;
-            let event = epoll::Event::new(events, RX_QUEUE_EVENT as u64);
+            let events = platform::PollEvents::EPOLLIN;
+            let event = platform::PollEvent::new(events, RX_QUEUE_EVENT as u64);
             let mut epoll_helper =
                 EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
 
@@ -812,8 +812,8 @@ mod unit_tests {
             let mut ctx = test_ctx.create_epoll_handler_context();
             ctx.handler.backend.write().unwrap().set_pending_rx(false);
 
-            let events = epoll::Events::EPOLLIN;
-            let event = epoll::Event::new(events, EVT_QUEUE_EVENT as u64);
+            let events = platform::PollEvents::EPOLLIN;
+            let event = platform::PollEvent::new(events, EVT_QUEUE_EVENT as u64);
             let mut epoll_helper =
                 EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
 
@@ -836,8 +836,8 @@ mod unit_tests {
 
             ctx.handler.backend.write().unwrap().set_pending_rx(true);
 
-            let events = epoll::Events::EPOLLIN;
-            let event = epoll::Event::new(events, BACKEND_EVENT as u64);
+            let events = platform::PollEvents::EPOLLIN;
+            let event = platform::PollEvent::new(events, BACKEND_EVENT as u64);
             let mut epoll_helper =
                 EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
             ctx.handler.handle_event(&mut epoll_helper, &event).unwrap();
@@ -845,7 +845,7 @@ mod unit_tests {
             // The backend should've received this event.
             assert_eq!(
                 ctx.handler.backend.read().unwrap().evset,
-                Some(epoll::Events::EPOLLIN)
+                Some(platform::PollEvents::EPOLLIN)
             );
             // TX queue processing should've been triggered.
             assert_eq!(ctx.guest_txvq.used.idx.get(), 1);
@@ -862,8 +862,8 @@ mod unit_tests {
 
             ctx.handler.backend.write().unwrap().set_pending_rx(false);
 
-            let events = epoll::Events::EPOLLIN;
-            let event = epoll::Event::new(events, BACKEND_EVENT as u64);
+            let events = platform::PollEvents::EPOLLIN;
+            let event = platform::PollEvent::new(events, BACKEND_EVENT as u64);
             let mut epoll_helper =
                 EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
             ctx.handler.handle_event(&mut epoll_helper, &event).unwrap();
@@ -871,7 +871,7 @@ mod unit_tests {
             // The backend should've received this event.
             assert_eq!(
                 ctx.handler.backend.read().unwrap().evset,
-                Some(epoll::Events::EPOLLIN)
+                Some(platform::PollEvents::EPOLLIN)
             );
             // TX queue processing should've been triggered.
             assert_eq!(ctx.guest_txvq.used.idx.get(), 1);
@@ -885,8 +885,8 @@ mod unit_tests {
         let test_ctx = TestContext::new();
         let mut ctx = test_ctx.create_epoll_handler_context();
 
-        let events = epoll::Events::EPOLLIN;
-        let event = epoll::Event::new(events, 0xff);
+        let events = platform::PollEvents::EPOLLIN;
+        let event = platform::PollEvent::new(events, 0xff);
         let mut epoll_helper =
             EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
 

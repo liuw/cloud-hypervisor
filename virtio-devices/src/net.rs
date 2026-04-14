@@ -90,7 +90,7 @@ impl EpollHelperHandler for NetCtrlEpollHandler {
     fn handle_event(
         &mut self,
         _helper: &mut EpollHelper,
-        event: &epoll::Event,
+        event: &platform::PollEvent,
     ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {
@@ -214,7 +214,7 @@ impl NetEpollHandler {
             net_util::register_listener(
                 self.net.epoll_fd.unwrap(),
                 self.net.tap.as_raw_fd(),
-                epoll::Events::EPOLLIN,
+                platform::PollEvents::EPOLLIN,
                 u64::from(self.net.tap_rx_event_id),
             )
             .map_err(DeviceError::IoError)?;
@@ -356,7 +356,7 @@ impl EpollHelperHandler for NetEpollHandler {
     fn handle_event(
         &mut self,
         _helper: &mut EpollHelper,
-        event: &epoll::Event,
+        event: &platform::PollEvent,
     ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {
@@ -402,7 +402,7 @@ impl EpollHelperHandler for NetEpollHandler {
                         net_util::register_listener(
                             self.net.epoll_fd.unwrap(),
                             self.net.tap.as_raw_fd(),
-                            epoll::Events::EPOLLIN,
+                            platform::PollEvents::EPOLLIN,
                             u64::from(self.net.tap_rx_event_id),
                         )
                         .map_err(|e| {

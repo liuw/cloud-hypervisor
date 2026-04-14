@@ -125,10 +125,10 @@ pub trait VsockEpollListener {
     fn get_polled_fd(&self) -> RawFd;
 
     /// Get the set of events for which the listener wants to be notified.
-    fn get_polled_evset(&self) -> epoll::Events;
+    fn get_polled_evset(&self) -> platform::PollEvents;
 
     /// Notify the listener that one or more events have occurred.
-    fn notify(&mut self, evset: epoll::Events);
+    fn notify(&mut self, evset: platform::PollEvents);
 }
 
 /// Trait to describe any channel that handles vsock packet traffic (sending and receiving packets)
@@ -211,7 +211,7 @@ pub mod unit_tests {
         pub pending_rx: bool,
         pub rx_ok_cnt: usize,
         pub tx_ok_cnt: usize,
-        pub evset: Option<epoll::Events>,
+        pub evset: Option<platform::PollEvents>,
     }
     impl TestBackend {
         #[allow(clippy::new_without_default)]
@@ -263,10 +263,10 @@ pub mod unit_tests {
         fn get_polled_fd(&self) -> RawFd {
             self.evfd.as_raw_fd()
         }
-        fn get_polled_evset(&self) -> epoll::Events {
-            epoll::Events::EPOLLIN
+        fn get_polled_evset(&self) -> platform::PollEvents {
+            platform::PollEvents::EPOLLIN
         }
-        fn notify(&mut self, evset: epoll::Events) {
+        fn notify(&mut self, evset: platform::PollEvents) {
             self.evset = Some(evset);
         }
     }
@@ -368,16 +368,16 @@ pub mod unit_tests {
     impl EpollHandlerContext<'_> {
         pub fn signal_txq_event(&mut self) {
             self.handler.queue_evts[1].write(1).unwrap();
-            let events = epoll::Events::EPOLLIN;
-            let event = epoll::Event::new(events, TX_QUEUE_EVENT as u64);
+            let events = platform::PollEvents::EPOLLIN;
+            let event = platform::PollEvent::new(events, TX_QUEUE_EVENT as u64);
             let mut epoll_helper =
                 EpollHelper::new(&self.handler.kill_evt, &self.handler.pause_evt).unwrap();
             self.handler.handle_event(&mut epoll_helper, &event).ok();
         }
         pub fn signal_rxq_event(&mut self) {
             self.handler.queue_evts[0].write(1).unwrap();
-            let events = epoll::Events::EPOLLIN;
-            let event = epoll::Event::new(events, RX_QUEUE_EVENT as u64);
+            let events = platform::PollEvents::EPOLLIN;
+            let event = platform::PollEvent::new(events, RX_QUEUE_EVENT as u64);
             let mut epoll_helper =
                 EpollHelper::new(&self.handler.kill_evt, &self.handler.pause_evt).unwrap();
             self.handler.handle_event(&mut epoll_helper, &event).ok();

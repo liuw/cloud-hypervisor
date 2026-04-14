@@ -204,7 +204,7 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
         helper.add_event_custom(
             self.vu.lock().unwrap().socket_handle().as_raw_fd(),
             HUP_CONNECTION_EVENT,
-            epoll::Events::EPOLLHUP,
+            platform::PollEvents::EPOLLHUP,
         )?;
 
         if let Some(backend_req_handler) = &self.backend_req_handler {
@@ -220,7 +220,7 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
         helper.del_event_custom(
             self.vu.lock().unwrap().socket_handle().as_raw_fd(),
             HUP_CONNECTION_EVENT,
-            epoll::Events::EPOLLHUP,
+            platform::PollEvents::EPOLLHUP,
         )?;
 
         let mut vhost_user = VhostUserHandle::connect_vhost_user(
@@ -260,7 +260,7 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
         helper.add_event_custom(
             vhost_user.socket_handle().as_raw_fd(),
             HUP_CONNECTION_EVENT,
-            epoll::Events::EPOLLHUP,
+            platform::PollEvents::EPOLLHUP,
         )?;
 
         // Update vhost-user reference
@@ -275,7 +275,7 @@ impl<S: VhostUserFrontendReqHandler> EpollHelperHandler for VhostUserEpollHandle
     fn handle_event(
         &mut self,
         helper: &mut EpollHelper,
-        event: &epoll::Event,
+        event: &platform::PollEvent,
     ) -> std::result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {

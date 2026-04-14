@@ -84,7 +84,7 @@ enum EpollListener {
     /// be forwarded to the listener via `VsockEpollListener::notify()`.
     Connection {
         key: ConnMapKey,
-        evset: epoll::Events,
+        evset: platform::PollEvents,
     },
     /// A listener interested in new host-initiated connections.
     HostSock,
@@ -303,16 +303,16 @@ impl VsockEpollListener for VsockMuxer {
     /// Since the polled FD is a nested epoll FD, we're only interested in EPOLLIN events (i.e.
     /// some event occurred on one of the FDs registered under our epoll FD).
     ///
-    fn get_polled_evset(&self) -> epoll::Events {
-        epoll::Events::EPOLLIN
+    fn get_polled_evset(&self) -> platform::PollEvents {
+        platform::PollEvents::EPOLLIN
     }
 
     /// Notify the muxer about a pending event having occurred under its nested epoll FD.
     ///
-    fn notify(&mut self, _: epoll::Events) {
+    fn notify(&mut self, _: platform::PollEvents) {
         debug!("vsock: muxer received kick");
 
-        let mut epoll_events = vec![epoll::Event::new(epoll::Events::empty(), 0); 32];
+        let mut epoll_events = vec![platform::PollEvent::new(platform::PollEvents::empty(), 0); 32];
         'epoll: loop {
             match epoll::wait(self.epoll_file.as_raw_fd(), 0, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
@@ -322,7 +322,7 @@ impl VsockEpollListener for VsockMuxer {
                             // It's ok to unwrap here, since the `evt.events` is filled
                             // in by `epoll::wait()`, and therefore contains only valid epoll
                             // flags.
-                            epoll::Events::from_bits(evt.events).unwrap(),
+                            platform::PollEvents::from_bits(evt.events).unwrap(),
                         );
                     }
                 }
@@ -400,7 +400,7 @@ impl VsockMuxer {
 
     /// Handle/dispatch an epoll event to its listener.
     ///
-    fn handle_event(&mut self, fd: RawFd, event_set: epoll::Events) {
+    fn handle_event(&mut self, fd: RawFd, event_set: platform::PollEvents) {
         debug!("vsock: muxer processing event: fd={fd}, event_set={event_set:?}");
 
         match self.listener_map.get_mut(&fd) {
@@ -643,15 +643,15 @@ impl VsockMuxer {
     fn add_listener(&mut self, fd: RawFd, listener: EpollListener) -> Result<()> {
         let evset = match listener {
             EpollListener::Connection { evset, .. } => evset,
-            EpollListener::LocalStream(_) => epoll::Events::EPOLLIN,
-            EpollListener::HostSock => epoll::Events::EPOLLIN,
+            EpollListener::LocalStream(_) => platform::PollEvents::EPOLLIN,
+            EpollListener::HostSock => platform::PollEvents::EPOLLIN,
         };
 
         epoll::ctl(
             self.epoll_file.as_raw_fd(),
             epoll::ControlOptions::EPOLL_CTL_ADD,
             fd,
-            epoll::Event::new(evset, fd as u64),
+            platform::PollEvent::new(evset, fd as u64),
         )
         .map(|_| {
             self.listener_map.insert(fd, listener);
@@ -671,7 +671,7 @@ impl VsockMuxer {
                 self.epoll_file.as_raw_fd(),
                 epoll::ControlOptions::EPOLL_CTL_DEL,
                 fd,
-                epoll::Event::new(epoll::Events::empty(), 0),
+                platform::PollEvent::new(platform::PollEvents::empty(), 0),
             )
             .unwrap_or_else(|err| {
                 warn!("vosck muxer: error removing epoll listener for fd {fd:?}: {err:?}");
@@ -809,7 +809,7 @@ impl VsockMuxer {
                         self.epoll_file.as_raw_fd(),
                         epoll::ControlOptions::EPOLL_CTL_MOD,
                         fd,
-                        epoll::Event::new(new_evset, fd as u64),
+                        platform::PollEvent::new(new_evset, fd as u64),
                     )
                     .unwrap_or_else(|err| {
                         // This really shouldn't happen, like, ever. However, "famous last
@@ -985,7 +985,7 @@ mod unit_tests {
         }
 
         fn notify_muxer(&mut self) {
-            self.muxer.notify(epoll::Events::EPOLLIN);
+            self.muxer.notify(platform::PollEvents::EPOLLIN);
         }
 
         fn count_epoll_listeners(&self) -> (usize, usize) {
@@ -1095,7 +1095,7 @@ mod unit_tests {
     fn test_muxer_epoll_listener() {
         let ctx = MuxerTestContext::new("muxer_epoll_listener");
         assert_eq!(ctx.muxer.get_polled_fd(), ctx.muxer.epoll_file.as_raw_fd());
-        assert_eq!(ctx.muxer.get_polled_evset(), epoll::Events::EPOLLIN);
+        assert_eq!(ctx.muxer.get_polled_evset(), platform::PollEvents::EPOLLIN);
     }
 
     #[test]
