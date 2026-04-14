@@ -90,20 +90,27 @@ const KERNEL_LOAD_ADDR: u64 = 0x100000; // 1 MiB — protected-mode kernel
 type GuestMem = GuestMemoryMmap<AtomicBitmap>;
 
 pub fn run() -> anyhow::Result<()> {
-    // Parse minimal CLI
+    // Parse CLI using VMM config types
     let args: Vec<String> = std::env::args().collect();
-    let kernel_path = args
-        .windows(2)
-        .find(|w| w[0] == "--kernel")
-        .map(|w| w[1].clone());
-    let initramfs_path = args
-        .windows(2)
-        .find(|w| w[0] == "--initramfs")
-        .map(|w| w[1].clone());
-    let disk_path = args
-        .windows(2)
-        .find(|w| w[0] == "--disk")
-        .map(|w| w[1].clone());
+    let get_arg = |name: &str| -> Option<String> {
+        args.windows(2)
+            .find(|w| w[0] == format!("--{name}"))
+            .map(|w| w[1].clone())
+    };
+
+    let payload = vmm::vm_config::PayloadConfig {
+        kernel: get_arg("kernel").map(std::path::PathBuf::from),
+        initramfs: get_arg("initramfs").map(std::path::PathBuf::from),
+        cmdline: get_arg("cmdline"),
+        firmware: None,
+        #[cfg(feature = "igvm")]
+        igvm: None,
+        #[cfg(feature = "sev_snp")]
+        host_data: None,
+        #[cfg(feature = "fw_cfg")]
+        fw_cfg_config: None,
+    };
+    let disk_path = get_arg("disk");
 
     println!("cloud-hypervisor (Windows / WHP backend)");
     println!();
@@ -136,7 +143,7 @@ pub fn run() -> anyhow::Result<()> {
 
     // Create the I/O APIC using the existing devices crate implementation.
     // This provides functional interrupt routing (PIT IRQ 0 → LAPIC → timer calibration).
-    let ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>> = if kernel_path.is_some() {
+    let ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>> = if payload.kernel.is_some() {
         let interrupt_manager = WhpInterruptManager { vm: vm.clone() };
         let ioapic_dev = devices::ioapic::Ioapic::new(
             "ioapic".to_string(),
@@ -230,8 +237,8 @@ pub fn run() -> anyhow::Result<()> {
     };
 
     // ── Load payload ─────────────────────────────────────────────────────
-    let entry_point = if let Some(ref path) = kernel_path {
-        load_kernel(host_mem, path, disk_path.is_some())?
+    let entry_point = if let Some(ref path) = payload.kernel {
+        load_kernel(host_mem, path.to_str().unwrap(), disk_path.is_some())?
     } else {
         load_demo_payload(host_mem)
     };
@@ -239,9 +246,9 @@ pub fn run() -> anyhow::Result<()> {
     // ── Load initramfs if provided ───────────────────────────────────────
     let mut initrd_addr: u64 = 0;
     let mut initrd_size: u64 = 0;
-    if let Some(ref path) = initramfs_path {
+    if let Some(ref path) = payload.initramfs {
         let mut f = File::open(path)
-            .with_context(|| format!("Failed to open initramfs: {path}"))?;
+            .with_context(|| format!("Failed to open initramfs: {}", path.display()))?;
         let fsize = f.metadata()?.len() as usize;
         // Place initramfs at end of guest RAM, page-aligned
         let addr = ((GUEST_MEM_SIZE - fsize) & !0xFFF) as u64;
@@ -255,11 +262,11 @@ pub fn run() -> anyhow::Result<()> {
         }
         initrd_addr = addr;
         initrd_size = fsize as u64;
-        println!("Loaded initramfs: {path} ({fsize} bytes at GPA {addr:#X})");
+        println!("Loaded initramfs: {} ({fsize} bytes at GPA {addr:#X})", path.display());
     }
 
     // ── Set up GDT and page tables for protected/long mode ─────────────
-    if kernel_path.is_some() {
+    if payload.kernel.is_some() {
         setup_gdt(host_mem);
         setup_page_tables(host_mem);
         setup_acpi_tables(host_mem);
@@ -337,7 +344,7 @@ pub fn run() -> anyhow::Result<()> {
     // and cancel the vCPU run to wake it from WHP-internal HLT.
     // Timer interrupt injection thread.
     // Injects both LAPIC timer vector and IRQ 0 to advance jiffies and drive work queues.
-    if kernel_path.is_some() {
+    if payload.kernel.is_some() {
         use hypervisor::whp::WhpVm;
         let vm_for_timer: Arc<dyn hypervisor::Vm> = vm.clone();
         let ioapic_for_timer = ioapic.clone();
