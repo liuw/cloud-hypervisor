@@ -1021,7 +1021,7 @@ fn setup_acpi_tables(host_mem: *mut u8) {
         std::ptr::copy_nonoverlapping(b"WHP DEMO    ".as_ptr(), mpc.add(16), 12); // Product ID
         w::<u32>(mpc, 28, 0); // OEM table pointer
         w::<u16>(mpc, 32, 0); // OEM table size
-        w::<u16>(mpc, 34, 3 + 16); // Entry count (1 CPU + 1 bus + 1 IOAPIC + 16 IRQ entries)
+        w::<u16>(mpc, 34, 4 + 17); // Entry count (1 CPU + 2 bus + 1 IOAPIC + 16 ISA IRQ + 1 PCI IRQ)
         w::<u32>(mpc, 36, 0xFEE0_0000); // Local APIC address
         w::<u16>(mpc, 40, 0); // Extended table length
         *mpc.add(42) = 0; // Extended table checksum
@@ -1039,11 +1039,18 @@ fn setup_acpi_tables(host_mem: *mut u8) {
         // Reserved (8 bytes at offset 12)
         offset += 20;
 
-        // Bus entry (type 1, 8 bytes)
-        let bus = mpc.add(offset);
-        *bus = 1; // Entry type = Bus
-        *bus.add(1) = 0; // Bus ID
-        std::ptr::copy_nonoverlapping(b"ISA   ".as_ptr(), bus.add(2), 6); // Bus type
+        // Bus 0: PCI (type 1, 8 bytes)
+        let bus0 = mpc.add(offset);
+        *bus0 = 1; // Entry type = Bus
+        *bus0.add(1) = 0; // Bus ID 0
+        std::ptr::copy_nonoverlapping(b"PCI   ".as_ptr(), bus0.add(2), 6);
+        offset += 8;
+
+        // Bus 1: ISA (type 1, 8 bytes)
+        let bus1 = mpc.add(offset);
+        *bus1 = 1; // Entry type = Bus
+        *bus1.add(1) = 1; // Bus ID 1
+        std::ptr::copy_nonoverlapping(b"ISA   ".as_ptr(), bus1.add(2), 6);
         offset += 8;
 
         // I/O APIC entry (type 2, 8 bytes)
@@ -1056,16 +1063,30 @@ fn setup_acpi_tables(host_mem: *mut u8) {
         offset += 8;
 
         // I/O Interrupt Assignment entries (type 3, 8 bytes each)
-        // Map ISA IRQs 0-15 to I/O APIC inputs 0-15
+        // Map ISA IRQs 0-15 to I/O APIC inputs 0-15 (source = bus 1 ISA)
         for irq in 0..16u8 {
             let entry = mpc.add(offset);
             *entry = 3; // Entry type = I/O Interrupt Assignment
             *entry.add(1) = 0; // Interrupt type: INT (vectored)
             w::<u16>(entry, 2, 0); // Flags: default (bus-type dependent)
-            *entry.add(4) = 0; // Source bus ID
+            *entry.add(4) = 1; // Source bus ID = 1 (ISA)
             *entry.add(5) = irq; // Source bus IRQ
             *entry.add(6) = 0; // Dest I/O APIC ID
             *entry.add(7) = irq; // Dest I/O APIC INTIN#
+            offset += 8;
+        }
+
+        // PCI interrupt routing: device 1 INTA# → IOAPIC pin 16
+        // Source bus IRQ for PCI: (device << 2) | (pin - 1) = (1 << 2) | 0 = 4
+        {
+            let entry = mpc.add(offset);
+            *entry = 3; // Entry type = I/O Interrupt Assignment
+            *entry.add(1) = 0; // Interrupt type: INT
+            w::<u16>(entry, 2, 0x000F); // Flags: active-low, level-triggered (PCI)
+            *entry.add(4) = 0; // Source bus ID = 0 (PCI)
+            *entry.add(5) = (PCI_BLK_SLOT as u8) << 2; // Source: device 1, pin A
+            *entry.add(6) = 0; // Dest I/O APIC ID
+            *entry.add(7) = 16; // Dest I/O APIC INTIN# 16
             offset += 8;
         }
 
@@ -1384,6 +1405,8 @@ struct PciBlkDevice {
 
     // VM for interrupt injection
     vm: Arc<dyn hypervisor::Vm>,
+
+    debug: bool,
 }
 
 // SAFETY: msix_table_host points to a page that lives for the VM lifetime.
@@ -1472,6 +1495,7 @@ impl PciBlkDevice {
             guest_mem,
             msix_table_host,
             vm,
+            debug: std::env::var("CH_DEBUG").is_ok(),
         })
     }
 
@@ -1666,9 +1690,11 @@ impl PciBlkDevice {
                 if data.len() >= 4 {
                     let pfn = u32::from_le_bytes(data[..4].try_into().unwrap());
                     if self.queue_select == 0 {
+                        if self.debug {
+                            eprintln!("[virtio-blk] queue 0 PFN={pfn:#x} (addr={:#x})", (pfn as u64) * 4096);
+                        }
                         self.queue_pfn = pfn;
                         if pfn == 0 {
-                            // Queue disabled
                             self.last_avail_idx = 0;
                         }
                     }
@@ -1692,6 +1718,7 @@ impl PciBlkDevice {
                 let new_status = data[0];
                 if new_status == 0 {
                     // Device reset
+                    if self.debug { eprintln!("[virtio-blk] device reset"); }
                     self.device_status = 0;
                     self.guest_features = 0;
                     self.queue_pfn = 0;
@@ -1701,6 +1728,9 @@ impl PciBlkDevice {
                     self.msix_config_vector = VIRTIO_MSI_NO_VECTOR;
                     self.queue_msix_vector = VIRTIO_MSI_NO_VECTOR;
                     return;
+                }
+                if self.debug && new_status != self.device_status {
+                    eprintln!("[virtio-blk] status {:#04x} → {:#04x}", self.device_status, new_status);
                 }
                 self.device_status = new_status;
             }
@@ -1712,6 +1742,9 @@ impl PciBlkDevice {
             VIRTIO_PCI_MSIX_QUEUE_VECTOR => {
                 if data.len() >= 2 && self.queue_select == 0 {
                     self.queue_msix_vector = u16::from_le_bytes(data[..2].try_into().unwrap());
+                    if self.debug {
+                        eprintln!("[virtio-blk] queue 0 MSI-X vector={}", self.queue_msix_vector);
+                    }
                 }
             }
             _ => {} // Ignore writes to read-only or unknown registers
@@ -1759,6 +1792,9 @@ impl PciBlkDevice {
         }
 
         if processed > 0 {
+            if self.debug {
+                eprintln!("[virtio-blk] processed {processed} requests");
+            }
             self.isr_status |= 0x01; // Used buffer notification
             self.inject_interrupt();
         }
