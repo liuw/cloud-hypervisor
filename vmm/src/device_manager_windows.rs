@@ -94,6 +94,31 @@ impl DeviceManager {
             None
         };
 
+        // ── PIT timer stub (0x40-0x43) ──────────────────────────────────
+        let pit = Arc::new(Mutex::new(PitStub::new()));
+        io_bus.insert(pit, 0x40, 0x4)
+            .map_err(|e| anyhow!("Failed to register PIT: {e:?}"))?;
+
+        // ── Port 0x61 (NMI/PIT gate) ────────────────────────────────────
+        let port61 = Arc::new(Mutex::new(Port61Stub::default()));
+        io_bus.insert(port61, 0x61, 0x1)
+            .map_err(|e| anyhow!("Failed to register port 0x61: {e:?}"))?;
+
+        // ── PIC stubs (0x20-0x21, 0xA0-0xA1) ────────────────────────────
+        let pic_master = Arc::new(Mutex::new(PicStub::default()));
+        let pic_slave = Arc::new(Mutex::new(PicStub::default()));
+        io_bus.insert(pic_master, 0x20, 0x2)
+            .map_err(|e| anyhow!("Failed to register PIC master: {e:?}"))?;
+        io_bus.insert(pic_slave, 0xA0, 0x2)
+            .map_err(|e| anyhow!("Failed to register PIC slave: {e:?}"))?;
+
+        // ── CMOS/RTC stub (0x70-0x71) ───────────────────────────────────
+        let cmos = Arc::new(Mutex::new(CmosStub::default()));
+        io_bus.insert(cmos, 0x70, 0x2)
+            .map_err(|e| anyhow!("Failed to register CMOS: {e:?}"))?;
+
+        info!("Registered PIT, port 0x61, PIC, CMOS on I/O bus");
+
         Ok(DeviceManager {
             io_bus,
             mmio_bus,
@@ -265,4 +290,68 @@ impl InterruptSourceGroup for WhpMsiInterrupt {
     fn notifier(&self, _index: InterruptIndex) -> Option<platform::EventFd> {
         None
     }
+}
+
+// ── Stub bus devices ─────────────────────────────────────────────────────────
+
+use std::sync::Barrier;
+
+struct PitStub {
+    start: std::time::Instant,
+    reload: u16,
+}
+
+impl PitStub {
+    fn new() -> Self {
+        PitStub { start: std::time::Instant::now(), reload: 0 }
+    }
+}
+
+impl BusDevice for PitStub {
+    fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
+        if offset == 0x02 && !data.is_empty() {
+            let elapsed_us = self.start.elapsed().as_micros() as u64;
+            let ticks = (elapsed_us * 1193) / 1000;
+            let reload = self.reload as u64;
+            let counter = if reload > 0 { reload.saturating_sub(ticks % (reload + 1)) } else { 0 };
+            data[0] = counter as u8;
+        }
+    }
+    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+        if offset == 0x02 && !data.is_empty() { self.reload = data[0] as u16; }
+        None
+    }
+}
+
+#[derive(Default)]
+struct Port61Stub { value: u8 }
+
+impl BusDevice for Port61Stub {
+    fn read(&mut self, _base: u64, _offset: u64, data: &mut [u8]) {
+        if !data.is_empty() { self.value ^= 0x20; data[0] = self.value; }
+    }
+    fn write(&mut self, _base: u64, _offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+        if !data.is_empty() { self.value = data[0]; }
+        None
+    }
+}
+
+#[derive(Default)]
+struct PicStub { imr: u8 }
+
+impl BusDevice for PicStub {
+    fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
+        if !data.is_empty() { data[0] = if offset == 1 { self.imr } else { 0 }; }
+    }
+    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+        if offset == 1 && !data.is_empty() { self.imr = data[0]; }
+        None
+    }
+}
+
+#[derive(Default)]
+struct CmosStub;
+
+impl BusDevice for CmosStub {
+    fn read(&mut self, _base: u64, _offset: u64, data: &mut [u8]) { data.fill(0); }
 }
