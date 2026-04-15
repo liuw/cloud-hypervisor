@@ -156,6 +156,28 @@ impl DeviceManager {
     pub fn mmio_bus(&self) -> &Arc<Bus> {
         &self.mmio_bus
     }
+
+    /// Register PCI config I/O on a bus (static helper for external callers).
+    pub fn register_pci_config_static<R, W>(
+        io_bus: &Arc<Bus>,
+        read_fn: R,
+        write_fn: W,
+    ) -> anyhow::Result<()>
+    where
+        R: Fn(u32, usize) -> u32 + Send + 'static,
+        W: Fn(u32, usize, u64, &[u8]) + Send + 'static,
+    {
+        let bridge = Arc::new(Mutex::new(PciConfigBridge {
+            config_address: 0,
+            read_fn: Box::new(read_fn),
+            write_fn: Box::new(write_fn),
+        }));
+        io_bus
+            .insert(bridge, 0xCF8, 0x8)
+            .map_err(|e| anyhow!("Failed to register PCI config I/O: {e:?}"))?;
+        info!("Registered PCI config I/O at 0xCF8");
+        Ok(())
+    }
 }
 
 // ── VmOps implementation using Bus dispatch ──────────────────────────────────
@@ -354,4 +376,64 @@ struct CmosStub;
 
 impl BusDevice for CmosStub {
     fn read(&mut self, _base: u64, _offset: u64, data: &mut [u8]) { data.fill(0); }
+}
+
+/// PCI config I/O bridge — handles 0xCF8 (address) and 0xCFC (data).
+struct PciConfigBridge {
+    config_address: u32,
+    read_fn: Box<dyn Fn(u32, usize) -> u32 + Send>,
+    write_fn: Box<dyn Fn(u32, usize, u64, &[u8]) + Send>,
+}
+
+impl BusDevice for PciConfigBridge {
+    fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
+        match offset {
+            0..=3 => {
+                // Read config address register
+                let start = offset as usize;
+                for (i, d) in data.iter_mut().enumerate() {
+                    *d = (self.config_address >> ((start + i) * 8)) as u8;
+                }
+            }
+            4..=7 => {
+                // Read config data — dispatch to registered devices
+                let enabled = (self.config_address & 0x8000_0000) != 0;
+                if !enabled {
+                    data.fill(0xFF);
+                    return;
+                }
+                let reg = ((self.config_address >> 2) & 0x3F) as usize;
+                let val = (self.read_fn)(self.config_address, reg);
+                let start = (offset - 4) as usize;
+                for (i, d) in data.iter_mut().enumerate() {
+                    *d = (val >> ((start + i) * 8)) as u8;
+                }
+            }
+            _ => data.fill(0xFF),
+        }
+    }
+
+    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+        match offset {
+            0..=3 => {
+                // Write config address register
+                let start = offset as usize;
+                for (i, d) in data.iter().enumerate() {
+                    let shift = (start + i) * 8;
+                    self.config_address = (self.config_address & !(0xFF << shift)) | ((*d as u32) << shift);
+                }
+            }
+            4..=7 => {
+                // Write config data — dispatch to registered devices
+                let enabled = (self.config_address & 0x8000_0000) != 0;
+                if !enabled {
+                    return None;
+                }
+                let reg = ((self.config_address >> 2) & 0x3F) as usize;
+                (self.write_fn)(self.config_address, reg, offset - 4, data);
+            }
+            _ => {}
+        }
+        None
+    }
 }

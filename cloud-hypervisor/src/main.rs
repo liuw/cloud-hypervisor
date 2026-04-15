@@ -94,14 +94,14 @@ fn main() {
 
         api_sender
             .send(Box::new(move |vmm: &mut vmm::Vmm| {
-                let result = vmm.vm_boot(|exit_evt, vm, mm, vm_ops, serial| {
+                let result = vmm.vm_boot(|exit_evt, vm, mm, vm_ops, serial, io_bus| {
                     let p = payload.unwrap_or(vmm::vm_config::PayloadConfig {
                         firmware: None, kernel: None, cmdline: None, initramfs: None,
                         #[cfg(feature = "igvm")] igvm: None,
                         #[cfg(feature = "sev_snp")] host_data: None,
                         #[cfg(feature = "fw_cfg")] fw_cfg_config: None,
                     });
-                    whp_demo::boot(exit_evt, p, disk_path, vm, mm, vm_ops, serial)
+                    whp_demo::boot(exit_evt, p, disk_path, vm, mm, vm_ops, serial, io_bus)
                 });
                 boot_sender.send(result).ok();
                 Ok(false)

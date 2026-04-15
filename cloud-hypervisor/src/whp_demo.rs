@@ -19,6 +19,7 @@ use vm_memory::bitmap::AtomicBitmap;
 const GUEST_MEM_SIZE: usize = 512 << 20; // 512 MiB
 
 // PCI device slots
+const PCI_HOST_BRIDGE_SLOT: u32 = 0;
 const PCI_BLK_SLOT: u32 = 1;
 
 // Default I/O BAR address for virtio-blk (may be reprogrammed by kernel)
@@ -89,6 +90,7 @@ pub fn boot(
     memory_manager: Arc<Mutex<vmm::memory_manager::MemoryManager>>,
     vm_ops: Arc<dyn hypervisor::VmOps>,
     serial: Arc<Mutex<devices::legacy::serial::Serial>>,
+    io_bus: Arc<vm_device::Bus>,
 ) -> anyhow::Result<()> {
     // ── Get guest memory from the VMM's memory manager ───────────────────
     let mm = memory_manager.lock().unwrap();
@@ -139,7 +141,41 @@ pub fn boot(
         let dev = PciBlkDevice::new(path, guest_mem.clone(), vm.clone(), msix_host)?;
         println!("Created virtio-blk PCI device: {} sectors ({:.1} MiB), disk={path}",
                  dev.capacity, (dev.capacity * 512) as f64 / (1024.0 * 1024.0));
-        Some(Arc::new(Mutex::new(dev)))
+        let pci_blk = Arc::new(Mutex::new(dev));
+
+        // Register PCI virtio-blk I/O BAR on the I/O bus
+        io_bus.insert(pci_blk.clone(), VIRTIO_BLK_IO_BAR_DEFAULT as u64, VIRTIO_BLK_IO_BAR_SIZE as u64)
+            .map_err(|e| anyhow!("Failed to register virtio-blk I/O BAR: {e:?}"))?;
+
+        // Register PCI config I/O bridge (0xCF8-0xCFF)
+        let pci_blk_for_read = pci_blk.clone();
+        let pci_blk_for_write = pci_blk.clone();
+        let host_bridge = host_bridge_config();
+        vmm::device_manager::DeviceManager::register_pci_config_static(
+            &io_bus,
+            move |addr, reg| {
+                let device = (addr >> 11) & 0x1F;
+                match device {
+                    PCI_HOST_BRIDGE_SLOT => {
+                        let off = reg * 4;
+                        if off + 4 <= 256 {
+                            u32::from_le_bytes(host_bridge[off..off+4].try_into().unwrap())
+                        } else { 0xFFFF_FFFF }
+                    }
+                    PCI_BLK_SLOT => pci_blk_for_read.lock().unwrap().read_config(reg),
+                    _ => 0xFFFF_FFFF,
+                }
+            },
+            move |addr, reg, offset, data| {
+                let device = (addr >> 11) & 0x1F;
+                if device == PCI_BLK_SLOT {
+                    pci_blk_for_write.lock().unwrap().write_config(reg, offset, data);
+                }
+            },
+        )?;
+        println!("Registered PCI config I/O and virtio-blk BAR on I/O bus");
+
+        Some(pci_blk)
     } else {
         None
     };
@@ -1214,6 +1250,18 @@ fn setup_regs(vcpu: &mut dyn hypervisor::Vcpu, entry: u64) -> anyhow::Result<()>
 
 // ── PCI virtio-blk device ────────────────────────────────────────────────────
 
+fn host_bridge_config() -> [u8; 256] {
+    let mut c = [0u8; 256];
+    // Vendor: Intel (0x8086), Device: Host Bridge (0x1237)
+    c[0x00] = 0x86; c[0x01] = 0x80;
+    c[0x02] = 0x37; c[0x03] = 0x12;
+    // Class: Host bridge (06 00)
+    c[0x0A] = 0x00; c[0x0B] = 0x06;
+    // Header type: normal
+    c[0x0E] = 0x00;
+    c
+}
+
 /// A self-contained legacy virtio-PCI block device.
 struct PciBlkDevice {
     config: [u8; 256],
@@ -1255,6 +1303,16 @@ struct PciBlkDevice {
 
 // SAFETY: msix_table_host points to a page that lives for the VM lifetime.
 unsafe impl Send for PciBlkDevice {}
+
+impl vm_device::BusDevice for PciBlkDevice {
+    fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
+        self.io_read(offset as u16, data);
+    }
+    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<std::sync::Arc<std::sync::Barrier>> {
+        self.io_write(offset as u16, data);
+        None
+    }
+}
 
 impl PciBlkDevice {
     fn new(

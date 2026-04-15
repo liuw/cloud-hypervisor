@@ -218,6 +218,7 @@ impl Vmm {
             Arc<Mutex<memory_manager::MemoryManager>>,
             Arc<dyn hypervisor::VmOps>,
             Arc<Mutex<devices::legacy::serial::Serial>>,
+            Arc<vm_device::Bus>,
         ) -> std::result::Result<(), anyhow::Error>,
     {
         let vm = self.vm.as_ref().ok_or_else(|| {
@@ -236,6 +237,7 @@ impl Vmm {
             mm.clone(),
             dm.vm_ops(),
             dm.serial().clone(),
+            dm.io_bus().clone(),
         )
         .map_err(|e| Error::VmBoot(format!("{e:#}")))?;
 
