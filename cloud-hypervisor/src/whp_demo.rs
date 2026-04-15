@@ -100,6 +100,8 @@ pub fn boot(
     disk_path: Option<String>,
     vm: Arc<dyn hypervisor::Vm>,
     memory_manager: Arc<Mutex<vmm::memory_manager::MemoryManager>>,
+    vm_ops: Arc<dyn hypervisor::VmOps>,
+    serial: Arc<Mutex<devices::legacy::serial::Serial>>,
 ) -> anyhow::Result<()> {
     // ── Get guest memory from the VMM's memory manager ───────────────────
     let mm = memory_manager.lock().unwrap();
@@ -111,70 +113,19 @@ pub fn boot(
 
     println!("Using VMM-managed memory: {} MiB at GPA 0x0", ram_size >> 20);
 
-    // Create the I/O APIC using the existing devices crate implementation.
-    // This provides functional interrupt routing (PIT IRQ 0 → LAPIC → timer calibration).
-    let ioapic: Option<Arc<Mutex<devices::ioapic::Ioapic>>> = if payload.kernel.is_some() {
-        let interrupt_manager = WhpInterruptManager { vm: vm.clone() };
-        let ioapic_dev = devices::ioapic::Ioapic::new(
-            "ioapic".to_string(),
-            GuestAddress(0xFEE0_0000),
-            &interrupt_manager,
-            None,
-        ).context("Failed to create IOAPIC")?;
-        let ioapic = Arc::new(Mutex::new(ioapic_dev));
-
-        // Pre-program IOAPIC redirect entries since WHP can't trap MMIO writes
-        // to 0xFEC00000 (guest writes go to unmapped memory and return 0).
-        // The kernel will try to program these via MMIO but the writes are lost.
-        // We pre-configure IRQ 0 (PIT timer) and IRQ 4 (serial) with proper vectors.
-        {
-            use vm_device::BusDevice;
-            let mut ioapic_guard = ioapic.lock().unwrap();
-
-            // Helper: write IOREGSEL then IOWIN to program an IOAPIC register
-            fn ioapic_write_reg(ioapic: &mut devices::ioapic::Ioapic, reg: u32, val: u32) {
-                let reg_bytes = reg.to_le_bytes();
-                let val_bytes = val.to_le_bytes();
-                ioapic.write(0xFEC0_0000, 0x00, &reg_bytes); // IOREGSEL
-                ioapic.write(0xFEC0_0000, 0x10, &val_bytes); // IOWIN
-            }
-
-            // IRQ 0 (PIT timer) → vector 0x30, physical destination 0, edge-triggered
-            // Redirect entry 0: low dword at register 0x10
-            ioapic_write_reg(&mut ioapic_guard, 0x10, 0x0000_0030); // vector=0x30, unmasked
-            // Redirect entry 0: high dword at register 0x11
-            ioapic_write_reg(&mut ioapic_guard, 0x11, 0x0000_0000); // destination=0
-
-            // IRQ 4 (serial ttyS0) → vector 0x34, physical destination 0, edge-triggered
-            // Redirect entry 4: low dword at register 0x18
-            ioapic_write_reg(&mut ioapic_guard, 0x18, 0x0000_0034); // vector=0x34, unmasked
-            // Redirect entry 4: high dword at register 0x19
-            ioapic_write_reg(&mut ioapic_guard, 0x19, 0x0000_0000); // destination=0
-
-            println!("  Pre-programmed IOAPIC: IRQ0→vec 0x30, IRQ4→vec 0x34");
-        }
-
-        println!("Created IOAPIC with WHP interrupt injection");
-
-        // Map a RAM page at 0xFEC00000 with the IOAPIC version register pre-populated.
-        // WHP doesn't generate MMIO exits for unmapped GPA regions (returns 0 silently).
-        // The kernel reads the IOAPIC version register to determine the number of pins.
+    // Map IOAPIC version page for kernel mode (WHP needs physical backing)
+    if payload.kernel.is_some() {
         let ioapic_page_layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
         let ioapic_host = unsafe { std::alloc::alloc_zeroed(ioapic_page_layout) };
         if !ioapic_host.is_null() {
             unsafe {
-                // IOREGSEL=1 (version), IOWIN=version value (24 entries, version 0x11)
                 std::ptr::write_unaligned(ioapic_host as *mut u32, 1);
                 std::ptr::write_unaligned(ioapic_host.add(0x10) as *mut u32, 0x0017_0011u32);
                 let _ = vm.create_user_memory_region(1, 0xFEC0_0000, 4096, ioapic_host, false, false);
             }
             println!("  Mapped IOAPIC version page at GPA 0xFEC00000");
         }
-
-        Some(ioapic)
-    } else {
-        None
-    };
+    }
 
     // ── Create PCI virtio-blk device if disk is provided ─────────────────
     let pci_blk: Option<Arc<Mutex<PciBlkDevice>>> = if let Some(ref path) = disk_path {
@@ -254,28 +205,11 @@ pub fn boot(
         }
     }
 
-    // ── Create serial device using the devices crate 16550 UART ────────
-    // This replaces the ad-hoc serial emulation with a proper UART that handles
-    // DLAB, baud rate, LCR, MCR, MSR, SCR, FIFO, and interrupt-driven I/O.
-    let serial_irq = Arc::new(WhpFixedVectorInterrupt { vm: vm.clone(), vector: 0x34 });
-    let serial_dev = devices::legacy::serial::Serial::new_out(
-        "serial0".to_string(),
-        serial_irq,
-        Box::new(std::io::stdout()),
-        None,
-    );
-    let serial = Arc::new(Mutex::new(serial_dev));
-
-    // ── Create vCPU ──────────────────────────────────────────────────────
-    let vm_ops = Arc::new(SerialVmOps::new(
-        ioapic.clone(),
-        Some(vm.clone()),
-        pci_blk.clone(),
-        serial.clone(),
-    ));
-    let vm_ops_clone: Arc<dyn VmOps> = vm_ops.clone();
+    // ── Create vCPU using bus-based VmOps from device manager ────────────
+    // Serial and IOAPIC are already registered on the I/O and MMIO buses
+    // by the device manager. The vm_ops dispatches PIO/MMIO to the buses.
     let mut vcpu = vm
-        .create_vcpu(0, Some(vm_ops_clone))
+        .create_vcpu(0, Some(vm_ops))
         .context("Failed to create vCPU")?;
 
     // Set initial register state
@@ -317,7 +251,6 @@ pub fn boot(
     if payload.kernel.is_some() {
         use hypervisor::whp::WhpVm;
         let vm_for_timer: Arc<dyn hypervisor::Vm> = vm.clone();
-        let ioapic_for_timer = ioapic.clone();
         std::thread::Builder::new()
             .name("timer-inject".to_string())
             .spawn(move || {

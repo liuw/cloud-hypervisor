@@ -25,6 +25,8 @@ pub mod vm_config;
 pub mod serial_manager;
 #[path = "memory_manager_windows.rs"]
 pub mod memory_manager;
+#[path = "device_manager_windows.rs"]
+pub mod device_manager;
 
 // ── Error types ─────────────────────────────────────────────────────────────
 
@@ -119,6 +121,7 @@ pub struct Vmm {
     vm: Option<Arc<dyn hypervisor::Vm>>,
     memory_manager: Option<Arc<Mutex<memory_manager::MemoryManager>>>,
     vm_config: Option<Arc<Mutex<vm_config::VmConfig>>>,
+    device_manager: Option<device_manager::DeviceManager>,
 }
 
 pub struct VmmThreadHandle {
@@ -156,6 +159,7 @@ impl Vmm {
             vm: None,
             memory_manager: None,
             vm_config: None,
+            device_manager: None,
         })
     }
 
@@ -169,11 +173,16 @@ impl Vmm {
         let mm = memory_manager::MemoryManager::new(vm.clone(), &config.memory)
             .map_err(Error::MemoryManager)?;
 
+        let has_kernel = config.payload.as_ref().map_or(false, |p| p.kernel.is_some());
+        let dm = device_manager::DeviceManager::new(&vm, &mm, has_kernel)
+            .map_err(|e| Error::VmBoot(format!("Device manager: {e:#}")))?;
+
         self.vm = Some(vm);
         self.memory_manager = Some(mm);
         self.vm_config = Some(Arc::new(Mutex::new(config)));
+        self.device_manager = Some(dm);
 
-        info!("VM created");
+        info!("VM created with device manager");
         Ok(())
     }
 
@@ -187,6 +196,11 @@ impl Vmm {
         self.memory_manager.as_ref()
     }
 
+    /// Get the device manager (if created).
+    pub fn device_manager(&self) -> Option<&device_manager::DeviceManager> {
+        self.device_manager.as_ref()
+    }
+
     /// Get the exit event (for signaling shutdown from vCPU threads).
     pub fn exit_evt(&self) -> &EventFd {
         &self.exit_evt
@@ -194,12 +208,17 @@ impl Vmm {
 
     /// Boot the VM using the provided boot function.
     ///
-    /// The boot function receives the exit_evt, VM handle, and memory manager,
-    /// and is responsible for loading the payload, creating devices, and
-    /// starting the vCPU thread. It must return immediately (not block).
+    /// The boot function receives the exit_evt, VM handle, memory manager,
+    /// and a VmOps handler for bus-based device dispatch.
     pub fn vm_boot<F>(&self, boot_fn: F) -> Result<()>
     where
-        F: FnOnce(EventFd, Arc<dyn hypervisor::Vm>, Arc<Mutex<memory_manager::MemoryManager>>) -> std::result::Result<(), anyhow::Error>,
+        F: FnOnce(
+            EventFd,
+            Arc<dyn hypervisor::Vm>,
+            Arc<Mutex<memory_manager::MemoryManager>>,
+            Arc<dyn hypervisor::VmOps>,
+            Arc<Mutex<devices::legacy::serial::Serial>>,
+        ) -> std::result::Result<(), anyhow::Error>,
     {
         let vm = self.vm.as_ref().ok_or_else(|| {
             Error::VmBoot("VM not created — call vm_create first".into())
@@ -207,11 +226,16 @@ impl Vmm {
         let mm = self.memory_manager.as_ref().ok_or_else(|| {
             Error::VmBoot("Memory manager not available".into())
         })?;
+        let dm = self.device_manager.as_ref().ok_or_else(|| {
+            Error::VmBoot("Device manager not available".into())
+        })?;
 
         boot_fn(
             self.exit_evt.try_clone().map_err(Error::EventFdCreate)?,
             vm.clone(),
             mm.clone(),
+            dm.vm_ops(),
+            dm.serial().clone(),
         )
         .map_err(|e| Error::VmBoot(format!("{e:#}")))?;
 
