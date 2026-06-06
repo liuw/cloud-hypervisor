@@ -156,6 +156,9 @@ use kvm::*;
 use hypervisor::mshv::mshv_ioctls::*;
 
 #[cfg(feature = "mshv")]
+const MSHV_GET_PARTITION_ID: u64 = 0x8008_b80b;
+
+#[cfg(feature = "mshv")]
 fn create_vmm_ioctl_seccomp_rule_common_mshv() -> Result<Vec<SeccompRule>, BackendError> {
     Ok(or![
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_CREATE_PARTITION())?],
@@ -181,6 +184,7 @@ fn create_vmm_ioctl_seccomp_rule_common_mshv() -> Result<Vec<SeccompRule>, Backe
             Eq,
             MSHV_SET_PARTITION_PROPERTY()
         )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_GET_PARTITION_ID)?],
         and![Cond::new(
             1,
             ArgLen::Dword,
@@ -845,6 +849,7 @@ fn http_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError>
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_recvmsg, vec![]),
         (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_sendto, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
         (libc::SYS_rt_sigprocmask, vec![]),
