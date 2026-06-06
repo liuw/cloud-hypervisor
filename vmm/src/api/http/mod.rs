@@ -8,9 +8,9 @@ use self::http_endpoint::{VmActionHandler, VmCreate, VmInfo, VmmPing, VmmShutdow
 use crate::api::VmCoredump;
 use crate::api::{
     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddNet, VmAddPmem, VmAddUserDevice,
-    VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot,
-    VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeZone, VmRestore, VmResume,
-    VmSendMigration, VmShutdown, VmSnapshot,
+    VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete, VmNmi, VmPartitionId, VmPause,
+    VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeZone, VmRestore,
+    VmResume, VmSendMigration, VmShutdown, VmSnapshot,
 };
 use crate::landlock::Landlock;
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
@@ -204,6 +204,10 @@ pub static HTTP_ROUTES: Lazy<HttpRoutes> = Lazy::new(|| {
     r.routes.insert(
         endpoint!("/vm.counters"),
         Box::new(VmActionHandler::new(&VmCounters)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.partition-id"),
+        Box::new(VmActionHandler::new(&VmPartitionId)),
     );
     r.routes
         .insert(endpoint!("/vm.create"), Box::new(VmCreate {}));

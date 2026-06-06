@@ -45,11 +45,17 @@ use snp_constants::*;
 #[cfg(target_arch = "x86_64")]
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
+use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
+use vmm_sys_util::ioctl::ioctl_with_mut_ref;
+use vmm_sys_util::ioctl_ioc_nr;
+use vmm_sys_util::ioctl_ior_nr;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::*;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{emulator, VcpuMshvState};
+
+ioctl_ior_nr!(MSHV_GET_PARTITION_ID, MSHV_IOCTL, 0x0B, u64);
 
 #[cfg(feature = "sev_snp")]
 const ONE_GB: usize = 1024 * 1024 * 1024;
@@ -1806,6 +1812,21 @@ impl vm::Vm for MshvVm {
 
         self.create_device(&mut vfio_dev)
             .map_err(|e| vm::HypervisorVmError::CreatePassthroughDevice(e.into()))
+    }
+
+    fn partition_id(&self) -> vm::Result<u64> {
+        let mut partition_id = 0;
+        // SAFETY: MSHV_GET_PARTITION_ID writes a u64 to the provided pointer.
+        let ret = unsafe {
+            ioctl_with_mut_ref(self.fd.as_ref(), MSHV_GET_PARTITION_ID(), &mut partition_id)
+        };
+        if ret == 0 {
+            Ok(partition_id)
+        } else {
+            Err(vm::HypervisorVmError::GetPartitionId(
+                errno::Error::last().into(),
+            ))
+        }
     }
 
     ///

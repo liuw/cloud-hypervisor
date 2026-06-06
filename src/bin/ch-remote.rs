@@ -90,6 +90,7 @@ trait DBusApi1 {
     fn vm_create(&self, vm_config: &str) -> zbus::Result<()>;
     fn vm_delete(&self) -> zbus::Result<()>;
     fn vm_info(&self) -> zbus::Result<String>;
+    fn vm_partition_id(&self) -> zbus::Result<Optional<String>>;
     fn vm_pause(&self) -> zbus::Result<()>;
     fn vm_power_button(&self) -> zbus::Result<()>;
     fn vm_reboot(&self) -> zbus::Result<()>;
@@ -182,6 +183,10 @@ impl<'a> DBusApi1ProxyBlocking<'a> {
 
     fn api_vm_counters(&self) -> ApiResult {
         self.print_response(self.vm_counters())
+    }
+
+    fn api_vm_partition_id(&self) -> ApiResult {
+        self.print_response(self.vm_partition_id())
     }
 
     fn api_vm_create(&self, vm_config: &str) -> ApiResult {
@@ -290,6 +295,9 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
         }
         Some("counters") => {
             simple_api_command(socket, "GET", "counters", None).map_err(Error::HttpApiClient)
+        }
+        Some("partition-id") => {
+            simple_api_command(socket, "GET", "partition-id", None).map_err(Error::HttpApiClient)
         }
         Some("ping") => {
             simple_api_full_command(socket, "GET", "vmm.ping", None).map_err(Error::HttpApiClient)
@@ -523,6 +531,7 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
         Some("pause") => proxy.api_vm_pause(),
         Some("info") => proxy.api_vm_info(),
         Some("counters") => proxy.api_vm_counters(),
+        Some("partition-id") => proxy.api_vm_partition_id(),
         Some("ping") => proxy.api_vmm_ping(),
         Some("shutdown") => proxy.api_vm_shutdown(),
         Some("resize") => {
@@ -1001,6 +1010,7 @@ fn main() {
         )
         .subcommand(Command::new("info").about("Info on the VM"))
         .subcommand(Command::new("counters").about("Counters from the VM"))
+        .subcommand(Command::new("partition-id").about("MSHV partition ID of the VM"))
         .subcommand(Command::new("pause").about("Pause the VM"))
         .subcommand(Command::new("reboot").about("Reboot the VM"))
         .subcommand(Command::new("power-button").about("Trigger a power button in the VM"))

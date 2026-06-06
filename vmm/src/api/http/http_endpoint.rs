@@ -9,9 +9,9 @@ use crate::api::http::{error_response, EndpointHandler, HttpError};
 use crate::api::VmCoredump;
 use crate::api::{
     AddDisk, ApiAction, ApiRequest, VmAddDevice, VmAddFs, VmAddNet, VmAddPmem, VmAddUserDevice,
-    VmAddVdpa, VmAddVsock, VmBoot, VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton,
-    VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeZone, VmRestore, VmResume,
-    VmSendMigration, VmShutdown, VmSnapshot,
+    VmAddVdpa, VmAddVsock, VmBoot, VmConfig, VmCounters, VmDelete, VmNmi, VmPartitionId, VmPause,
+    VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeZone, VmRestore,
+    VmResume, VmSendMigration, VmShutdown, VmSnapshot,
 };
 use crate::config::{NetConfig, RestoreConfig};
 use micro_http::{Body, Method, Request, Response, StatusCode, Version};
@@ -164,6 +164,7 @@ macro_rules! vm_action_put_handler_body {
 }
 
 vm_action_get_handler!(VmCounters);
+vm_action_get_handler!(VmPartitionId);
 
 vm_action_put_handler!(VmBoot);
 vm_action_put_handler!(VmDelete);

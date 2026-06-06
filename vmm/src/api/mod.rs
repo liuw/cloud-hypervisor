@@ -162,6 +162,9 @@ pub enum ApiError {
 
     /// Error triggering NMI
     VmNmi(VmError),
+
+    /// The VM partition ID could not be retrieved.
+    VmPartitionId(VmError),
 }
 pub type ApiResult<T> = Result<T, ApiError>;
 
@@ -204,6 +207,7 @@ impl Display for ApiError {
             VmSendMigration(migratable_error) => write!(f, "{migratable_error}"),
             VmPowerButton(vm_error) => write!(f, "{vm_error}"),
             VmNmi(vm_error) => write!(f, "{vm_error}"),
+            VmPartitionId(vm_error) => write!(f, "{vm_error}"),
         }
     }
 }
@@ -222,6 +226,11 @@ pub struct VmmPingResponse {
     pub version: String,
     pub pid: i64,
     pub features: Vec<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct VmPartitionIdResponse {
+    pub partition_id: u64,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -345,6 +354,8 @@ pub trait RequestHandler {
     fn vm_add_vsock(&mut self, vsock_cfg: VsockConfig) -> Result<Option<Vec<u8>>, VmError>;
 
     fn vm_counters(&mut self) -> Result<Option<Vec<u8>>, VmError>;
+
+    fn vm_partition_id(&mut self) -> Result<Option<Vec<u8>>, VmError>;
 
     fn vm_power_button(&mut self) -> Result<(), VmError>;
 
@@ -804,6 +815,39 @@ impl ApiAction for VmCounters {
             let response = vmm
                 .vm_counters()
                 .map_err(ApiError::VmInfo)
+                .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmPartitionId;
+
+impl ApiAction for VmPartitionId {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmPartitionId");
+
+            let response = vmm
+                .vm_partition_id()
+                .map_err(ApiError::VmPartitionId)
                 .map(ApiResponsePayload::VmAction);
 
             response_sender

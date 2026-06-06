@@ -142,6 +142,11 @@ pub enum HypervisorVmError {
     ///
     #[error("Failed to create passthrough device: {0}")]
     CreatePassthroughDevice(#[source] anyhow::Error),
+    ///
+    /// Get partition ID error
+    ///
+    #[error("Failed to get partition ID: {0}")]
+    GetPartitionId(#[source] anyhow::Error),
     /// Write to Guest memory
     ///
     #[error("Failed to write to guest memory: {0}")]
@@ -346,6 +351,12 @@ pub trait Vm: Send + Sync + Any {
     fn set_clock(&self, data: &ClockData) -> Result<()>;
     /// Create a device that is used for passthrough
     fn create_passthrough_device(&self) -> Result<vfio_ioctls::VfioDeviceFd>;
+    /// Get the MSHV partition ID when supported by the hypervisor.
+    fn partition_id(&self) -> Result<u64> {
+        Err(HypervisorVmError::GetPartitionId(anyhow::anyhow!(
+            "partition ID is only supported by MSHV"
+        )))
+    }
     /// Start logging dirty pages
     fn start_dirty_log(&self) -> Result<()>;
     /// Stop logging dirty pages

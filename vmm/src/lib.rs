@@ -1936,6 +1936,22 @@ impl RequestHandler for Vmm {
         }
     }
 
+    fn vm_partition_id(&mut self) -> result::Result<Option<Vec<u8>>, VmError> {
+        if let Some(ref mut vm) = self.vm {
+            let info = api::VmPartitionIdResponse {
+                partition_id: vm.partition_id().map_err(|e| {
+                    error!("Error when getting partition ID from the VM: {:?}", e);
+                    e
+                })?,
+            };
+            serde_json::to_vec(&info)
+                .map(Some)
+                .map_err(VmError::SerializeJson)
+        } else {
+            Err(VmError::VmNotRunning)
+        }
+    }
+
     fn vm_power_button(&mut self) -> result::Result<(), VmError> {
         if let Some(ref mut vm) = self.vm {
             vm.power_button()

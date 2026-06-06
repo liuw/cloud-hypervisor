@@ -52,6 +52,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/VmCounters"
 
+  /vm.partition-id:
+    get:
+      summary: Get the MSHV partition ID of the VM
+      responses:
+        200:
+          description: The VM MSHV partition ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VmPartitionId"
+
   /vm.create:
     put:
       summary: Create the cloud-hypervisor Virtual Machine (VM) instance. The instance is not booted, only created.
@@ -522,6 +533,15 @@ components:
       additionalProperties:
         type: object
         additionalProperties:
+          type: integer
+          format: int64
+
+    VmPartitionId:
+      type: object
+      required:
+        - partition_id
+      properties:
+        partition_id:
           type: integer
           format: int64
 

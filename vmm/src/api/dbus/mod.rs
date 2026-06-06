@@ -7,9 +7,9 @@ use super::{ApiAction, ApiRequest};
 use crate::api::VmCoredump;
 use crate::api::{
     AddDisk, Body, VmAddDevice, VmAddFs, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa,
-    VmAddVsock, VmBoot, VmCounters, VmCreate, VmDelete, VmInfo, VmPause, VmPowerButton, VmReboot,
-    VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeZone, VmRestore, VmResume,
-    VmSendMigration, VmShutdown, VmSnapshot, VmmPing, VmmShutdown,
+    VmAddVsock, VmBoot, VmCounters, VmCreate, VmDelete, VmInfo, VmPartitionId, VmPause,
+    VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeZone, VmRestore,
+    VmResume, VmSendMigration, VmShutdown, VmSnapshot, VmmPing, VmmShutdown,
 };
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::{Error as VmmError, Result as VmmResult};
@@ -195,6 +195,10 @@ impl DBusApi {
 
     async fn vm_counters(&self) -> Result<Optional<String>> {
         self.vm_action(&VmCounters, ()).await
+    }
+
+    async fn vm_partition_id(&self) -> Result<Optional<String>> {
+        self.vm_action(&VmPartitionId, ()).await
     }
 
     async fn vm_create(&self, vm_config: String) -> Result<()> {

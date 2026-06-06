@@ -328,6 +328,9 @@ pub enum Error {
     #[error("Error resuming the VM: {0}")]
     ResumeVm(#[source] hypervisor::HypervisorVmError),
 
+    #[error("Error getting partition ID: {0}")]
+    GetPartitionId(#[source] hypervisor::HypervisorVmError),
+
     #[error("Error creating console devices")]
     CreateConsoleDevices(ConsoleDeviceError),
 }
@@ -1732,6 +1735,10 @@ impl Vm {
 
     pub fn counters(&self) -> Result<HashMap<String, HashMap<&'static str, Wrapping<u64>>>> {
         Ok(self.device_manager.lock().unwrap().counters())
+    }
+
+    pub fn partition_id(&self) -> Result<u64> {
+        self.vm.partition_id().map_err(Error::GetPartitionId)
     }
 
     #[cfg(feature = "tdx")]
