@@ -5116,6 +5116,55 @@ mod common_parallel {
     }
 
     #[test]
+    #[cfg(all(feature = "mshv", target_arch = "x86_64"))]
+    fn test_api_http_mshv_partition_id() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let api_socket = temp_api_path(&guest.tmp_dir);
+        let kernel_path = direct_kernel_boot_path();
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=256M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", "console=hvc0 root=/dev/none panic=0"])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            for _ in 0..120 {
+                if remote_command(&api_socket, "ping", None) {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(250));
+            }
+            assert!(remote_command(&api_socket, "ping", None));
+
+            let (cmd_success, cmd_output) =
+                remote_command_w_output(&api_socket, "partition-id", None);
+            assert!(cmd_success);
+            let response: serde_json::Value = serde_json::from_slice(&cmd_output).unwrap();
+            let partition_id = response["partition_id"].as_u64().unwrap();
+            assert_ne!(partition_id, 0);
+
+            let (cmd_success, cmd_output) =
+                remote_command_w_output(&api_socket, "partition-id", None);
+            assert!(cmd_success);
+            let response: serde_json::Value = serde_json::from_slice(&cmd_output).unwrap();
+            assert_eq!(response["partition_id"].as_u64().unwrap(), partition_id);
+
+            assert!(Path::new(&format!("/sys/kernel/mshv/partitions/{partition_id}")).exists());
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
     fn test_virtio_iommu() {
         _test_virtio_iommu(cfg!(target_arch = "x86_64"))
     }
