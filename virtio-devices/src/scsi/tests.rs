@@ -6,13 +6,13 @@
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
     use std::path::PathBuf;
 
     use super::super::commands::*;
     use super::super::protocol::*;
     use super::super::target::*;
 
+    #[allow(dead_code)]
     fn create_test_config() -> ScsiLunConfig {
         ScsiLunConfig {
             target: 0,
@@ -109,7 +109,8 @@ mod tests {
     #[test]
     fn test_lun_parsing() {
         // Test LUN parsing for single-level addressing (target, LUN)
-        let lun_bytes: [u8; 8] = [0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        // Format: [format=1, target, lun_hi, lun_lo, 0, 0, 0, 0]
+        let lun_bytes: [u8; 8] = [0x01, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00];
         let result = parse_lun(&lun_bytes);
         assert!(result.is_some());
         let (target, lun) = result.unwrap();
@@ -124,6 +125,8 @@ mod tests {
         assert_eq!(scsi_opcode::READ_10, 0x28);
         assert_eq!(scsi_opcode::WRITE_10, 0x2A);
         assert_eq!(scsi_opcode::READ_CAPACITY_10, 0x25);
+        assert_eq!(scsi_opcode::PERSISTENT_RESERVE_IN, 0x5E);
+        assert_eq!(scsi_opcode::PERSISTENT_RESERVE_OUT, 0x5F);
     }
 
     #[test]

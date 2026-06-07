@@ -322,6 +322,8 @@ pub mod scsi_opcode {
     pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
     pub const UNMAP: u8 = 0x42;
     pub const MODE_SELECT_10: u8 = 0x55;
+    pub const PERSISTENT_RESERVE_IN: u8 = 0x5E;
+    pub const PERSISTENT_RESERVE_OUT: u8 = 0x5F;
     pub const MODE_SENSE_10: u8 = 0x5A;
     pub const READ_16: u8 = 0x88;
     pub const WRITE_16: u8 = 0x8A;

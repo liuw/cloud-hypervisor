@@ -227,10 +227,33 @@ pub struct ScsiLunState {
     pub id: ScsiLunId,
     /// Whether the LUN is online
     pub online: bool,
+    /// Persistent reservation state for this LUN.
+    #[serde(default)]
+    pub persistent_reservation: ScsiPersistentReservationState,
     /// Unit attention condition pending
     pub unit_attention: bool,
     /// Power condition
     pub power_condition: u8,
+}
+
+/// Active persistent reservation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScsiPersistentReservation {
+    /// Registered reservation key that owns the reservation.
+    pub key: u64,
+    /// SCSI persistent reservation type.
+    pub reservation_type: u8,
+}
+
+/// Per-LUN persistent reservation state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScsiPersistentReservationState {
+    /// Generation counter returned by PR IN commands.
+    pub generation: u32,
+    /// Registered keys. virtio-scsi currently exposes one local initiator.
+    pub registered_keys: Vec<u64>,
+    /// Current active reservation, if any.
+    pub reservation: Option<ScsiPersistentReservation>,
 }
 
 #[cfg(test)]
