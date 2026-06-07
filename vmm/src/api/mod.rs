@@ -58,6 +58,7 @@ use crate::vm::{Error as VmError, VmState};
 use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
     UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    ScsiConfig,
 };
 
 /// API errors are sent back from the VMM API server through the ApiResponse.
@@ -170,6 +171,10 @@ pub enum ApiError {
     /// The disk could not be added to the VM.
     #[error("The disk could not be added to the VM")]
     VmAddDisk(#[source] VmError),
+
+    /// The SCSI device could not be added to the VM.
+    #[error("The SCSI device could not be added to the VM")]
+    VmAddScsi(#[source] VmError),
 
     /// The fs could not be added to the VM.
     #[error("The fs could not be added to the VM")]
@@ -555,6 +560,8 @@ pub trait RequestHandler {
 
     fn vm_add_disk(&mut self, disk_cfg: DiskConfig) -> Result<Option<Vec<u8>>, VmError>;
 
+    fn vm_add_scsi(&mut self, scsi_cfg: ScsiConfig) -> Result<Option<Vec<u8>>, VmError>;
+
     fn vm_add_fs(&mut self, fs_cfg: FsConfig) -> Result<Option<Vec<u8>>, VmError>;
 
     fn vm_add_generic_vhost_user(
@@ -704,6 +711,43 @@ impl ApiAction for AddDisk {
             let response = vmm
                 .vm_add_disk(config)
                 .map_err(ApiError::VmAddDisk)
+                .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct AddScsi;
+
+impl ApiAction for AddScsi {
+    type RequestBody = ScsiConfig;
+    type ResponseBody = Option<Body>;
+
+    fn request(
+        &self,
+        config: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: AddScsi {config:?}");
+
+            let response = vmm
+                .vm_add_scsi(config)
+                .map_err(ApiError::VmAddScsi)
                 .map(ApiResponsePayload::VmAction);
 
             response_sender

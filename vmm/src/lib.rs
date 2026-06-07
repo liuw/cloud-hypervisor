@@ -65,6 +65,7 @@ use crate::vm::{Error as VmError, Vm, VmState};
 use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
     UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    ScsiConfig,
 };
 
 mod acpi;
@@ -2331,6 +2332,31 @@ impl RequestHandler for Vmm {
             // Update VmConfig by adding the new device.
             let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
             add_to_config(&mut config.disks, disk_cfg);
+            Ok(None)
+        }
+    }
+
+    fn vm_add_scsi(&mut self, scsi_cfg: ScsiConfig) -> result::Result<Option<Vec<u8>>, VmError> {
+        self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
+
+        {
+            // Validate the configuration change in a cloned configuration
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            add_to_config(&mut config.scsi, scsi_cfg.clone());
+            config.validate().map_err(VmError::ConfigValidation)?;
+        }
+
+        if let Some(ref mut vm) = self.vm {
+            let info = vm.add_scsi(scsi_cfg).inspect_err(|e| {
+                error!("Error when adding new SCSI device to the VM: {e:?}");
+            })?;
+            serde_json::to_vec(&info)
+                .map(Some)
+                .map_err(VmError::SerializeJson)
+        } else {
+            // Update VmConfig by adding the new device.
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
+            add_to_config(&mut config.scsi, scsi_cfg);
             Ok(None)
         }
     }

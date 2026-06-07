@@ -111,6 +111,9 @@ pub enum Error {
     /// Error parsing disk options
     #[error("Error parsing --disk")]
     ParseDisk(#[source] OptionParserError),
+    /// Error parsing SCSI options
+    #[error("Error parsing --scsi")]
+    ParseScsi(#[source] OptionParserError),
     /// Error parsing network options
     #[error("Error parsing --net")]
     ParseNetwork(#[source] OptionParserError),
@@ -459,6 +462,7 @@ pub struct VmParams<'a> {
     pub cmdline: Option<&'a str>,
     pub rate_limit_groups: Option<Vec<&'a str>>,
     pub disks: Option<Vec<&'a str>>,
+    pub scsi: Option<Vec<&'a str>>,
     pub net: Option<Vec<&'a str>>,
     pub rng: &'a str,
     pub balloon: Option<&'a str>,
@@ -515,6 +519,9 @@ impl<'a> VmParams<'a> {
             .map(|x| x.map(|y| y as &str).collect());
         let disks: Option<Vec<&str>> = args
             .get_many::<String>("disk")
+            .map(|x| x.map(|y| y as &str).collect());
+        let scsi: Option<Vec<&str>> = args
+            .get_many::<String>("scsi")
             .map(|x| x.map(|y| y as &str).collect());
         let net: Option<Vec<&str>> = args
             .get_many::<String>("net")
@@ -580,6 +587,7 @@ impl<'a> VmParams<'a> {
             cmdline,
             rate_limit_groups,
             disks,
+            scsi,
             net,
             rng,
             balloon,
@@ -1601,6 +1609,128 @@ impl DiskConfig {
                 serial.len(),
                 VIRTIO_BLK_ID_BYTES as usize,
             ));
+        }
+
+        Ok(())
+    }
+}
+
+impl ScsiLunConfig {
+    pub const SYNTAX: &'static str = "SCSI LUN parameters \
+         \"path=<disk_image_path>,target=<target_id>,lun=<lun_id>,readonly=on|off\"";
+
+    pub fn parse(lun_str: &str) -> Result<Self> {
+        let mut parser = OptionParser::new();
+        parser.add("path").add("target").add("lun").add("readonly");
+        parser.parse(lun_str).map_err(Error::ParseScsi)?;
+
+        let path = parser
+            .get("path")
+            .map(PathBuf::from)
+            .ok_or_else(|| Error::ParseScsi(OptionParserError::InvalidSyntax(
+                "path is required".to_string(),
+            )))?;
+        let target = parser
+            .convert("target")
+            .map_err(Error::ParseScsi)?
+            .unwrap_or(0);
+        let lun = parser
+            .convert("lun")
+            .map_err(Error::ParseScsi)?
+            .unwrap_or(0);
+        let readonly = parser
+            .convert::<Toggle>("readonly")
+            .map_err(Error::ParseScsi)?
+            .unwrap_or(Toggle(false))
+            .0;
+
+        Ok(ScsiLunConfig {
+            path,
+            target,
+            lun,
+            readonly,
+        })
+    }
+}
+
+impl ScsiConfig {
+    pub const SYNTAX: &'static str = "SCSI controller parameters \
+         \"path=<disk_path>,id=<device_id>,pci_segment=<segment_id>,iommu=on|off,\
+         num_queues=<number_of_request_queues>,queue_size=<size_of_each_queue>,\
+         target=<target_id>,lun=<lun_id>,readonly=on|off\" \
+         (path creates a single LUN; for multiple LUNs use JSON config)";
+
+    pub fn parse(scsi: &str) -> Result<Self> {
+        let mut parser = OptionParser::new();
+        parser
+            .add("id")
+            .add("pci_segment")
+            .add("iommu")
+            .add("num_queues")
+            .add("queue_size")
+            .add("path")
+            .add("target")
+            .add("lun")
+            .add("readonly");
+        parser.parse(scsi).map_err(Error::ParseScsi)?;
+
+        let pci_common = PciDeviceCommonConfig::parse(scsi)?;
+        let num_queues = parser
+            .convert("num_queues")
+            .map_err(Error::ParseScsi)?
+            .unwrap_or_else(default_scsiconfig_num_queues);
+        let queue_size = parser
+            .convert("queue_size")
+            .map_err(Error::ParseScsi)?
+            .unwrap_or_else(default_scsiconfig_queue_size);
+
+        // Parse single LUN from path/target/lun/readonly options
+        let luns = if let Some(path) = parser.get("path") {
+            let target = parser
+                .convert("target")
+                .map_err(Error::ParseScsi)?
+                .unwrap_or(0);
+            let lun = parser
+                .convert("lun")
+                .map_err(Error::ParseScsi)?
+                .unwrap_or(0);
+            let readonly = parser
+                .convert::<Toggle>("readonly")
+                .map_err(Error::ParseScsi)?
+                .unwrap_or(Toggle(false))
+                .0;
+
+            vec![ScsiLunConfig {
+                path: PathBuf::from(path),
+                target,
+                lun,
+                readonly,
+            }]
+        } else {
+            Vec::new()
+        };
+
+        Ok(ScsiConfig {
+            pci_common,
+            num_queues,
+            queue_size,
+            luns,
+        })
+    }
+
+    pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+        self.pci_common.validate(vm_config)?;
+
+        // Validate LUN uniqueness
+        let mut seen_luns = std::collections::HashSet::new();
+        for lun in &self.luns {
+            let key = (lun.target, lun.lun);
+            if !seen_luns.insert(key) {
+                return Err(ValidationError::DuplicateDevicePath(format!(
+                    "Duplicate SCSI LUN: target={}, lun={}",
+                    lun.target, lun.lun
+                )));
+            }
         }
 
         Ok(())
@@ -3413,6 +3543,16 @@ impl VmConfig {
             disks = Some(disk_config_list);
         }
 
+        let mut scsi: Option<Vec<ScsiConfig>> = None;
+        if let Some(scsi_list) = &vm_params.scsi {
+            let mut scsi_config_list = Vec::new();
+            for item in scsi_list.iter() {
+                let scsi_config = ScsiConfig::parse(item)?;
+                scsi_config_list.push(scsi_config);
+            }
+            scsi = Some(scsi_config_list);
+        }
+
         #[cfg(feature = "fw_cfg")]
         let fw_cfg_config = if let Some(fw_cfg_config_str) = vm_params.fw_cfg_config {
             let fw_cfg_config = FwCfgConfig::parse(fw_cfg_config_str)?;
@@ -3599,6 +3739,7 @@ impl VmConfig {
             payload,
             rate_limit_groups,
             disks,
+            scsi,
             net,
             rng,
             balloon,
@@ -3738,6 +3879,7 @@ impl Clone for VmConfig {
             payload: self.payload.clone(),
             rate_limit_groups: self.rate_limit_groups.clone(),
             disks: self.disks.clone(),
+            scsi: self.scsi.clone(),
             net: self.net.clone(),
             rng: self.rng.clone(),
             rtc: self.rtc.clone(),

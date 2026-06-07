@@ -122,7 +122,7 @@ use crate::vm_config::IvshmemConfig;
 use crate::vm_config::{
     ConsoleOutputMode, DEFAULT_IOMMU_ADDRESS_WIDTH_BITS, DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT,
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PciDeviceCommonConfig,
-    PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig, VsockConfig,
+    PmemConfig, ScsiConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig, VsockConfig,
 };
 use crate::{DEVICE_MANAGER_SNAPSHOT_ID, GuestRegionMmap, PciDeviceInfo, device_node};
 
@@ -151,6 +151,7 @@ const IVSHMEM_DEVICE_NAME: &str = "__ivshmem";
 // Devices that the user may name and for which we generate
 // identifiers if the user doesn't give one
 const DISK_DEVICE_NAME_PREFIX: &str = "_disk";
+const SCSI_DEVICE_NAME_PREFIX: &str = "_scsi";
 const FS_DEVICE_NAME_PREFIX: &str = "_fs";
 const NET_DEVICE_NAME_PREFIX: &str = "_net";
 const GENERIC_VHOST_USER_DEVICE_NAME_PREFIX: &str = "_generic_vhost_user";
@@ -180,6 +181,10 @@ pub enum DeviceManagerError {
     /// Cannot create virtio-blk device
     #[error("Cannot create virtio-blk device")]
     CreateVirtioBlock(#[source] io::Error),
+
+    /// Cannot create virtio-scsi device
+    #[error("Cannot create virtio-scsi device")]
+    CreateVirtioScsi(#[source] virtio_devices::scsi::Error),
 
     /// Cannot create virtio-net device
     #[error("Cannot create virtio-net device")]
@@ -2631,6 +2636,7 @@ impl DeviceManager {
     fn make_virtio_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
         // Create "standard" virtio devices (net/block/rng)
         self.make_virtio_block_devices(snapshot)?;
+        self.make_virtio_scsi_devices(snapshot)?;
         self.make_virtio_net_devices(snapshot)?;
         self.make_virtio_rng_devices(snapshot)?;
 
@@ -2899,6 +2905,84 @@ impl DeviceManager {
             }
         }
         self.config.lock().unwrap().disks = block_devices;
+
+        Ok(())
+    }
+
+    /// Creates a [`MetaVirtioDevice`] from the provided [`ScsiConfig`].
+    fn make_virtio_scsi_device(
+        &mut self,
+        scsi_cfg: &mut ScsiConfig,
+        snapshot: Option<&Snapshot>,
+    ) -> DeviceManagerResult<MetaVirtioDevice> {
+        let id = match scsi_cfg.pci_common.id.as_ref() {
+            Some(id) => id.clone(),
+            None => scsi_cfg
+                .pci_common
+                .id
+                .insert(self.next_device_name(SCSI_DEVICE_NAME_PREFIX)?)
+                .clone(),
+        };
+
+        info!("Creating virtio-scsi device: {scsi_cfg:?}");
+
+        // Convert VMM ScsiLunConfig to virtio-devices ScsiLunConfig
+        let luns: Vec<virtio_devices::scsi::ScsiLunConfig> = scsi_cfg
+            .luns
+            .iter()
+            .map(|lun| virtio_devices::scsi::ScsiLunConfig {
+                target: lun.target,
+                lun: lun.lun,
+                path: lun.path.clone(),
+                readonly: lun.readonly,
+                direct: false,
+                device_type: virtio_devices::scsi::ScsiDeviceType::DirectAccess,
+                vendor_id: "CLOUD-HV".to_string(),
+                product_id: "VIRTIO-SCSI".to_string(),
+                product_rev: "0001".to_string(),
+            })
+            .collect();
+
+        // Create the SCSI device
+        let scsi_device = virtio_devices::Scsi::new(
+            id.clone(),
+            luns,
+            scsi_cfg.num_queues,
+            scsi_cfg.queue_size,
+            self.force_access_platform | scsi_cfg.pci_common.iommu,
+            self.seccomp_action.clone(),
+            self.exit_evt
+                .try_clone()
+                .map_err(DeviceManagerError::EventFd)?,
+            state_from_id(snapshot, id.as_str()).map_err(DeviceManagerError::RestoreGetState)?,
+        )
+        .map_err(DeviceManagerError::CreateVirtioScsi)?;
+
+        let scsi_device = Arc::new(Mutex::new(scsi_device));
+        let migratable_device = scsi_device.clone();
+
+        // Fill the device tree with a new node
+        self.device_tree
+            .lock()
+            .unwrap()
+            .insert(id.clone(), device_node!(id, migratable_device));
+
+        Ok(MetaVirtioDevice {
+            virtio_device: scsi_device as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
+            pci_common: scsi_cfg.pci_common.clone(),
+            dma_handler: None,
+        })
+    }
+
+    fn make_virtio_scsi_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
+        let mut scsi_devices = self.config.lock().unwrap().scsi.clone();
+        if let Some(scsi_list_cfg) = &mut scsi_devices {
+            for scsi_cfg in scsi_list_cfg.iter_mut() {
+                let device = self.make_virtio_scsi_device(scsi_cfg, snapshot)?;
+                self.virtio_devices.push(device);
+            }
+        }
+        self.config.lock().unwrap().scsi = scsi_devices;
 
         Ok(())
     }
@@ -5184,6 +5268,17 @@ impl DeviceManager {
         }
 
         let device = self.make_virtio_block_device(disk_cfg, true, None)?;
+        self.hotplug_virtio_pci_device(device)
+    }
+
+    pub fn add_scsi(&mut self, scsi_cfg: &mut ScsiConfig) -> DeviceManagerResult<PciDeviceInfo> {
+        self.validate_identifier(&scsi_cfg.pci_common.id)?;
+
+        if scsi_cfg.pci_common.iommu && !self.is_iommu_segment(scsi_cfg.pci_common.pci_segment) {
+            return Err(DeviceManagerError::InvalidIommuHotplug);
+        }
+
+        let device = self.make_virtio_scsi_device(scsi_cfg, None)?;
         self.hotplug_virtio_pci_device(device)
     }
 

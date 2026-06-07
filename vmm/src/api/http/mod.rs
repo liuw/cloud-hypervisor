@@ -32,6 +32,7 @@ use crate::api::{
     VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCounters, VmDelete, VmNmi,
     VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
     VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+    AddScsi,
 };
 use crate::landlock::Landlock;
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
@@ -210,6 +211,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
     r.routes.insert(
         endpoint!("/vm.add-disk"),
         Box::new(VmActionHandler::new(&AddDisk)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.add-scsi"),
+        Box::new(VmActionHandler::new(&AddScsi)),
     );
     r.routes.insert(
         endpoint!("/vm.add-fs"),

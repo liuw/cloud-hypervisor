@@ -36,6 +36,7 @@ use vmm::vm_config::{
     LandlockConfig, NetConfig, NumaConfig, PciSegmentConfig, PlatformConfig, PmemConfig,
     RateLimiterGroupConfig, RngConfig, RtcConfig, SerialConfig, TpmConfig, UserDeviceConfig,
     VdpaConfig, VmConfig, VsockConfig,
+    ScsiConfig,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::block_signal;
@@ -409,6 +410,11 @@ fn get_cli_options_sorted(
             .help(RtcConfig::SYNTAX)
             .num_args(0..=1)
             .default_missing_value("")
+            .group("vm-config"),
+        Arg::new("scsi")
+            .long("scsi")
+            .help(ScsiConfig::SYNTAX)
+            .num_args(1..)
             .group("vm-config"),
         Arg::new("seccomp")
             .long("seccomp")

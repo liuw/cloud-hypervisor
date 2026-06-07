@@ -50,6 +50,7 @@ use crate::api::{
     VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
     VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
     VmShutdown, VmSnapshot,
+    AddScsi,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
@@ -419,6 +420,7 @@ vm_action_put_handler!(VmNmi);
 
 vm_action_put_handler_body!(VmAddDevice);
 vm_action_put_handler_body!(AddDisk);
+vm_action_put_handler_body!(AddScsi);
 vm_action_put_handler_body!(VmAddFs);
 vm_action_put_handler_body!(VmAddGenericVhostUser);
 vm_action_put_handler_body!(VmAddPmem);

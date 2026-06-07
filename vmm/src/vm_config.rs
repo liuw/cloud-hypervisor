@@ -420,6 +420,62 @@ pub fn default_diskconfig_sparse() -> bool {
 
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ScsiLunConfig {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub target: u8,
+    #[serde(default)]
+    pub lun: u16,
+    #[serde(default)]
+    pub readonly: bool,
+}
+
+impl ApplyLandlock for ScsiLunConfig {
+    fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
+        landlock.add_rule_with_access(&self.path, "rw")?;
+        Ok(())
+    }
+}
+
+/// SCSI controller configuration.
+#[serde_with::skip_serializing_none]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ScsiConfig {
+    #[serde(flatten)]
+    pub pci_common: PciDeviceCommonConfig,
+    /// Number of request queues (in addition to control and event queues)
+    #[serde(default = "default_scsiconfig_num_queues")]
+    pub num_queues: usize,
+    /// Queue size
+    #[serde(default = "default_scsiconfig_queue_size")]
+    pub queue_size: u16,
+    /// LUNs attached to this controller
+    #[serde(default)]
+    pub luns: Vec<ScsiLunConfig>,
+}
+
+impl ApplyLandlock for ScsiConfig {
+    fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
+        for lun in &self.luns {
+            lun.apply_landlock(landlock)?;
+        }
+        Ok(())
+    }
+}
+
+pub const DEFAULT_SCSI_NUM_QUEUES: usize = 1;
+
+pub fn default_scsiconfig_num_queues() -> usize {
+    DEFAULT_SCSI_NUM_QUEUES
+}
+
+pub const DEFAULT_SCSI_QUEUE_SIZE: u16 = 128;
+
+pub fn default_scsiconfig_queue_size() -> u16 {
+    DEFAULT_SCSI_QUEUE_SIZE
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct NetConfig {
     #[serde(flatten)]
     pub pci_common: PciDeviceCommonConfig,
@@ -1111,6 +1167,7 @@ pub struct VmConfig {
     pub payload: Option<PayloadConfig>,
     pub rate_limit_groups: Option<Box<[RateLimiterGroupConfig]>>,
     pub disks: Option<Vec<DiskConfig>>,
+    pub scsi: Option<Vec<ScsiConfig>>,
     pub net: Option<Vec<NetConfig>>,
     #[serde(default)]
     pub rng: RngConfig,
@@ -1183,6 +1240,12 @@ impl VmConfig {
         if let Some(disks) = disks {
             for disk in disks.iter() {
                 disk.apply_landlock(&mut landlock)?;
+            }
+        }
+
+        if let Some(scsi_configs) = &self.scsi {
+            for scsi_config in scsi_configs.iter() {
+                scsi_config.apply_landlock(&mut landlock)?;
             }
         }
 
