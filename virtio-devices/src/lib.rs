@@ -28,6 +28,7 @@ pub mod net;
 mod pmem;
 mod rng;
 mod rtc;
+pub mod scsi;
 pub mod seccomp_filters;
 mod thread_helper;
 pub mod transport;
