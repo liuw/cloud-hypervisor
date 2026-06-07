@@ -17,6 +17,7 @@ This document describes the device model supported by `cloud-hypervisor`.
 | virtio-net | :x: | :x: | :heavy_check_mark: |
 | virtio-pmem | :x: | :x: | :heavy_check_mark: |
 | virtio-rng | :x: | :x: | :heavy_check_mark: |
+| virtio-scsi | :x: | :x: | :heavy_check_mark: |
 | virtio-vsock | :x: | :x: | :heavy_check_mark: |
 | vhost-user-blk | :x: | :x: | :heavy_check_mark: |
 | vhost-user-fs | :x: | :x: | :heavy_check_mark: |
@@ -152,6 +153,12 @@ that can be found on the host. By default, the chosen source of entropy is
 
 This device is always built-in, and it is always enabled. The `--rng` flag can
 be used to change the source of entropy.
+
+### virtio-scsi
+
+The `virtio-scsi` device exposes one or more disk-backed SCSI LUNs to the
+guest through a SCSI HBA. It is enabled with the `--scsi` option or the
+equivalent JSON/API configuration. Vhost-user-scsi is not supported.
 
 ### virtio-vsock
 
