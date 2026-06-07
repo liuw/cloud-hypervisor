@@ -5,6 +5,7 @@
 //! Virtio SCSI device implementation.
 
 mod commands;
+mod device;
 mod handler;
 mod protocol;
 mod target;
@@ -12,6 +13,7 @@ mod target;
 mod tests;
 
 pub use commands::{DiskOps, ScsiCommandError, ScsiCommandProcessor, ScsiCommandResult};
+pub use device::{Error, Scsi, ScsiState};
 pub use handler::{ScsiCtrlHandler, ScsiDisk, ScsiEventHandler, ScsiRequestHandler};
 pub use protocol::*;
 pub use target::*;

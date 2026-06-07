@@ -57,6 +57,7 @@ pub use self::net::{Net, NetCtrlEpollHandler};
 pub use self::pmem::Pmem;
 pub use self::rng::Rng;
 pub use self::rtc::Rtc;
+pub use self::scsi::{Scsi, ScsiState};
 pub use self::vdpa::{Vdpa, VdpaDmaMapping};
 pub use self::vsock::Vsock;
 pub use self::watchdog::Watchdog;
