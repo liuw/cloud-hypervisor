@@ -13,6 +13,7 @@ use std::io::{Read, Seek, Write};
 #[cfg(not(feature = "mshv"))]
 use std::net::TcpListener;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::string::String;
@@ -20,6 +21,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, thread};
 
+use api_client::{simple_api_command, simple_api_full_command_and_response};
 use block::ImageType;
 use test_infra::*;
 use vmm_sys_util::tempdir::TempDir;
@@ -3280,6 +3282,276 @@ mod common_parallel {
     fn test_disk_hotplug_with_landlock() {
         let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
         _test_disk_hotplug(&guest, true);
+    }
+
+    fn create_scsi_test_disk(path: &std::path::Path, size: u64) {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+    }
+
+    fn api_scsi_config_contains_lun(api_socket: &str, lun_path: &std::path::Path) -> bool {
+        let Ok(mut socket) = UnixStream::connect(api_socket) else {
+            return false;
+        };
+        let Ok(Some(response)) =
+            simple_api_full_command_and_response(&mut socket, "GET", "vm.info", None)
+        else {
+            return false;
+        };
+        let Ok(info) = serde_json::from_str::<serde_json::Value>(&response) else {
+            return false;
+        };
+        info["config"]["scsi"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|controller| controller["luns"].as_array().into_iter().flatten())
+            .any(|lun| lun["path"].as_str() == lun_path.to_str())
+    }
+
+    #[test]
+    fn test_virtio_scsi_sync() {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let api_socket = temp_api_path(&guest.tmp_dir);
+        let lun0 = guest.tmp_dir.as_path().join("scsi-sync-lun0.img");
+        create_scsi_test_disk(&lun0, 16 << 20);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .default_disks()
+            .args(["--scsi", format!("path={}", lun0.display()).as_str()])
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            assert!(api_scsi_config_contains_lun(&api_socket, &lun0));
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_virtio_scsi_snapshot_restore() {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let api_socket_source = format!("{}.1", temp_api_path(&guest.tmp_dir));
+        let api_socket_restored = format!("{}.2", temp_api_path(&guest.tmp_dir));
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
+        let event_path_restored = format!("{}.2", temp_event_monitor_path(&guest.tmp_dir));
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+        let lun0 = guest.tmp_dir.as_path().join("scsi-restore-lun0.img");
+        create_scsi_test_disk(&lun0, 16 << 20);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_source])
+            .args(["--event-monitor", format!("path={event_path}").as_str()])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--console", "off"])
+            .default_disks()
+            .args(["--scsi", format!("path={}", lun0.display()).as_str()])
+            .default_net()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            assert!(api_scsi_config_contains_lun(&api_socket_source, &lun0));
+            snapshot_restore_common::snapshot_and_check_events(
+                &api_socket_source,
+                &snapshot_dir,
+                &event_path,
+            );
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_restored])
+            .args([
+                "--event-monitor",
+                format!("path={event_path_restored}").as_str(),
+            ])
+            .args([
+                "--restore",
+                format!("source_url=file://{snapshot_dir}").as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            assert!(wait_until(Duration::from_secs(30), || remote_command(
+                &api_socket_restored,
+                "info",
+                None
+            )));
+            assert!(remote_command(&api_socket_restored, "resume", None));
+            guest.wait_for_ssh(Duration::from_secs(30)).unwrap();
+            assert!(api_scsi_config_contains_lun(&api_socket_restored, &lun0));
+        });
+
+        let _ = std::fs::remove_dir_all(snapshot_dir.as_str());
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    #[cfg(not(feature = "mshv"))]
+    fn test_scsi_live_migration() {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let src_api_socket = format!("{}.src", temp_api_path(&guest.tmp_dir));
+        let dest_api_socket = format!("{}.dest", temp_api_path(&guest.tmp_dir));
+        let lun0 = guest.tmp_dir.as_path().join("scsi-migrate-lun0.img");
+        create_scsi_test_disk(&lun0, 16 << 20);
+
+        let mut src_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &src_api_socket])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--console", "off"])
+            .default_disks()
+            .args(["--scsi", format!("path={}", lun0.display()).as_str()])
+            .default_net()
+            .spawn()
+            .unwrap();
+
+        let mut dest_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &dest_api_socket])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            assert!(api_scsi_config_contains_lun(&src_api_socket, &lun0));
+
+            let migration_socket = guest
+                .tmp_dir
+                .as_path()
+                .join("scsi-live-migration.sock")
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                start_live_migration(
+                    &migration_socket,
+                    &src_api_socket,
+                    &dest_api_socket,
+                    false,
+                    false
+                ),
+                "Unsuccessful command: 'send-migration' or 'receive-migration'."
+            );
+        });
+
+        if r.is_err() {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "Error occurred during SCSI live migration",
+            );
+        }
+
+        let src_exited_ok = wait_until(Duration::from_secs(30), || {
+            matches!(src_child.try_wait(), Ok(Some(_)))
+        }) && src_child.try_wait().unwrap().is_some_and(|s| s.success());
+        if !src_exited_ok {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "source VM was not terminated successfully.",
+            );
+        }
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_for_ssh(Duration::from_secs(30)).unwrap();
+            assert!(api_scsi_config_contains_lun(&dest_api_socket, &lun0));
+        });
+
+        let _ = dest_child.kill();
+        let output = dest_child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_scsi_hotplug_multi_lun() {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let api_socket = temp_api_path(&guest.tmp_dir);
+
+        let lun0 = guest.tmp_dir.as_path().join("scsi-lun0.img");
+        let lun1 = guest.tmp_dir.as_path().join("scsi-lun1.img");
+        create_scsi_test_disk(&lun0, 16 << 20);
+        create_scsi_test_disk(&lun1, 32 << 20);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            assert!(
+                guest
+                    .ssh_command("test ! -e /dev/sda && test ! -e /dev/sdb")
+                    .is_ok()
+            );
+
+            let request_body = serde_json::json!({
+                "id": "scsi0",
+                "luns": [
+                    { "path": lun0, "target": 0, "lun": 0 },
+                    { "path": lun1, "target": 0, "lun": 1 }
+                ]
+            })
+            .to_string();
+
+            let mut socket = UnixStream::connect(&api_socket).unwrap();
+            simple_api_command(&mut socket, "PUT", "add-scsi", Some(&request_body)).unwrap();
+            assert!(api_scsi_config_contains_lun(&api_socket, &lun0));
+            assert!(api_scsi_config_contains_lun(&api_socket, &lun1));
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
     }
 
     #[test]
