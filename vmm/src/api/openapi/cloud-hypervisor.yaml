@@ -277,6 +277,28 @@ paths:
         500:
           description: The new device could not be added to the VM instance.
 
+  /vm.add-scsi:
+    put:
+      summary: Add a new virtio-scsi device to the VM
+      requestBody:
+        description: The details of the new SCSI controller
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScsiConfig"
+        required: true
+      responses:
+        200:
+          description: The new SCSI controller was successfully added to the VM instance.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PciDeviceInfo"
+        204:
+          description: The new SCSI controller was successfully (cold) added to the VM instance.
+        500:
+          description: The new SCSI controller could not be added to the VM instance.
+
   /vm.add-generic-vhost-user:
     put:
       summary: Add a new generic vhost-user device to the VM
@@ -617,6 +639,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DiskConfig"
+        scsi:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScsiConfig"
         net:
           type: array
           items:
@@ -1031,6 +1057,71 @@ components:
           $ref: "#/components/schemas/ImageType"
         lock_granularity:
           $ref: "#/components/schemas/LockGranularity"
+
+    ScsiLunConfig:
+      type: object
+      required:
+        - path
+      properties:
+        path:
+          type: string
+        target:
+          type: integer
+          format: int16
+          default: 0
+        lun:
+          type: integer
+          format: int16
+          default: 0
+        readonly:
+          type: boolean
+          default: false
+        direct:
+          type: boolean
+          default: false
+        device_type:
+          type: string
+          enum: ["disk", "cdrom"]
+          default: "disk"
+
+    ScsiConfig:
+      type: object
+      required:
+        - luns
+      properties:
+        id:
+          type: string
+        iommu:
+          type: boolean
+          default: false
+        pci_segment:
+          type: integer
+          format: int16
+          default: 0
+        pci_device_id:
+          type: integer
+          format: uint8
+        num_queues:
+          type: integer
+          minimum: 1
+          default: 1
+        queue_size:
+          type: integer
+          minimum: 3
+          default: 128
+        luns:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ScsiLunConfig"
+        queue_affinity:
+          type: array
+          items:
+            $ref: "#/components/schemas/VirtQueueAffinity"
+        vhost_user_socket:
+          type: string
+          deprecated: true
+          description: Unsupported. Requests with this field fail validation with "vhost-user SCSI is not supported".
 
     NetConfig:
       type: object

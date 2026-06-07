@@ -63,9 +63,8 @@ use crate::migration_transport::{
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::vm::{Error as VmError, Vm, VmState};
 use crate::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig, ScsiConfig,
     UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
-    ScsiConfig,
 };
 
 mod acpi;
@@ -2774,6 +2773,7 @@ mod unit_tests {
             }),
             rate_limit_groups: None,
             disks: None,
+            scsi: None,
             net: None,
             rng: RngConfig {
                 src: PathBuf::from("/dev/urandom"),

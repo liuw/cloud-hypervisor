@@ -34,9 +34,8 @@ use vmm::vm_config::IvshmemConfig;
 use vmm::vm_config::{
     BalloonConfig, ConsoleConfig, DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig,
     LandlockConfig, NetConfig, NumaConfig, PciSegmentConfig, PlatformConfig, PmemConfig,
-    RateLimiterGroupConfig, RngConfig, RtcConfig, SerialConfig, TpmConfig, UserDeviceConfig,
-    VdpaConfig, VmConfig, VsockConfig,
-    ScsiConfig,
+    RateLimiterGroupConfig, RngConfig, RtcConfig, ScsiConfig, SerialConfig, TpmConfig,
+    UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::block_signal;
@@ -1026,6 +1025,7 @@ mod unit_tests {
             }),
             rate_limit_groups: None,
             disks: None,
+            scsi: None,
             net: None,
             rng: RngConfig {
                 src: PathBuf::from("/dev/urandom"),

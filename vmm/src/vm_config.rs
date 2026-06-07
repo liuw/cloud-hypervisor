@@ -418,7 +418,18 @@ pub fn default_diskconfig_sparse() -> bool {
     true
 }
 
-#[serde_with::skip_serializing_none]
+/// SCSI device type (disk or cdrom)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScsiDeviceType {
+    /// Block disk device (SBC)
+    #[default]
+    Disk,
+    /// CD/DVD-ROM device (MMC)
+    Cdrom,
+}
+
+/// SCSI LUN configuration - represents a single logical unit (disk)
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ScsiLunConfig {
     pub path: PathBuf,
@@ -428,6 +439,12 @@ pub struct ScsiLunConfig {
     pub lun: u16,
     #[serde(default)]
     pub readonly: bool,
+    /// Use direct I/O (O_DIRECT)
+    #[serde(default)]
+    pub direct: bool,
+    /// Device type (disk or cdrom)
+    #[serde(default)]
+    pub device_type: ScsiDeviceType,
 }
 
 impl ApplyLandlock for ScsiLunConfig {
@@ -452,12 +469,21 @@ pub struct ScsiConfig {
     /// LUNs attached to this controller
     #[serde(default)]
     pub luns: Vec<ScsiLunConfig>,
+    /// Queue affinity settings (queue_index -> host_cpus)
+    #[serde(default)]
+    pub queue_affinity: Option<Vec<VirtQueueAffinity>>,
+    /// Vhost-user socket path (currently unsupported)
+    #[serde(default)]
+    pub vhost_user_socket: Option<PathBuf>,
 }
 
 impl ApplyLandlock for ScsiConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         for lun in &self.luns {
             lun.apply_landlock(landlock)?;
+        }
+        if let Some(ref socket) = self.vhost_user_socket {
+            landlock.add_rule_with_access(socket, "rw")?;
         }
         Ok(())
     }

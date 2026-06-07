@@ -116,8 +116,8 @@ use crate::sev::MeasuredBootInfo;
 use crate::vm_config::FwCfgConfig;
 use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetConfig,
-    NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
-    ScsiConfig,
+    NumaConfig, PayloadConfig, PmemConfig, ScsiConfig, UserDeviceConfig, VdpaConfig, VmConfig,
+    VsockConfig,
 };
 use crate::{
     CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemoryMmap,

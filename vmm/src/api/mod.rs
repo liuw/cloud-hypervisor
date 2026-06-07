@@ -56,9 +56,8 @@ use crate::device_tree::DeviceTree;
 use crate::migration_transport::MAX_MIGRATION_CONNECTIONS;
 use crate::vm::{Error as VmError, VmState};
 use crate::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig, ScsiConfig,
     UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
-    ScsiConfig,
 };
 
 /// API errors are sent back from the VMM API server through the ApiResponse.

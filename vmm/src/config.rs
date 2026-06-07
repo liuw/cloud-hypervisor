@@ -251,6 +251,15 @@ pub enum ValidationError {
     /// No socket provided for vhost_use
     #[error("No socket provided when using vhost-user")]
     VhostUserMissingSocket,
+    /// Vhost-user SCSI is not supported yet
+    #[error("vhost-user SCSI is not supported")]
+    ScsiVhostUserUnsupported,
+    /// SCSI controller has no LUNs
+    #[error("SCSI controller requires at least one LUN")]
+    ScsiMissingLuns,
+    /// SCSI controller has no request queues
+    #[error("SCSI controller requires at least one request queue")]
+    ScsiQueueCountZero,
     /// Trying to use IOMMU without PCI
     #[error("Using an IOMMU without PCI support is unsupported")]
     IommuUnsupported,
@@ -1617,19 +1626,25 @@ impl DiskConfig {
 
 impl ScsiLunConfig {
     pub const SYNTAX: &'static str = "SCSI LUN parameters \
-         \"path=<disk_image_path>,target=<target_id>,lun=<lun_id>,readonly=on|off\"";
+         \"path=<disk_image_path>,target=<target_id>,lun=<lun_id>,readonly=on|off,direct=on|off,\
+         device_type=disk|cdrom\"";
 
     pub fn parse(lun_str: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
-        parser.add("path").add("target").add("lun").add("readonly");
+        parser
+            .add("path")
+            .add("target")
+            .add("lun")
+            .add("readonly")
+            .add("direct")
+            .add("device_type");
         parser.parse(lun_str).map_err(Error::ParseScsi)?;
 
-        let path = parser
-            .get("path")
-            .map(PathBuf::from)
-            .ok_or_else(|| Error::ParseScsi(OptionParserError::InvalidSyntax(
+        let path = parser.get("path").map(PathBuf::from).ok_or_else(|| {
+            Error::ParseScsi(OptionParserError::InvalidSyntax(
                 "path is required".to_string(),
-            )))?;
+            ))
+        })?;
         let target = parser
             .convert("target")
             .map_err(Error::ParseScsi)?
@@ -1643,13 +1658,35 @@ impl ScsiLunConfig {
             .map_err(Error::ParseScsi)?
             .unwrap_or(Toggle(false))
             .0;
+        let direct = parser
+            .convert::<Toggle>("direct")
+            .map_err(Error::ParseScsi)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let device_type = parse_scsi_device_type(parser.get("device_type"))?;
 
         Ok(ScsiLunConfig {
             path,
             target,
             lun,
             readonly,
+            direct,
+            device_type,
         })
+    }
+}
+
+fn parse_scsi_device_type(device_type: Option<String>) -> Result<ScsiDeviceType> {
+    if let Some(device_type) = device_type {
+        match device_type.to_lowercase().as_str() {
+            "disk" => Ok(ScsiDeviceType::Disk),
+            "cdrom" => Ok(ScsiDeviceType::Cdrom),
+            _ => Err(Error::ParseScsi(OptionParserError::InvalidValue(
+                device_type,
+            ))),
+        }
+    } else {
+        Ok(ScsiDeviceType::Disk)
     }
 }
 
@@ -1657,7 +1694,8 @@ impl ScsiConfig {
     pub const SYNTAX: &'static str = "SCSI controller parameters \
          \"path=<disk_path>,id=<device_id>,pci_segment=<segment_id>,iommu=on|off,\
          num_queues=<number_of_request_queues>,queue_size=<size_of_each_queue>,\
-         target=<target_id>,lun=<lun_id>,readonly=on|off\" \
+         target=<target_id>,lun=<lun_id>,readonly=on|off,direct=on|off,\
+         device_type=disk|cdrom,vhost_user_socket=<socket_path> (unsupported)\" \
          (path creates a single LUN; for multiple LUNs use JSON config)";
 
     pub fn parse(scsi: &str) -> Result<Self> {
@@ -1671,7 +1709,10 @@ impl ScsiConfig {
             .add("path")
             .add("target")
             .add("lun")
-            .add("readonly");
+            .add("readonly")
+            .add("direct")
+            .add("device_type")
+            .add("vhost_user_socket");
         parser.parse(scsi).map_err(Error::ParseScsi)?;
 
         let pci_common = PciDeviceCommonConfig::parse(scsi)?;
@@ -1683,8 +1724,9 @@ impl ScsiConfig {
             .convert("queue_size")
             .map_err(Error::ParseScsi)?
             .unwrap_or_else(default_scsiconfig_queue_size);
+        let vhost_user_socket = parser.get("vhost_user_socket").map(PathBuf::from);
 
-        // Parse single LUN from path/target/lun/readonly options
+        // Parse single LUN from path/target/lun/readonly/direct options
         let luns = if let Some(path) = parser.get("path") {
             let target = parser
                 .convert("target")
@@ -1699,12 +1741,20 @@ impl ScsiConfig {
                 .map_err(Error::ParseScsi)?
                 .unwrap_or(Toggle(false))
                 .0;
+            let direct = parser
+                .convert::<Toggle>("direct")
+                .map_err(Error::ParseScsi)?
+                .unwrap_or(Toggle(false))
+                .0;
+            let device_type = parse_scsi_device_type(parser.get("device_type"))?;
 
             vec![ScsiLunConfig {
                 path: PathBuf::from(path),
                 target,
                 lun,
                 readonly,
+                direct,
+                device_type,
             }]
         } else {
             Vec::new()
@@ -1715,10 +1765,35 @@ impl ScsiConfig {
             num_queues,
             queue_size,
             luns,
+            queue_affinity: None,
+            vhost_user_socket,
         })
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+        if self.vhost_user_socket.is_some() {
+            return Err(ValidationError::ScsiVhostUserUnsupported);
+        }
+
+        if self.luns.is_empty() {
+            return Err(ValidationError::ScsiMissingLuns);
+        }
+
+        if self.num_queues == 0 {
+            return Err(ValidationError::ScsiQueueCountZero);
+        }
+
+        if self.num_queues > vm_config.cpus.boot_vcpus as usize {
+            return Err(ValidationError::TooManyQueues(
+                self.num_queues,
+                vm_config.cpus.boot_vcpus as usize,
+            ));
+        }
+
+        if self.queue_size <= MINIMUM_BLOCK_QUEUE_SIZE {
+            return Err(ValidationError::InvalidQueueSize(self.queue_size));
+        }
+
         self.pci_common.validate(vm_config)?;
 
         // Validate LUN uniqueness
@@ -3266,6 +3341,15 @@ impl VmConfig {
             }
         }
 
+        if let Some(scsi_devices) = &self.scsi {
+            for scsi in scsi_devices {
+                scsi.validate(self)?;
+                self.iommu |= scsi.pci_common.iommu;
+
+                Self::validate_identifier(&mut id_list, &scsi.pci_common.id)?;
+            }
+        }
+
         if let Some(nets) = &self.net {
             for net in nets {
                 if net.vhost_user && !self.backed_by_shared_memory() {
@@ -4279,6 +4363,24 @@ mod unit_tests {
         }
     }
 
+    fn scsi_fixture() -> ScsiConfig {
+        ScsiConfig {
+            pci_common: PciDeviceCommonConfig::default(),
+            num_queues: 1,
+            queue_size: 128,
+            luns: vec![ScsiLunConfig {
+                path: PathBuf::from("/path/to_file"),
+                target: 0,
+                lun: 0,
+                readonly: false,
+                direct: false,
+                device_type: ScsiDeviceType::Disk,
+            }],
+            queue_affinity: None,
+            vhost_user_socket: None,
+        }
+    }
+
     #[test]
     fn test_disk_parsing() -> Result<()> {
         assert_eq!(
@@ -4397,6 +4499,98 @@ mod unit_tests {
                 ..disk_fixture()
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_scsi_parsing() -> Result<()> {
+        assert_eq!(
+            ScsiConfig::parse("path=/path/to_file")?,
+            ScsiConfig { ..scsi_fixture() }
+        );
+        assert_eq!(
+            ScsiConfig::parse("path=/path/to_file,id=myscsi0")?,
+            ScsiConfig {
+                pci_common: PciDeviceCommonConfig {
+                    id: Some("myscsi0".to_owned()),
+                    ..Default::default()
+                },
+                ..scsi_fixture()
+            }
+        );
+        assert_eq!(
+            ScsiConfig::parse("path=/path/to_file,pci_segment=1")?,
+            ScsiConfig {
+                pci_common: PciDeviceCommonConfig {
+                    pci_segment: 1,
+                    ..Default::default()
+                },
+                ..scsi_fixture()
+            }
+        );
+        assert_eq!(
+            ScsiConfig::parse("path=/path/to_file,iommu=on")?,
+            ScsiConfig {
+                pci_common: PciDeviceCommonConfig {
+                    iommu: true,
+                    ..Default::default()
+                },
+                ..scsi_fixture()
+            }
+        );
+        assert_eq!(
+            ScsiConfig::parse("path=/path/to_file,num_queues=4,queue_size=256")?,
+            ScsiConfig {
+                num_queues: 4,
+                queue_size: 256,
+                ..scsi_fixture()
+            }
+        );
+        assert_eq!(
+            ScsiConfig::parse("path=/path/to_file,target=2,lun=3")?,
+            ScsiConfig {
+                luns: vec![ScsiLunConfig {
+                    target: 2,
+                    lun: 3,
+                    ..scsi_fixture().luns[0].clone()
+                }],
+                ..scsi_fixture()
+            }
+        );
+        assert_eq!(
+            ScsiConfig::parse("path=/path/to_file,readonly=on,direct=on")?,
+            ScsiConfig {
+                luns: vec![ScsiLunConfig {
+                    readonly: true,
+                    direct: true,
+                    ..scsi_fixture().luns[0].clone()
+                }],
+                ..scsi_fixture()
+            }
+        );
+        assert_eq!(
+            ScsiConfig::parse("path=/path/to_file,device_type=cdrom")?,
+            ScsiConfig {
+                luns: vec![ScsiLunConfig {
+                    device_type: ScsiDeviceType::Cdrom,
+                    ..scsi_fixture().luns[0].clone()
+                }],
+                ..scsi_fixture()
+            }
+        );
+        assert_eq!(
+            ScsiConfig::parse("vhost_user_socket=/path/to/sock")?,
+            ScsiConfig {
+                luns: Vec::new(),
+                vhost_user_socket: Some(PathBuf::from("/path/to/sock")),
+                ..scsi_fixture()
+            }
+        );
+        assert!(matches!(
+            ScsiConfig::parse("path=/path/to_file,device_type=tape"),
+            Err(Error::ParseScsi(_))
+        ));
+
         Ok(())
     }
 
@@ -5151,6 +5345,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             payload: None,
             rate_limit_groups: None,
             disks: None,
+            scsi: None,
             rng: RngConfig::default(),
             generic_vhost_user: None,
             balloon: None,
@@ -5388,6 +5583,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             }),
             rate_limit_groups: None,
             disks: None,
+            scsi: None,
             net: None,
             rng: RngConfig {
                 src: PathBuf::from("/dev/urandom"),
@@ -5593,6 +5789,80 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         }]);
         still_valid_config.memory.shared = true;
         still_valid_config.validate().unwrap();
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.scsi = Some(vec![ScsiConfig {
+            num_queues: 2,
+            ..scsi_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::TooManyQueues(2, 1))
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.scsi = Some(vec![ScsiConfig {
+            num_queues: 0,
+            ..scsi_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::ScsiQueueCountZero)
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.scsi = Some(vec![ScsiConfig {
+            queue_size: MINIMUM_BLOCK_QUEUE_SIZE,
+            ..scsi_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::InvalidQueueSize(MINIMUM_BLOCK_QUEUE_SIZE))
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.scsi = Some(vec![ScsiConfig {
+            luns: vec![
+                ScsiLunConfig {
+                    target: 1,
+                    lun: 2,
+                    ..scsi_fixture().luns[0].clone()
+                },
+                ScsiLunConfig {
+                    target: 1,
+                    lun: 2,
+                    ..scsi_fixture().luns[0].clone()
+                },
+            ],
+            ..scsi_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::DuplicateDevicePath(
+                "Duplicate SCSI LUN: target=1, lun=2".to_owned()
+            ))
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.scsi = Some(vec![ScsiConfig {
+            luns: Vec::new(),
+            ..scsi_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::ScsiMissingLuns)
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.scsi = Some(vec![ScsiConfig {
+            luns: Vec::new(),
+            vhost_user_socket: Some(PathBuf::from("/path/to/sock")),
+            ..scsi_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::ScsiVhostUserUnsupported)
+        );
 
         let mut invalid_config = valid_config.clone();
         invalid_config.net = Some(vec![NetConfig {

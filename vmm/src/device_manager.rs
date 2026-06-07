@@ -117,6 +117,7 @@ use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
 use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
 use crate::pci_segment::PciSegment;
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
+use crate::vm_config;
 #[cfg(feature = "ivshmem")]
 use crate::vm_config::IvshmemConfig;
 use crate::vm_config::{
@@ -1062,7 +1063,7 @@ pub struct DeviceManager {
     legacy_interrupt_manager: Option<Arc<dyn InterruptManager<GroupConfig = LegacyIrqGroupConfig>>>,
 
     // Passthrough device handle
-    passthrough_device: Option<VfioDeviceFd>,
+    passthrough_device: Option<Arc<VfioDeviceFd>>,
 
     // VFIO operation instance
     // Only one can be created, therefore it is stored as part of the
@@ -2930,16 +2931,25 @@ impl DeviceManager {
         let luns: Vec<virtio_devices::scsi::ScsiLunConfig> = scsi_cfg
             .luns
             .iter()
-            .map(|lun| virtio_devices::scsi::ScsiLunConfig {
-                target: lun.target,
-                lun: lun.lun,
-                path: lun.path.clone(),
-                readonly: lun.readonly,
-                direct: false,
-                device_type: virtio_devices::scsi::ScsiDeviceType::DirectAccess,
-                vendor_id: "CLOUD-HV".to_string(),
-                product_id: "VIRTIO-SCSI".to_string(),
-                product_rev: "0001".to_string(),
+            .map(|lun| {
+                // Map vm_config device type to SCSI device type
+                let device_type = match lun.device_type {
+                    vm_config::ScsiDeviceType::Disk => {
+                        virtio_devices::scsi::ScsiDeviceType::DirectAccess
+                    }
+                    vm_config::ScsiDeviceType::Cdrom => virtio_devices::scsi::ScsiDeviceType::CdDvd,
+                };
+                virtio_devices::scsi::ScsiLunConfig {
+                    target: lun.target,
+                    lun: lun.lun,
+                    path: lun.path.clone(),
+                    readonly: lun.readonly,
+                    direct: lun.direct,
+                    device_type,
+                    vendor_id: "CLOUD-HV".to_string(),
+                    product_id: "VIRTIO-SCSI".to_string(),
+                    product_rev: "0001".to_string(),
+                }
             })
             .collect();
 
@@ -3936,12 +3946,12 @@ impl DeviceManager {
         // If the passthrough device has not been created yet, it is created
         // here and stored in the DeviceManager structure for future needs.
         if self.passthrough_device.is_none() {
-            self.passthrough_device = Some(
+            self.passthrough_device = Some(Arc::new(
                 self.address_manager
                     .vm
                     .create_passthrough_device()
                     .map_err(|e| DeviceManagerError::CreatePassthroughDevice(e.into()))?,
-            );
+            ));
         }
 
         self.add_vfio_device(device_cfg, snapshot)
@@ -3953,9 +3963,7 @@ impl DeviceManager {
             .as_ref()
             .ok_or(DeviceManagerError::NoDevicePassthroughSupport)?;
 
-        let dup = passthrough_device
-            .try_clone()
-            .map_err(DeviceManagerError::VfioCreate)?;
+        let dup = passthrough_device.clone();
 
         let iommufd = self
             .config
@@ -3970,7 +3978,7 @@ impl DeviceManager {
             {
                 info!("Using vfio cdev mode with iommufd.");
                 let iommufd = IommuFd::new().map_err(DeviceManagerError::IommufdCreate)?;
-                let vfio_iommufd = VfioIommufd::new(Arc::new(iommufd), None, Some(Arc::new(dup)))
+                let vfio_iommufd = VfioIommufd::new(Arc::new(iommufd), None, Some(dup))
                     .map_err(DeviceManagerError::VfioCreate)?;
                 Ok(Arc::new(vfio_iommufd))
             }
@@ -3979,7 +3987,7 @@ impl DeviceManager {
         } else {
             info!("Using vfio legacy mode with vfio container/group.");
             Ok(Arc::new(
-                VfioContainer::new(Some(Arc::new(dup))).map_err(DeviceManagerError::VfioCreate)?,
+                VfioContainer::new(Some(dup)).map_err(DeviceManagerError::VfioCreate)?,
             ))
         }
     }
