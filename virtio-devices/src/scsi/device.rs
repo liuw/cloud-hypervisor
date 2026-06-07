@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io;
 use std::num::Wrapping;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::result;
 use std::sync::atomic::AtomicBool;
@@ -22,17 +23,19 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_memory::ByteValued;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
-use vm_virtio::VirtioDeviceType;
-use vmm_sys_util::eventfd::EventFd;
+use vm_virtio::{AccessPlatform, VirtioDeviceType};
+use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
 use super::commands::ScsiCommandProcessor;
-use super::handler::{ScsiCtrlHandler, ScsiDisk, ScsiEventHandler, ScsiRequestHandler};
+use super::handler::{
+    ScsiCtrlHandler, ScsiDisk, ScsiEventHandler, ScsiEventState, ScsiRequestHandler,
+};
 use super::protocol::*;
-use super::target::{ScsiLunConfig, ScsiLunId};
+use super::target::{ScsiLunConfig, ScsiLunId, ScsiLunState};
 use crate::seccomp_filters::Thread;
 use crate::{
-    ActivateError, ActivateResult, VirtioCommon, VirtioDevice, VIRTIO_F_ACCESS_PLATFORM,
-    VIRTIO_F_VERSION_1,
+    ActivateError, ActivateResult, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1, VirtioCommon,
+    VirtioDevice,
 };
 
 /// Minimum number of queues: 1 control + 1 event + 1 request
@@ -52,6 +55,8 @@ pub enum Error {
     InvalidQueueConfig,
     #[error("Duplicate LUN: {0}")]
     DuplicateLun(ScsiLunId),
+    #[error("Failed to create eventfd: {0}")]
+    CreateEventFd(#[source] io::Error),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -63,6 +68,8 @@ pub struct ScsiState {
     pub acked_features: u64,
     pub config: VirtioScsiConfig,
     pub luns: Vec<ScsiLunConfig>,
+    #[serde(default)]
+    pub lun_states: Vec<ScsiLunState>,
 }
 
 /// Virtio SCSI device.
@@ -78,6 +85,8 @@ pub struct Scsi {
     processors: Arc<Mutex<HashMap<ScsiLunId, ScsiCommandProcessor>>>,
     /// Disk files for each LUN
     disks: HashMap<ScsiLunId, PathBuf>,
+    event_state: Arc<Mutex<ScsiEventState>>,
+    event_notify: EventFd,
 }
 
 impl Scsi {
@@ -102,32 +111,48 @@ impl Scsi {
         exit_evt: EventFd,
         state: Option<ScsiState>,
     ) -> Result<Self> {
-        let (avail_features, acked_features, config, paused) = if let Some(state) = state {
-            info!("Restoring virtio-scsi {id}");
-            (
-                state.avail_features,
-                state.acked_features,
-                state.config,
-                true,
-            )
-        } else {
-            let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
-                | (1u64 << VIRTIO_SCSI_F_INOUT)
-                | (1u64 << VIRTIO_SCSI_F_HOTPLUG)
-                | (1u64 << VIRTIO_SCSI_F_CHANGE);
+        let (avail_features, acked_features, config, luns, lun_states, paused) =
+            if let Some(state) = state {
+                info!("Restoring virtio-scsi {id}");
+                (
+                    state.avail_features,
+                    state.acked_features,
+                    state.config,
+                    state.luns,
+                    state.lun_states,
+                    true,
+                )
+            } else {
+                let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+                    | (1u64 << VIRTIO_SCSI_F_INOUT)
+                    | (1u64 << VIRTIO_SCSI_F_HOTPLUG)
+                    | (1u64 << VIRTIO_SCSI_F_CHANGE);
 
-            if iommu {
-                avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
-            }
+                if iommu {
+                    avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
+                }
 
-            let config = VirtioScsiConfig::new(num_queues as u32);
+                let mut config = VirtioScsiConfig::new(num_queues as u32);
+                config.event_info_size = std::mem::size_of::<VirtioScsiEvent>() as u32;
 
-            (avail_features, 0, config, false)
-        };
+                (avail_features, 0, config, luns, Vec::new(), false)
+            };
+
+        let mut config = config;
+        if config.event_info_size == 0 {
+            config.event_info_size = std::mem::size_of::<VirtioScsiEvent>() as u32;
+        }
+
+        let num_queues = config.num_queues as usize;
+        if num_queues == 0 || queue_size == 0 {
+            return Err(Error::InvalidQueueConfig);
+        }
 
         // Build processor map and validate LUNs
         let mut processors = HashMap::new();
         let mut disks = HashMap::new();
+        let lun_states: HashMap<ScsiLunId, ScsiLunState> =
+            lun_states.into_iter().map(|s| (s.id, s)).collect();
 
         for lun_config in &luns {
             let lun_id = lun_config.id();
@@ -137,16 +162,23 @@ impl Scsi {
             }
 
             // Get disk size
-            let file = OpenOptions::new()
-                .read(true)
-                .write(!lun_config.readonly)
-                .open(&lun_config.path)
-                .map_err(Error::OpenDisk)?;
+            let mut opts = OpenOptions::new();
+            opts.read(true).write(!lun_config.readonly);
+            if lun_config.direct {
+                opts.custom_flags(libc::O_DIRECT);
+            }
+            let file = opts.open(&lun_config.path).map_err(Error::OpenDisk)?;
 
             let disk_size = file.metadata().map_err(Error::GetDiskSize)?.len();
             let block_size = 512u32; // Standard block size
 
-            let processor = ScsiCommandProcessor::new(lun_config.clone(), disk_size, block_size);
+            let mut processor =
+                ScsiCommandProcessor::new(lun_config.clone(), disk_size, block_size);
+            if let Some(lun_state) = lun_states.get(&lun_id) {
+                processor.set_ready(lun_state.online);
+                processor
+                    .set_persistent_reservation_state(lun_state.persistent_reservation.clone());
+            }
             processors.insert(lun_id, processor);
             disks.insert(lun_id, lun_config.path.clone());
         }
@@ -154,6 +186,8 @@ impl Scsi {
         // Total queues: 1 control + 1 event + N request queues
         let total_queues = 2 + num_queues;
         let queue_sizes = vec![queue_size; total_queues];
+
+        let event_notify = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateEventFd)?;
 
         Ok(Scsi {
             common: VirtioCommon {
@@ -173,15 +207,40 @@ impl Scsi {
             luns,
             processors: Arc::new(Mutex::new(processors)),
             disks,
+            event_state: Arc::new(Mutex::new(ScsiEventState::default())),
+            event_notify,
         })
     }
 
     fn state(&self) -> ScsiState {
+        // No in-flight request list is needed here: requests are processed
+        // synchronously and the common pause barrier waits for queue handlers
+        // to stop before snapshotting.
+        let processors = self.processors.lock().unwrap();
+        let lun_states = self
+            .luns
+            .iter()
+            .map(|lun| {
+                let id = lun.id();
+                ScsiLunState {
+                    id,
+                    online: processors.get(&id).map(|p| p.is_ready()).unwrap_or(true),
+                    persistent_reservation: processors
+                        .get(&id)
+                        .map(|p| p.persistent_reservation_state())
+                        .unwrap_or_default(),
+                    unit_attention: false,
+                    power_condition: 0,
+                }
+            })
+            .collect();
+
         ScsiState {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
             config: self.config,
             luns: self.luns.clone(),
+            lun_states,
         }
     }
 
@@ -195,11 +254,12 @@ impl Scsi {
         }
 
         // Get disk size
-        let file = OpenOptions::new()
-            .read(true)
-            .write(!lun_config.readonly)
-            .open(&lun_config.path)
-            .map_err(Error::OpenDisk)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(!lun_config.readonly);
+        if lun_config.direct {
+            opts.custom_flags(libc::O_DIRECT);
+        }
+        let file = opts.open(&lun_config.path).map_err(Error::OpenDisk)?;
 
         let disk_size = file.metadata().map_err(Error::GetDiskSize)?.len();
         let block_size = 512u32;
@@ -210,6 +270,11 @@ impl Scsi {
 
         self.disks.insert(lun_id, lun_config.path.clone());
         self.luns.push(lun_config);
+        self.event_state
+            .lock()
+            .unwrap()
+            .queue_transport_reset(lun_id, VIRTIO_SCSI_EVT_RESET_RESCAN);
+        self.notify_event_handler();
 
         Ok(())
     }
@@ -221,9 +286,65 @@ impl Scsi {
             drop(processors);
             self.disks.remove(lun_id);
             self.luns.retain(|l| l.id() != *lun_id);
+            self.event_state
+                .lock()
+                .unwrap()
+                .queue_transport_reset(*lun_id, VIRTIO_SCSI_EVT_RESET_REMOVED);
+            self.notify_event_handler();
             true
         } else {
             false
+        }
+    }
+
+    /// Queue a hard reset event for a LUN that is still present.
+    pub fn notify_lun_reset(&self, lun_id: &ScsiLunId) -> bool {
+        if !self.processors.lock().unwrap().contains_key(lun_id) {
+            return false;
+        }
+
+        self.event_state
+            .lock()
+            .unwrap()
+            .queue_transport_reset(*lun_id, VIRTIO_SCSI_EVT_RESET_HARD);
+        self.notify_event_handler();
+        true
+    }
+
+    /// Queue a subscribed media-change asynchronous notification.
+    pub fn notify_media_change(&self, lun_id: &ScsiLunId) -> bool {
+        if !self.processors.lock().unwrap().contains_key(lun_id) {
+            return false;
+        }
+
+        let queued = self
+            .event_state
+            .lock()
+            .unwrap()
+            .queue_async_notify(*lun_id, VIRTIO_SCSI_EVT_ASYNC_MEDIA_CHANGE);
+        if queued {
+            self.notify_event_handler();
+        }
+        queued
+    }
+
+    /// Queue a LUN parameter change event.
+    pub fn notify_parameter_change(&self, lun_id: &ScsiLunId, asc: u8, ascq: u8) -> bool {
+        if !self.processors.lock().unwrap().contains_key(lun_id) {
+            return false;
+        }
+
+        self.event_state
+            .lock()
+            .unwrap()
+            .queue_param_change(*lun_id, asc, ascq);
+        self.notify_event_handler();
+        true
+    }
+
+    fn notify_event_handler(&self) {
+        if let Err(e) = self.event_notify.write(1) {
+            warn!("Failed to notify virtio-scsi event handler: {e}");
         }
     }
 }
@@ -306,6 +427,10 @@ impl VirtioDevice for Scsi {
         // Queue 0: Control queue
         let (_, ctrl_queue, ctrl_evt) = queues.remove(0);
         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+        let ctrl_event_notify = self.event_notify.try_clone().map_err(|e| {
+            error!("Failed to clone virtio-scsi control event notification fd: {e}");
+            ActivateError::BadActivate
+        })?;
 
         let mut ctrl_handler = ScsiCtrlHandler {
             queue: ctrl_queue,
@@ -314,6 +439,8 @@ impl VirtioDevice for Scsi {
             queue_evt: ctrl_evt,
             kill_evt,
             pause_evt,
+            event_state: self.event_state.clone(),
+            event_notify: ctrl_event_notify,
         };
 
         let paused = self.common.paused.clone();
@@ -332,6 +459,10 @@ impl VirtioDevice for Scsi {
         // Queue 1: Event queue
         let (_, event_queue, event_evt) = queues.remove(0);
         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+        let event_notify = self.event_notify.try_clone().map_err(|e| {
+            error!("Failed to clone virtio-scsi event notification fd: {e}");
+            ActivateError::BadActivate
+        })?;
 
         let mut event_handler = ScsiEventHandler {
             queue: event_queue,
@@ -340,6 +471,8 @@ impl VirtioDevice for Scsi {
             queue_evt: event_evt,
             kill_evt,
             pause_evt,
+            notify_evt: event_notify,
+            event_state: self.event_state.clone(),
         };
 
         let paused = self.common.paused.clone();
@@ -413,7 +546,11 @@ impl VirtioDevice for Scsi {
             )?;
         }
 
-        info!("virtio-scsi {} activated with {} LUNs", self.id, self.luns.len());
+        info!(
+            "virtio-scsi {} activated with {} LUNs",
+            self.id,
+            self.luns.len()
+        );
 
         Ok(())
     }
@@ -426,6 +563,14 @@ impl VirtioDevice for Scsi {
     fn counters(&self) -> Option<HashMap<&'static str, Wrapping<u64>>> {
         // TODO: Implement counters for read/write bytes and ops
         None
+    }
+
+    fn set_access_platform(&mut self, access_platform: Arc<dyn AccessPlatform>) {
+        self.common.set_access_platform(access_platform);
+    }
+
+    fn access_platform(&self) -> Option<Arc<dyn AccessPlatform>> {
+        self.common.access_platform()
     }
 }
 
@@ -457,3 +602,294 @@ impl Snapshottable for Scsi {
 
 impl Transportable for Scsi {}
 impl Migratable for Scsi {}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, OpenOptions};
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+
+    use seccompiler::SeccompAction;
+    use vm_migration::{Pausable, Snapshottable};
+    use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+
+    use super::super::target::{
+        ScsiDeviceType, ScsiPersistentReservation, ScsiPersistentReservationState,
+    };
+    use super::*;
+
+    fn test_disk_path(name: &str) -> PathBuf {
+        let dir = PathBuf::from("target/scsi-lifecycle-tests");
+        fs::create_dir_all(&dir).unwrap();
+        dir.join(format!("{}-{}.img", name, std::process::id()))
+    }
+
+    fn create_test_disk(name: &str) -> PathBuf {
+        let path = test_disk_path(name);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        path
+    }
+
+    fn test_lun(path: PathBuf, target: u8, lun: u16) -> ScsiLunConfig {
+        ScsiLunConfig {
+            target,
+            lun,
+            path,
+            readonly: false,
+            direct: false,
+            device_type: ScsiDeviceType::DirectAccess,
+            vendor_id: "CLOUD-HV".to_string(),
+            product_id: "VIRTIO-SCSI".to_string(),
+            product_rev: "0001".to_string(),
+        }
+    }
+
+    fn test_state(luns: Vec<ScsiLunConfig>) -> ScsiState {
+        ScsiState {
+            avail_features: 0,
+            acked_features: 0,
+            config: VirtioScsiConfig::new(1),
+            luns,
+            lun_states: Vec::new(),
+        }
+    }
+
+    fn new_scsi(luns: Vec<ScsiLunConfig>, state: Option<ScsiState>) -> Result<Scsi> {
+        Scsi::new(
+            "scsi-test".to_string(),
+            luns,
+            1,
+            64,
+            false,
+            SeccompAction::Allow,
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            state,
+        )
+    }
+
+    #[test]
+    fn test_restore_uses_snapshot_luns_and_queue_count() {
+        let snapshot_lun = test_lun(create_test_disk("restore-snapshot"), 3, 7);
+        let snapshot_path = snapshot_lun.path.clone();
+        let state = ScsiState {
+            avail_features: 0x55,
+            acked_features: 0x11,
+            config: VirtioScsiConfig::new(2),
+            luns: vec![snapshot_lun],
+            lun_states: Vec::new(),
+        };
+
+        let scsi = new_scsi(Vec::new(), Some(state)).unwrap();
+
+        assert!(scsi.common.paused.load(Ordering::SeqCst));
+        assert_eq!(scsi.common.avail_features, 0x55);
+        assert_eq!(scsi.common.acked_features, 0x11);
+        assert_eq!(scsi.queue_max_sizes().len(), 4);
+        assert_eq!(scsi.luns.len(), 1);
+        assert_eq!(scsi.luns[0].id(), ScsiLunId::new(3, 7));
+        assert_eq!(scsi.luns[0].path, snapshot_path);
+    }
+
+    #[test]
+    fn test_restore_missing_snapshot_disk_fails() {
+        let valid_config_lun = test_lun(create_test_disk("restore-config"), 0, 0);
+        let missing_path = test_disk_path("missing-restore-disk");
+        let _ = fs::remove_file(&missing_path);
+        let state = test_state(vec![test_lun(missing_path, 1, 0)]);
+
+        assert!(matches!(
+            new_scsi(vec![valid_config_lun], Some(state)),
+            Err(Error::OpenDisk(_))
+        ));
+    }
+
+    #[test]
+    fn test_restore_duplicate_snapshot_lun_fails() {
+        let path = create_test_disk("duplicate-restore-lun");
+        let state = test_state(vec![test_lun(path.clone(), 2, 0), test_lun(path, 2, 0)]);
+
+        assert!(matches!(
+            new_scsi(Vec::new(), Some(state)),
+            Err(Error::DuplicateLun(id)) if id == ScsiLunId::new(2, 0)
+        ));
+    }
+
+    #[test]
+    fn test_restore_pause_resume_before_activate() {
+        let state = test_state(vec![test_lun(
+            create_test_disk("pause-resume-restore"),
+            0,
+            0,
+        )]);
+        let mut scsi = new_scsi(Vec::new(), Some(state)).unwrap();
+
+        assert!(scsi.common.paused.load(Ordering::SeqCst));
+        scsi.pause().unwrap();
+        assert!(scsi.common.paused.load(Ordering::SeqCst));
+        scsi.resume().unwrap();
+        assert!(!scsi.common.paused.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_invalid_queue_config_fails() {
+        let mut state = test_state(vec![test_lun(create_test_disk("invalid-queues"), 0, 0)]);
+        state.config = VirtioScsiConfig::new(0);
+
+        assert!(matches!(
+            new_scsi(Vec::new(), Some(state)),
+            Err(Error::InvalidQueueConfig)
+        ));
+    }
+
+    #[test]
+    fn test_snapshot_round_trips_lifecycle_state() {
+        let lun = test_lun(create_test_disk("snapshot-round-trip"), 4, 1);
+        let lun_path = lun.path.clone();
+        let mut scsi = new_scsi(vec![lun], None).unwrap();
+        scsi.ack_features(1u64 << VIRTIO_SCSI_F_INOUT);
+        scsi.processors
+            .lock()
+            .unwrap()
+            .get_mut(&ScsiLunId::new(4, 1))
+            .unwrap()
+            .set_ready(false);
+        scsi.processors
+            .lock()
+            .unwrap()
+            .get_mut(&ScsiLunId::new(4, 1))
+            .unwrap()
+            .set_persistent_reservation_state(ScsiPersistentReservationState {
+                generation: 7,
+                registered_keys: vec![0x44],
+                reservation: Some(ScsiPersistentReservation {
+                    key: 0x44,
+                    reservation_type: 1,
+                }),
+            });
+
+        let snapshot = scsi.snapshot().unwrap();
+        let state: ScsiState = snapshot.to_state().unwrap();
+
+        assert_eq!(state.acked_features, 1u64 << VIRTIO_SCSI_F_INOUT);
+        assert_eq!(state.config.num_queues, 1);
+        assert_eq!(state.luns.len(), 1);
+        assert_eq!(state.luns[0].id(), ScsiLunId::new(4, 1));
+        assert_eq!(state.luns[0].path, lun_path);
+        assert_eq!(state.lun_states.len(), 1);
+        assert_eq!(state.lun_states[0].id, ScsiLunId::new(4, 1));
+        assert!(!state.lun_states[0].online);
+        assert_eq!(state.lun_states[0].persistent_reservation.generation, 7);
+        assert_eq!(
+            state.lun_states[0].persistent_reservation.registered_keys,
+            vec![0x44]
+        );
+
+        let restored = new_scsi(Vec::new(), Some(state)).unwrap();
+        let processors = restored.processors.lock().unwrap();
+        let processor = processors.get(&ScsiLunId::new(4, 1)).unwrap();
+        assert!(!processor.is_ready());
+        assert_eq!(processor.persistent_reservation_state().generation, 7);
+        assert_eq!(
+            processor
+                .persistent_reservation_state()
+                .reservation
+                .unwrap()
+                .key,
+            0x44
+        );
+    }
+
+    #[test]
+    fn test_add_lun_queues_rescan_event() {
+        let lun = test_lun(create_test_disk("hotplug-add"), 1, 4);
+        let mut scsi = new_scsi(Vec::new(), None).unwrap();
+
+        scsi.add_lun(lun).unwrap();
+
+        let event = scsi.event_state.lock().unwrap().pop_event().unwrap();
+        let event_type = event.event;
+        let event_lun = event.lun;
+        let event_reason = event.reason;
+        assert_eq!(event_type, VIRTIO_SCSI_T_TRANSPORT_RESET);
+        assert_eq!(event_lun, encode_lun(1, 4));
+        assert_eq!(event_reason, VIRTIO_SCSI_EVT_RESET_RESCAN);
+    }
+
+    #[test]
+    fn test_remove_lun_queues_removed_event() {
+        let lun = test_lun(create_test_disk("hotplug-remove"), 2, 5);
+        let mut scsi = new_scsi(vec![lun], None).unwrap();
+
+        assert!(scsi.remove_lun(&ScsiLunId::new(2, 5)));
+
+        let event = scsi.event_state.lock().unwrap().pop_event().unwrap();
+        let event_type = event.event;
+        let event_lun = event.lun;
+        let event_reason = event.reason;
+        assert_eq!(event_type, VIRTIO_SCSI_T_TRANSPORT_RESET);
+        assert_eq!(event_lun, encode_lun(2, 5));
+        assert_eq!(event_reason, VIRTIO_SCSI_EVT_RESET_REMOVED);
+    }
+
+    #[test]
+    fn test_lun_reset_queues_hard_reset_event() {
+        let lun = test_lun(create_test_disk("lun-reset"), 3, 6);
+        let scsi = new_scsi(vec![lun], None).unwrap();
+
+        assert!(scsi.notify_lun_reset(&ScsiLunId::new(3, 6)));
+
+        let event = scsi.event_state.lock().unwrap().pop_event().unwrap();
+        let event_type = event.event;
+        let event_lun = event.lun;
+        let event_reason = event.reason;
+        assert_eq!(event_type, VIRTIO_SCSI_T_TRANSPORT_RESET);
+        assert_eq!(event_lun, encode_lun(3, 6));
+        assert_eq!(event_reason, VIRTIO_SCSI_EVT_RESET_HARD);
+    }
+
+    #[test]
+    fn test_media_change_requires_subscription() {
+        let lun = test_lun(create_test_disk("media-change"), 4, 7);
+        let scsi = new_scsi(vec![lun], None).unwrap();
+        let lun_id = ScsiLunId::new(4, 7);
+
+        assert!(!scsi.notify_media_change(&lun_id));
+        assert!(scsi.event_state.lock().unwrap().pop_event().is_none());
+
+        scsi.event_state
+            .lock()
+            .unwrap()
+            .subscribe_async_events(lun_id, VIRTIO_SCSI_EVT_ASYNC_MEDIA_CHANGE);
+        assert!(scsi.notify_media_change(&lun_id));
+
+        let event = scsi.event_state.lock().unwrap().pop_event().unwrap();
+        let event_type = event.event;
+        let event_lun = event.lun;
+        let event_reason = event.reason;
+        assert_eq!(event_type, VIRTIO_SCSI_T_ASYNC_NOTIFY);
+        assert_eq!(event_lun, encode_lun(4, 7));
+        assert_eq!(event_reason, VIRTIO_SCSI_EVT_ASYNC_MEDIA_CHANGE);
+    }
+
+    #[test]
+    fn test_parameter_change_queues_event() {
+        let lun = test_lun(create_test_disk("param-change"), 5, 8);
+        let scsi = new_scsi(vec![lun], None).unwrap();
+
+        assert!(scsi.notify_parameter_change(&ScsiLunId::new(5, 8), 0x2a, 0x09));
+
+        let event = scsi.event_state.lock().unwrap().pop_event().unwrap();
+        let event_type = event.event;
+        let event_lun = event.lun;
+        let event_reason = event.reason;
+        assert_eq!(event_type, VIRTIO_SCSI_T_PARAM_CHANGE);
+        assert_eq!(event_lun, encode_lun(5, 8));
+        assert_eq!(event_reason, 0x092a);
+    }
+}
