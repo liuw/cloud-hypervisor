@@ -4,12 +4,20 @@
 
 //! Helpers for `mmap()`
 
-use core::ffi::c_int;
+use core::ffi::{c_int, c_void};
 use core::ptr::null_mut;
 use std::io::{self, Error, ErrorKind};
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 
 use libc::size_t;
+
+const TWO_MIB: usize = 2 * 1024 * 1024;
+
+/// Round `addr` up to the next 2 MiB boundary.
+#[inline]
+fn align_up_to_2mib(addr: usize) -> usize {
+    addr.next_multiple_of(TWO_MIB)
+}
 
 /// A region of `mmap()`-allocated memory that calls `munmap()` when dropped.
 /// This guarantees that the buffer is valid and that its address space
@@ -76,14 +84,95 @@ in both isize and libc::size_t";
             (prot & !(libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC)) == 0,
             "bad protection"
         );
-        let flags = libc::MAP_SHARED;
-        // SAFETY: FFI call with correct parameters.
-        let addr = unsafe { libc::mmap(null_mut(), len, prot, flags, fd.as_raw_fd(), offset) };
-        if addr == libc::MAP_FAILED {
-            Err(Error::last_os_error())
-        } else {
-            let addr = addr.cast();
-            Ok(Self { addr, len })
+
+        // A 2 MiB-aligned address only lets the kernel back the mapping with
+        // huge pages when the mapping length is itself a multiple of 2 MiB. For
+        // other lengths the alignment is pointless, so create a plain
+        // page-aligned mapping instead.
+        if !len.is_multiple_of(TWO_MIB) {
+            // SAFETY: FFI call with correct parameters.
+            let addr = unsafe {
+                libc::mmap(
+                    null_mut(),
+                    len,
+                    prot,
+                    libc::MAP_SHARED,
+                    fd.as_raw_fd(),
+                    offset,
+                )
+            };
+            if addr == libc::MAP_FAILED {
+                return Err(Error::last_os_error());
+            }
+            return Ok(Self {
+                addr: addr.cast(),
+                len,
+            });
         }
+
+        // Align the mapping to a 2 MiB boundary so the kernel can back it with
+        // huge pages. `mmap(NULL, ...)` only guarantees page-sized alignment, so
+        // reserve an anonymous region big enough to contain a 2 MiB-aligned run
+        // of `len` bytes, map the file at the aligned address, and trim the
+        // excess on both sides.
+        let Some(reserve) = len.checked_add(TWO_MIB) else {
+            return Err(Error::new(ErrorKind::InvalidInput, BAD_LENGTH));
+        };
+
+        // SAFETY: FFI call. Reserving address space with a NULL hint and no fd.
+        let base = unsafe {
+            libc::mmap(
+                null_mut(),
+                reserve,
+                prot,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(Error::last_os_error());
+        }
+
+        let base_addr = base as usize;
+        let aligned_addr = align_up_to_2mib(base_addr);
+        let aligned = aligned_addr as *mut c_void;
+
+        // SAFETY: FFI call. MAP_FIXED is safe here because it only replaces the
+        // anonymous reservation we just created.
+        let addr = unsafe {
+            libc::mmap(
+                aligned,
+                len,
+                prot,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd.as_raw_fd(),
+                offset,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            let err = Error::last_os_error();
+            // SAFETY: release the whole reservation we created above.
+            unsafe { assert_eq!(libc::munmap(base, reserve), 0) };
+            return Err(err);
+        }
+
+        // Trim the head and tail of the reservation that surround the mapping.
+        let head_len = aligned_addr - base_addr;
+        if head_len > 0 {
+            // SAFETY: this range is still the anonymous reservation.
+            unsafe { assert_eq!(libc::munmap(base, head_len), 0) };
+        }
+        let tail_addr = aligned_addr + len;
+        let tail_len = (base_addr + reserve) - tail_addr;
+        if tail_len > 0 {
+            // SAFETY: this range is still the anonymous reservation.
+            unsafe { assert_eq!(libc::munmap(tail_addr as *mut c_void, tail_len), 0) };
+        }
+
+        Ok(Self {
+            addr: addr.cast(),
+            len,
+        })
     }
 }
