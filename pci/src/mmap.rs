@@ -12,11 +12,12 @@ use std::os::fd::{AsRawFd as _, BorrowedFd};
 use libc::size_t;
 
 const TWO_MIB: usize = 2 * 1024 * 1024;
+const ONE_GIB: usize = 1024 * 1024 * 1024;
 
-/// Round `addr` up to the next 2 MiB boundary.
+/// Round `addr` up to the next multiple of `align`.
 #[inline]
-fn align_up_to_2mib(addr: usize) -> usize {
-    addr.next_multiple_of(TWO_MIB)
+fn align_up(addr: usize, align: usize) -> usize {
+    addr.next_multiple_of(align)
 }
 
 /// A region of `mmap()`-allocated memory that calls `munmap()` when dropped.
@@ -85,11 +86,16 @@ in both isize and libc::size_t";
             "bad protection"
         );
 
-        // A 2 MiB-aligned address only lets the kernel back the mapping with
-        // huge pages when the mapping length is itself a multiple of 2 MiB. For
-        // other lengths the alignment is pointless, so create a plain
-        // page-aligned mapping instead.
-        if !len.is_multiple_of(TWO_MIB) {
+        // A huge-page-aligned address only lets the kernel back the mapping
+        // with huge pages when the mapping length is itself a multiple of the
+        // huge-page size. Pick the largest boundary the length qualifies for
+        // (1 GiB, then 2 MiB); for other lengths the alignment is pointless, so
+        // create a plain page-aligned mapping instead.
+        let align = if len.is_multiple_of(ONE_GIB) {
+            ONE_GIB
+        } else if len.is_multiple_of(TWO_MIB) {
+            TWO_MIB
+        } else {
             // SAFETY: FFI call with correct parameters.
             let addr = unsafe {
                 libc::mmap(
@@ -108,14 +114,14 @@ in both isize and libc::size_t";
                 addr: addr.cast(),
                 len,
             });
-        }
+        };
 
-        // Align the mapping to a 2 MiB boundary so the kernel can back it with
-        // huge pages. `mmap(NULL, ...)` only guarantees page-sized alignment, so
-        // reserve an anonymous region big enough to contain a 2 MiB-aligned run
-        // of `len` bytes, map the file at the aligned address, and trim the
-        // excess on both sides.
-        let Some(reserve) = len.checked_add(TWO_MIB) else {
+        // Align the mapping to `align` so the kernel can back it with huge
+        // pages. `mmap(NULL, ...)` only guarantees page-sized alignment, so
+        // reserve an anonymous region big enough to contain an aligned run of
+        // `len` bytes, map the file at the aligned address, and trim the excess
+        // on both sides.
+        let Some(reserve) = len.checked_add(align) else {
             return Err(Error::new(ErrorKind::InvalidInput, BAD_LENGTH));
         };
 
@@ -135,7 +141,7 @@ in both isize and libc::size_t";
         }
 
         let base_addr = base as usize;
-        let aligned_addr = align_up_to_2mib(base_addr);
+        let aligned_addr = align_up(base_addr, align);
         let aligned = aligned_addr as *mut c_void;
 
         // SAFETY: FFI call. MAP_FIXED is safe here because it only replaces the
