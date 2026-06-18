@@ -1413,9 +1413,9 @@ impl CpuManager {
                                     VmExit::Tdx => {
                                             match vcpu.vcpu.get_tdx_exit_details() {
                                                 Ok(details) => match details {
-                                                    TdxExitDetails::GetQuote => warn!("TDG_VP_VMCALL_GET_QUOTE not supported"),
+                                                    TdxExitDetails::GetQuote => debug!("TDG_VP_VMCALL_GET_QUOTE not supported"),
                                                     TdxExitDetails::SetupEventNotifyInterrupt => {
-                                                        warn!("TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT not supported");
+                                                        debug!("TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT not supported");
                                                     }
                                                 },
                                                 Err(e) => error!("Unexpected TDX VMCALL: {e}"),

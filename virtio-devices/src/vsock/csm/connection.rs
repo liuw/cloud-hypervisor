@@ -281,7 +281,7 @@ where
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {
                     // This shouldn't actually happen (receiving EWOULDBLOCK after EPOLLIN), but
                     // apparently it does, so we need to handle it gracefully.
-                    warn!(
+                    debug!(
                         "vsock: unexpected EWOULDBLOCK while reading from backing stream: \
                          lp={}, pp={}, err={:?}",
                         self.local_port, self.peer_port, err

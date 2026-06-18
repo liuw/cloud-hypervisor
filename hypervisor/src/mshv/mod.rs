@@ -707,7 +707,7 @@ impl cpu::Vcpu for MshvVcpu {
                     let info = x.to_gpa_attribute_info().unwrap();
                     let host_vis = info.__bindgen_anon_1.host_visibility();
                     if host_vis >= HV_MAP_GPA_READABLE | HV_MAP_GPA_WRITABLE {
-                        warn!("Ignored attribute intercept with full host visibility");
+                        debug!("Ignored attribute intercept with full host visibility");
                         return Ok(cpu::VmExit::Ignore);
                     }
 
