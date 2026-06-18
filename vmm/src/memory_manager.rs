@@ -2556,14 +2556,14 @@ impl MemoryManager {
                 // Keep the hotplugged_size up to date.
                 virtio_mem_zone.hotplugged_size = size;
             } else {
-                error!("Failed resizing virtio-mem region: No virtio-mem handler");
+                warn!("Failed resizing virtio-mem region: No virtio-mem handler");
                 return Err(Error::MissingVirtioMemHandler);
             }
 
             return Ok(());
         }
 
-        error!("Failed resizing virtio-mem region: Unknown memory zone");
+        warn!("Failed resizing virtio-mem region: Unknown memory zone");
         Err(Error::UnknownMemoryZone)
     }
 
@@ -2573,7 +2573,7 @@ impl MemoryManager {
     /// already been allocated at boot time.
     pub fn resize(&mut self, desired_ram: u64) -> Result<Option<Arc<GuestRegionMmap>>, Error> {
         if self.user_provided_zones {
-            error!(
+            warn!(
                 "Not allowed to resize guest memory when backed with user \
                 defined memory zones."
             );
@@ -2609,7 +2609,7 @@ impl MemoryManager {
 
     pub fn resize_zone(&mut self, id: &str, virtio_mem_size: u64) -> Result<(), Error> {
         if !self.user_provided_zones {
-            error!(
+            warn!(
                 "Not allowed to resize guest memory zone when no zone is \
                 defined."
             );
@@ -2624,7 +2624,7 @@ impl MemoryManager {
         // SAFETY: FFI call with correct arguments
         let ret = unsafe { libc::fstat(f.as_raw_fd(), stat.as_mut_ptr()) };
         if ret != 0 {
-            error!("Couldn't fstat the backing file");
+            warn!("Couldn't fstat the backing file");
             return false;
         }
 

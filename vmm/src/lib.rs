@@ -2245,7 +2245,7 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => vm
                 .resize(desired_vcpus, desired_ram, desired_balloon)
-                .inspect_err(|e| error!("Error when resizing VM: {e:?}")),
+                .inspect_err(|e| warn!("Error when resizing VM: {e:?}")),
             VmOwnership::None => {
                 let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
                 if let Some(desired_vcpus) = desired_vcpus {
@@ -2280,7 +2280,7 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 vm.resize_zone(&id, desired_ram)
-                    .inspect_err(|e| error!("Error when resizing zone: {e:?}"))?;
+                    .inspect_err(|e| warn!("Error when resizing zone: {e:?}"))?;
                 Ok(())
             }
             VmOwnership::None => {
@@ -2296,7 +2296,7 @@ impl RequestHandler for Vmm {
                     }
                 }
 
-                error!("Could not find the memory zone {id} for the resize");
+                warn!("Could not find the memory zone {id} for the resize");
                 Err(VmError::ResizeZone)
             }
         }
@@ -2318,7 +2318,7 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 let info = vm.add_device(device_cfg).inspect_err(|e| {
-                    error!("Error when adding new device to the VM: {e:?}");
+                    warn!("Error when adding new device to the VM: {e:?}");
                 })?;
                 serde_json::to_vec(&info)
                     .map(Some)
@@ -2349,7 +2349,7 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 let info = vm.add_user_device(device_cfg).inspect_err(|e| {
-                    error!("Error when adding new user device to the VM: {e:?}");
+                    warn!("Error when adding new user device to the VM: {e:?}");
                 })?;
                 serde_json::to_vec(&info)
                     .map(Some)
@@ -2368,7 +2368,7 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 vm.remove_device(&id)
-                    .inspect_err(|e| error!("Error when removing device from the VM: {e:?}"))?;
+                    .inspect_err(|e| warn!("Error when removing device from the VM: {e:?}"))?;
                 Ok(())
             }
             VmOwnership::None => {
@@ -2399,7 +2399,7 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 let info = vm.add_disk(disk_cfg).inspect_err(|e| {
-                    error!("Error when adding new disk to the VM: {e:?}");
+                    warn!("Error when adding new disk to the VM: {e:?}");
                 })?;
                 serde_json::to_vec(&info)
                     .map(Some)
@@ -2427,7 +2427,7 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 let info = vm.add_fs(fs_cfg).inspect_err(|e| {
-                    error!("Error when adding new fs to the VM: {e:?}");
+                    warn!("Error when adding new fs to the VM: {e:?}");
                 })?;
                 serde_json::to_vec(&info)
                     .map(Some)
@@ -2463,7 +2463,7 @@ impl RequestHandler for Vmm {
                 let info = vm
                     .add_generic_vhost_user(generic_vhost_user_cfg)
                     .inspect_err(|e| {
-                        error!("Error when adding new generic vhost-user device to the VM: {e:?}");
+                        warn!("Error when adding new generic vhost-user device to the VM: {e:?}");
                     })?;
                 serde_json::to_vec(&info)
                     .map(Some)
@@ -2491,7 +2491,7 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 let info = vm.add_pmem(pmem_cfg).inspect_err(|e| {
-                    error!("Error when adding new pmem device to the VM: {e:?}");
+                    warn!("Error when adding new pmem device to the VM: {e:?}");
                 })?;
                 serde_json::to_vec(&info)
                     .map(Some)
@@ -2519,7 +2519,7 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 let info = vm.add_net(net_cfg).inspect_err(|e| {
-                    error!("Error when adding new network device to the VM: {e:?}");
+                    warn!("Error when adding new network device to the VM: {e:?}");
                 })?;
                 serde_json::to_vec(&info)
                     .map(Some)
@@ -2547,7 +2547,7 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 let info = vm.add_vdpa(vdpa_cfg).inspect_err(|e| {
-                    error!("Error when adding new vDPA device to the VM: {e:?}");
+                    warn!("Error when adding new vDPA device to the VM: {e:?}");
                 })?;
                 serde_json::to_vec(&info)
                     .map(Some)
@@ -2580,7 +2580,7 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 let info = vm.add_vsock(vsock_cfg).inspect_err(|e| {
-                    error!("Error when adding new vsock device to the VM: {e:?}");
+                    warn!("Error when adding new vsock device to the VM: {e:?}");
                 })?;
                 serde_json::to_vec(&info)
                     .map(Some)
@@ -2599,7 +2599,7 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 let info = vm.counters().inspect_err(|e| {
-                    error!("Error when getting counters from the VM: {e:?}");
+                    warn!("Error when getting counters from the VM: {e:?}");
                 })?;
                 serde_json::to_vec(&info)
                     .map(Some)

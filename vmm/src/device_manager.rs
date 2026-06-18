@@ -757,7 +757,7 @@ impl DeviceRelocation for AddressManager {
                         )
                         .is_none()
                     {
-                        error!(
+                        warn!(
                             "Failed to restore old IO range 0x{old_base:x} after rejected move_bar"
                         );
                     }
@@ -799,7 +799,7 @@ impl DeviceRelocation for AddressManager {
                                 )
                                 .is_none()
                             {
-                                error!(
+                                warn!(
                                     "Failed to restore old MMIO range 0x{old_base:x} after rejected move_bar"
                                 );
                             }
@@ -6047,7 +6047,7 @@ impl BusDevice for DeviceManager {
                 }
                 data.copy_from_slice(&(self.selected_segment as u32).to_le_bytes());
             }
-            _ => error!("Accessing unknown location at base 0x{base:x}, offset 0x{offset:x}"),
+            _ => warn!("Accessing unknown location at base 0x{base:x}, offset 0x{offset:x}"),
         }
 
         debug!("PCI_HP_REG_R: base 0x{base:x}, offset 0x{offset:x}, data {data:?}");
@@ -6067,7 +6067,7 @@ impl BusDevice for DeviceManager {
                 while slot_bitmap > 0 {
                     let slot_id = slot_bitmap.trailing_zeros();
                     if let Err(e) = self.eject_device(self.selected_segment as u16, slot_id as u8) {
-                        error!("Failed ejecting device {slot_id}: {e:?}");
+                        warn!("Failed ejecting device {slot_id}: {e:?}");
                     }
                     self.cleanup_vfio_ops();
                     slot_bitmap &= !(1 << slot_id);
