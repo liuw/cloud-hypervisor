@@ -9,7 +9,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use log::{error, info};
+use log::{debug, error};
 use rate_limiter::{RateLimiter, TokenType};
 use thiserror::Error;
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
@@ -510,7 +510,7 @@ impl NetQueuePair {
             )
             .map_err(NetQueuePairError::RegisterListener)?;
             self.tx_tap_listening = true;
-            info!("Writing to TAP returned EAGAIN. Listening for TAP to become writable.");
+            debug!("Writing to TAP returned EAGAIN. Listening for TAP to become writable.");
         } else if !tx_tap_retry && self.tx_tap_listening {
             unregister_listener(
                 self.epoll_fd.unwrap(),
@@ -520,7 +520,7 @@ impl NetQueuePair {
             )
             .map_err(NetQueuePairError::UnregisterListener)?;
             self.tx_tap_listening = false;
-            info!("Writing to TAP succeeded. No longer listening for TAP to become writable.");
+            debug!("Writing to TAP succeeded. No longer listening for TAP to become writable.");
         }
 
         self.counters

@@ -338,7 +338,7 @@ where
                 if pkt.op() == uapi::VSOCK_OP_RW =>
             {
                 if !pkt.has_buf() {
-                    info!(
+                    debug!(
                         "vsock: dropping empty data packet from guest (lp={}, pp={}",
                         self.local_port, self.peer_port
                     );

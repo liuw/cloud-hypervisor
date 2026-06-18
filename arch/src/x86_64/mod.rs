@@ -1170,7 +1170,7 @@ pub fn generate_ram_ranges(guest_mem: &GuestMemoryMmap) -> super::Result<Vec<Ram
 
     // Generate additional usable physical memory range after the gap if any.
     for ram_region in ram_regions.iter().skip(1) {
-        info!(
+        debug!(
             "found usable physical memory range, start: 0x{:08x}, end: 0x{:08x}",
             ram_region.0, ram_region.1
         );
@@ -1232,7 +1232,7 @@ fn configure_pvh(
 
     // Create e820 memory map entries
     for ram_range in ram_ranges {
-        info!(
+        debug!(
             "create_memmap_entry, start: 0x{:08x}, end: 0x{:08x}",
             ram_range.0, ram_range.1
         );

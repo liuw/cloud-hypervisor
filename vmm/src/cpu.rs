@@ -2098,7 +2098,7 @@ impl CpuManager {
         // or low (0x000xxx...).
         let high_range = extract_bits_64!(gva, 55, 1);
         if high_range == 0 {
-            info!("VA (0x{gva:x}) range is not supported!");
+            debug!("VA (0x{gva:x}) range is not supported!");
             return Ok(gva);
         }
 
@@ -2110,7 +2110,7 @@ impl CpuManager {
         let ds = extract_bits_64!(tcr_el1, 59, 1);
 
         if tsz == 0 {
-            info!("VA translation is not ready!");
+            debug!("VA translation is not ready!");
             return Ok(gva);
         }
 
