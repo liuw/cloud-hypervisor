@@ -10,7 +10,7 @@ use std::fs::{OpenOptions, read_link};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::{io, result, str};
+use std::{io, iter, result, str};
 
 use log::warn;
 use remain::sorted;
@@ -714,10 +714,14 @@ fn rebuild_refcounts(raw_file: &mut QcowRawFile, header: QcowHeader) -> BlockRes
     }
 
     // Write the updated reference count blocks and reftable.
+    // `declared_table_entries` is how many entries the refcount table the
+    // header describes can hold, which is what has to be left valid on disk;
+    // `ref_table` covers only the refblocks this rebuild produced.
     fn write_refblocks(
         refcounts: &[u64],
         mut header: QcowHeader,
         ref_table: &[u64],
+        declared_table_entries: u64,
         raw_file: &mut QcowRawFile,
         refcount_block_entries: u64,
     ) -> Result<()> {
@@ -748,9 +752,17 @@ fn rebuild_refcounts(raw_file: &mut QcowRawFile, header: QcowHeader) -> BlockRes
             }
         }
 
-        // Rewrite the top-level refcount table.
+        // Rewrite the top-level refcount table. The entries past the
+        // refblocks that were rebuilt have to be zeroed to remove
+        // stale entries.
+        let unused_entries = (declared_table_entries as usize).saturating_sub(ref_table.len());
         raw_file
-            .write_pointer_table_direct(header.refcount_table_offset, ref_table.iter())
+            .write_pointer_table_direct(
+                header.refcount_table_offset,
+                ref_table
+                    .iter()
+                    .chain(iter::repeat_n(&0u64, unused_entries)),
+            )
             .map_err(Error::WritingHeader)?;
 
         // Rewrite the header again, now with lazy refcounts disabled.
@@ -839,21 +851,30 @@ fn rebuild_refcounts(raw_file: &mut QcowRawFile, header: QcowHeader) -> BlockRes
     )
     .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
 
+    // Rebuilding only the refblocks that cover the file keeps the work proportional to the image
+    let file_clusters = div_round_up_u64(file_size, cluster_size);
+    let used_refblocks =
+        div_round_up_u64(file_clusters, refcount_block_entries).min(refblock_clusters);
+
     // Allocate clusters to store the new reference count blocks.
     let ref_table = alloc_refblocks(
         &mut refcounts,
         cluster_size,
-        refblock_clusters,
+        used_refblocks,
         max_refcount,
         refcount_bits,
     )
     .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
+
+    let declared_table_entries =
+        u64::from(header.refcount_table_clusters) * cluster_size / size_of::<u64>() as u64;
 
     // Write updated reference counts and point the reftable at them.
     write_refblocks(
         &refcounts,
         header,
         &ref_table,
+        declared_table_entries,
         raw_file,
         refcount_block_entries,
     )
@@ -1965,6 +1986,42 @@ mod unit_tests {
         assert!(
             disk.metadata().header().is_corrupt(),
             "Corrupt bit should be set"
+        );
+    }
+
+    #[test]
+    fn rebuild_refcounts_is_bounded_by_the_file() {
+        use std::fs;
+        use std::os::unix::fs::FileExt;
+
+        let temp = QcowTempDisk::new(1 << 40, None, false, true, false).unwrap();
+        let path = temp.path().to_owned();
+        let file = temp.into_tempfile();
+        let header = QcowHeader::new(&AlignedFile::new(
+            file.as_file().try_clone().unwrap(),
+            false,
+        ))
+        .unwrap();
+
+        // Clearing the first refcount table entry forces the rebuild on open.
+        file.as_file()
+            .write_all_at(&[0u8; 8], header.refcount_table_offset)
+            .unwrap();
+        drop(
+            QcowDisk::new(
+                file.as_file().try_clone().unwrap(),
+                false,
+                false,
+                true,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let len = fs::metadata(&path).unwrap().len();
+        assert!(
+            len < 8 << 20,
+            "a one terabyte claim over a small file produced a {len} byte image"
         );
     }
 
