@@ -5,8 +5,8 @@
 //! Flat VMDK adapter.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::os::unix::fs::FileExt;
+use std::path::{Component, Path};
 
 use block::disk_file::AsyncFullDiskFile;
 use block::error::{BlockError, BlockErrorKind, BlockResult};
@@ -64,17 +64,29 @@ impl Vmdk {
         Ok(())
     }
 
-    /// Rejects a descriptor that names an extent by absolute path.
+    /// Rejects a descriptor that names an extent outside the scratch
+    /// directory.
     ///
-    /// The engine anchors an absolute extent name at the filesystem root, so
-    /// opening one would let a corpus entry reach any file on the host. That
-    /// is unacceptable in a fuzzer, and it is the same reason backing files
-    /// are not enabled for qcow2. Fuzzing that branch safely needs a
-    /// filesystem sandbox rather than a scratch directory.
-    fn names_absolute_extent(descriptor: &str) -> bool {
+    /// The engine resolves an extent name against the descriptor's directory
+    /// with `openat2` and `resolve: 0`, which anchors an absolute name at the
+    /// filesystem root and follows `..` out of the directory, and it opens
+    /// the extent writable. A corpus entry could therefore reach and
+    /// overwrite any file on the host. That is unacceptable in a fuzzer, and
+    /// it is the same reason backing files are not enabled for qcow2.
+    /// Fuzzing that branch safely needs a filesystem sandbox rather than a
+    /// scratch directory.
+    ///
+    /// Only names made entirely of [`Component::Normal`] components are
+    /// allowed: that rejects absolute paths, root and prefix components, `..`
+    /// and `.` alike.
+    fn names_escaping_extent(descriptor: &str) -> bool {
         descriptor.lines().any(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            matches!(parts.len(), 4 | 5) && parts[3].trim_matches('"').starts_with('/')
+            if !matches!(parts.len(), 4 | 5) {
+                return false;
+            }
+            let name = Path::new(parts[3].trim_matches('"'));
+            name.is_absolute() || !name.components().all(|c| matches!(c, Component::Normal(_)))
         })
     }
 }
@@ -112,18 +124,16 @@ impl DiskFormat for Vmdk {
             .parent()
             .unwrap_or_else(|| scratch_dir(Self::NAME).expect("scratch directory"));
 
-        let mut descriptor = String::new();
-        let mut probe = file
-            .try_clone()
+        // Read positionally: `try_clone` is dup(2) and shares the file
+        // cursor with the engine, so a probe that moved it would leave the
+        // guard and the parser looking at different bytes.
+        let mut raw = vec![0u8; Self::MAX_IMAGE_LEN];
+        let len = file
+            .read_at(&mut raw, 0)
             .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
-        probe
-            .read_to_string(&mut descriptor)
-            .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
-        probe
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
+        let descriptor = String::from_utf8_lossy(&raw[..len]);
 
-        if Self::names_absolute_extent(&descriptor) {
+        if Self::names_escaping_extent(&descriptor) {
             return Err(BlockError::from_kind(BlockErrorKind::UnsupportedFeature));
         }
 
@@ -133,5 +143,62 @@ impl DiskFormat for Vmdk {
         // open and lets the descriptor's own access field decide per extent.
         let disk = VmdkDisk::new(file, path, false, config.direct)?;
         Ok(Box::new(disk))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disk_engine::image::image_file;
+
+    fn descriptor(name: &str) -> String {
+        format!("# Disk DescriptorFile\nversion=1\ncreateType=\"monolithicFlat\"\nRW 2048 FLAT \"{name}\" 0\n")
+    }
+
+    // The engine opens extents writable through openat2 with resolve: 0,
+    // which follows `..` out of the scratch directory, so a descriptor that
+    // escapes must never reach it.
+    #[test]
+    fn traversing_extent_names_are_rejected() {
+        for name in [
+            "../../../../tmp/victim",
+            "..",
+            "./image-flat.vmdk",
+            "sub/../../tmp/victim",
+            "/tmp/victim",
+            "/etc/passwd",
+        ] {
+            assert!(
+                Vmdk::names_escaping_extent(&descriptor(name)),
+                "{name} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_extent_names_are_accepted() {
+        for name in ["image-flat.vmdk", "two-f001.vmdk"] {
+            assert!(
+                !Vmdk::names_escaping_extent(&descriptor(name)),
+                "{name} must be accepted"
+            );
+        }
+    }
+
+    // The guard has to hold at the harness entry point, not just in
+    // isolation: `open` reads the descriptor positionally, so it sees the
+    // same bytes the engine parses.
+    #[test]
+    fn open_refuses_a_traversing_descriptor() {
+        let bytes = descriptor("../../../../tmp/victim");
+        let (file, path) = image_file("vmdk", bytes.as_bytes()).expect("scratch image");
+        let err = Vmdk::open(file, Some(&path), &OpenConfig::default())
+            .err()
+            .expect("a descriptor escaping the scratch directory must be refused");
+        assert_eq!(err.kind(), BlockErrorKind::UnsupportedFeature);
+        assert!(
+            !Path::new("/tmp/victim").exists(),
+            "the harness must not have created /tmp/victim"
+        );
     }
 }
