@@ -126,7 +126,11 @@ also check the trait contract itself: an accepted operation completes exactly
 once and carries its own user data, a rejected operation does not complete at
 all, a completion never reports more bytes than were requested, and a format
 with a fixed capacity neither changes its reported size without a successful
-resize nor transfers bytes beyond it.
+resize nor transfers bytes beyond it. Two more invariants are opt in, because
+they follow from a format's layout rather than from the trait contract: a
+format whose data sits in the image file never advertises more capacity than
+the file holds, and a format whose read path is all or nothing never completes
+a read successfully with fewer bytes than were asked for.
 
 ### Running in OSS-Fuzz
 
@@ -187,9 +191,11 @@ impl DiskFormat for MyFormat {
 
 Set the associated constants that decide how the framework drives the format
 and which invariants hold for it: `NEEDS_PATH`, `MAX_IMAGE_LEN`,
-`COMPLETES_INLINE`, `PUNCH_HOLE_READS_ZEROES` and `FIXED_CAPACITY`. Then add
-the targets, the image target always and the operation target when there is a
-template, each a single call into the framework, and register them in
+`COMPLETES_INLINE`, `PUNCH_HOLE_READS_ZEROES`, `FIXED_CAPACITY`,
+`CAPACITY_FILE_TAIL` and `NO_SHORT_READS`. Each defaults to the value that
+checks nothing, so a format only gains an invariant it can actually keep. Then
+add the targets, the image target always and the operation target when there
+is a template, each a single call into the framework, and register them in
 `fuzz/Cargo.toml`.
 
 Finally give the image target something to start from: a `seed_<format>`
