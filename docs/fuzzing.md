@@ -113,6 +113,26 @@ The same limit is why `DiskFormat::MAX_IMAGE_LEN` is a per format constant:
 the harness rejects anything larger, and a format whose metadata reaches far
 into the file needs a bigger budget than the 8 MiB default.
 
+A checksum protected format needs one more thing: a custom mutator. `disk_vhd`
+and `disk_vhdx` both have one, because their parsers verify a checksum before
+they look at anything else, so a plain byte mutation is rejected at open and
+the fuzzer never reaches the structure it changed. Each target runs
+`libfuzzer_sys::fuzzer_mutate` and then recomputes the checksums over the
+result:
+
+| Target | What it repairs | Why |
+| ------ | --------------- | --- |
+| `disk_vhdx` | the CRC-32C of both headers and both region tables | `VhdxHeader::new` refuses an image whose four checksums do not match |
+| `disk_vhd` | the fixed VHD footer checksum, big endian, in the last 512 bytes | `VhdFooter::validate_fixed` refuses an image whose footer checksum does not match |
+
+The offsets and the algorithms are taken from the parser under test rather
+than from the specification, so the mutator and the code it feeds cannot
+disagree. Repair is necessary but not sufficient: the other validated fields
+still reject a mutation on their own merits, and `disk_vhd` deliberately
+leaves one mutation in eight unrepaired so that the checksum mismatch branch
+stays reachable. Both targets still take arbitrary bytes, since the corpus
+holds images the mutator never produced.
+
 `disk_<format>_ops` builds its own valid image, so it needs no corpus:
 
 ```
@@ -200,7 +220,9 @@ is a template, each a single call into the framework, and register them in
 
 Finally give the image target something to start from: a `seed_<format>`
 function in `scripts/generate-fuzz-seeds.sh` and, when the format is magic
-heavy, a dictionary in `fuzz/dictionaries/`.
+heavy, a dictionary in `fuzz/dictionaries/`. If the parser checksums part of
+the image, add a repair function next to the adapter and a `fuzz_mutator!`
+that calls it, as `disk_vhd` and `disk_vhdx` do.
 
 Backing files are deliberately left out: a fuzzed image names its backing file
 by path, so enabling them would let a corpus entry open arbitrary host files
