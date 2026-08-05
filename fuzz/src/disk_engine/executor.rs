@@ -39,6 +39,12 @@ const MAX_MODEL_LEN: u64 = 8 << 20;
 /// Largest size a `Resize` op may ask for.
 const MAX_RESIZE_LEN: u64 = 64 << 20;
 
+/// Bytes written into each L2 table by a `Sweep` op.
+///
+/// One sector is enough to allocate a cluster and dirty the table that maps
+/// it, and keeps a sweep over the whole cache cheap.
+const SWEEP_LEN: usize = 512;
+
 /// Drives an op program against one opened disk image.
 pub struct Executor<F: DiskFormat> {
     disk: Box<dyn AsyncFullDiskFile>,
@@ -125,6 +131,28 @@ impl<F: DiskFormat> Executor<F> {
             }
             Op::UseClone { ring_depth: depth } => self.use_clone(ring_depth(depth)),
             Op::QueryCaps => self.query_caps(),
+            Op::Sweep {
+                first,
+                tables,
+                seed,
+            } => self.sweep(first, tables, seed),
+        }
+    }
+
+    /// Writes one sector into each of a run of L2 tables, then reads every
+    /// one of them back.
+    ///
+    /// The read back pass is what makes the eviction path testable rather
+    /// than merely reachable: a table the engine wrote back to the wrong
+    /// place, or dropped without writing back, only shows up when the data
+    /// behind it is read again after the cache has moved on.
+    fn sweep(&mut self, first: u8, tables: u8, seed: u8) {
+        let offsets: Vec<u64> = Op::sweep_offsets(first, tables, self.size).collect();
+        for &offset in &offsets {
+            self.write_vec(offset, SWEEP_LEN, seed);
+        }
+        for &offset in &offsets {
+            self.read_vec(offset, SWEEP_LEN);
         }
     }
 
