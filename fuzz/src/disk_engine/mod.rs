@@ -33,6 +33,11 @@
 //! format can open. It gets its own target, [`fuzz_detect`], whose input
 //! space is "any image of any format".
 //!
+//! Backing chains are not part of either family either. A qcow2 image names
+//! its backing file by path, so the harness has to sandbox the filesystem
+//! before the engine sees it, and the input is two images rather than one.
+//! That lives in [`formats::qcow2_chain`], behind `disk_qcow2_chain`.
+//!
 //! # Adding a format
 //!
 //! Implement [`DiskFormat`] for the new format, then add two targets that call
@@ -45,6 +50,7 @@ pub mod formats;
 mod image;
 mod model;
 mod program;
+mod sandbox;
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
