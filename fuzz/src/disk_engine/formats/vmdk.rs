@@ -5,6 +5,7 @@
 //! Flat VMDK adapter.
 
 use std::fs::{File, OpenOptions};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::unix::fs::FileExt;
 use std::path::{Component, Path};
 
@@ -83,6 +84,31 @@ impl Vmdk {
                 .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
         }
         Ok(())
+    }
+
+    /// Decides from the input whether this iteration resolves its extents
+    /// with the `openat2` fallback walk.
+    ///
+    /// One input in two, by a hash of the descriptor, so both resolution
+    /// paths keep a share of the corpus and neither depends on anything
+    /// outside the input.
+    ///
+    /// A descriptor naming an absolute extent is the exception: it is the
+    /// only thing that reaches the `openat2` arm which deliberately leaves
+    /// `RESOLVE_BENEATH` off, so sending it down the walk would spend the
+    /// one input that can cover it.
+    #[cfg_attr(not(fuzzing), allow(dead_code))]
+    fn force_walk(bytes: &[u8]) -> bool {
+        if bytes
+            .windows(SCRATCH_TOKEN.len())
+            .any(|window| window == SCRATCH_TOKEN.as_bytes())
+        {
+            return false;
+        }
+
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        !hasher.finish().is_multiple_of(2)
     }
 
     /// Expands [`SCRATCH_TOKEN`] in `descriptor` into the scratch directory.
@@ -210,6 +236,14 @@ impl DiskFormat for Vmdk {
 
         Self::reset_extents(dir)?;
 
+        // Which resolution path the engine takes is derived from the input
+        // rather than from the environment, so a crash found on the fallback
+        // walk reproduces from its bytes alone. Without this the walk is
+        // dead code on every kernel a fuzzer runs on, because `openat2`
+        // always succeeds there.
+        #[cfg(fuzzing)]
+        block::formats::vmdk::set_force_extent_walk(Self::force_walk(&raw[..len]));
+
         // The fuzzer drives the writable path, so it asks for a writable
         // open and lets the descriptor's own access field decide per extent.
         let disk = VmdkDisk::new(file, path, false, config.direct)?;
@@ -291,6 +325,31 @@ mod tests {
         assert!(expanded.contains(&dir.display().to_string()));
         assert!(!Vmdk::names_escaping_extent(&expanded, dir));
         assert!(Vmdk::expand_scratch_token("no token here", dir).is_none());
+    }
+
+    // The resolution path must depend on the input alone, and both paths
+    // have to keep a share of it.
+    #[test]
+    fn the_walk_choice_is_a_function_of_the_input() {
+        let a = descriptor("image-flat.vmdk");
+        assert_eq!(
+            Vmdk::force_walk(a.as_bytes()),
+            Vmdk::force_walk(a.as_bytes())
+        );
+
+        let mixed = (0..64u8)
+            .map(|i| Vmdk::force_walk(format!("{a}{i}").as_bytes()))
+            .filter(|walk| *walk)
+            .count();
+        assert!(
+            (8..56).contains(&mixed),
+            "{mixed} of 64 inputs took the walk, expected a rough split"
+        );
+
+        // An absolute name has to reach openat2, which is the only arm that
+        // can cover the unconfined resolve.
+        let absolute = descriptor(&format!("{SCRATCH_TOKEN}/image-flat.vmdk"));
+        assert!(!Vmdk::force_walk(absolute.as_bytes()));
     }
 
     // `magic_ok` decides whether a corpus entry is a descriptor at all, so it
