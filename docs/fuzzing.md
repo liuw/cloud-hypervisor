@@ -227,6 +227,35 @@ The same limit is why `DiskFormat::MAX_IMAGE_LEN` is a per format constant:
 the harness rejects anything larger, and a format whose metadata reaches far
 into the file needs a bigger budget than the 8 MiB default.
 
+#### How a VMDK extent name is resolved
+
+The extent opener has two arms the harness has to reach on purpose, and both
+are security relevant.
+
+The first is the fallback walk. `open_extent` resolves a name with
+`openat2(2)` and `RESOLVE_BENEATH` and only walks the path component by
+component when the syscall is missing (`ENOSYS`, kernels before 5.6) or
+blocked (`EPERM`). On any kernel a fuzzer runs on the first call succeeds, so
+`open_extent_walk` and `extent_components` never run, and they are precisely
+where the fallback rejects a traversing name itself, without a kernel to do
+it. A `cfg(fuzzing)` switch in `block/src/formats/vmdk/flat.rs` lets the
+harness take the walk instead, and the VMDK adapter sets it from a hash of
+the descriptor, one input in two. Deriving it from the input rather than from
+an environment variable is what keeps a crash reproducible from its bytes
+alone; a seccomp filter could not do that, because a filter is process wide
+and cannot be lifted once installed.
+
+The second is the absolute name. An extent name may be absolute, and then the
+engine anchors resolution at the filesystem root and deliberately does not
+apply `RESOLVE_BENEATH`. A fuzzer may only open an absolute path inside its
+own scratch directory, whose name carries the process id, so no fixed corpus
+entry can name it. A descriptor therefore writes the placeholder
+`/@fuzz-scratch@`, which the harness expands into the scratch directory
+before the parser reads the file, and the name guard accepts an absolute name
+only when it starts with that directory and every component after it is a
+plain name. The expansion is a function of the input alone, and
+`scripts/generate-fuzz-seeds.sh` writes a seed that uses it.
+
 ### QCOW2 backing chains
 
 A qcow2 image may name a backing file, and `disk_qcow2` reaches none of the
@@ -377,6 +406,28 @@ holds images the mutator never produced.
 ```
 cargo fuzz run disk_qcow2_ops -j `nproc`
 ```
+
+#### Templates and the L2 cache
+
+A format may build more than one template image, and the program picks one by
+index, because some engine behaviour follows from the image layout rather
+than from the operations. qcow2 is the case in point: the number of L2 tables
+an image has follows from its cluster size, the engine caches 100 of them and
+writes a dirty table back when it evicts it, and with the default 64 KiB
+cluster one L2 table covers 512 MiB of the disk. No image small enough for
+the shadow model can then hold more tables than the cache does, so nothing
+ever evicted. The second qcow2 template is 4 MiB with 512 byte clusters,
+which is 128 L2 tables and still under the model's 8 MiB limit.
+
+A template alone is not enough either: with `MAX_OPS` at 64, no program of
+ordinary operations can keep 101 tables live however its offsets fall. The
+`Sweep` operation writes one sector into each of up to 192 consecutive L2
+tables and then reads every one of them back. The write pass outruns the
+cache; the read back pass is what makes the eviction testable rather than
+merely reachable, since a table written back to the wrong place, or dropped
+without a write back, only shows up when the data behind it is read after the
+cache has moved on. Because the sweep runs under the shadow model, that shows
+up as a read back mismatch.
 
 Because that image is valid and starts out reading as zeroes, the framework
 keeps a shadow model of the disk contents and compares every read against it,
