@@ -38,6 +38,23 @@ const EXTENTS: [&str; 6] = [
     "two-f002.vmdk",
 ];
 
+/// Placeholder a descriptor uses to name the scratch directory.
+///
+/// An extent name may be absolute, and the engine treats an absolute name
+/// very differently from a relative one: it anchors resolution at the
+/// filesystem root and deliberately does not apply `RESOLVE_BENEATH`
+/// (block/src/formats/vmdk/flat.rs:141 and :190). That arm cannot be fuzzed
+/// by naming a real absolute path, because the only absolute path that is
+/// safe to open here is one inside the scratch directory, and the scratch
+/// directory carries the process id so no fixed corpus entry can name it.
+///
+/// A descriptor therefore writes the placeholder, and the harness expands it
+/// into the scratch directory before the parser reads the file. The
+/// expansion is a pure function of the input, so an input still reproduces
+/// on its own: what varies between processes is the directory the harness
+/// itself creates, exactly as it already does for relative names.
+const SCRATCH_TOKEN: &str = "/@fuzz-scratch@";
+
 /// Flat VMDK images, as opened by [`VmdkDisk`].
 ///
 /// A VMDK image is a text descriptor that names its data extents as separate
@@ -68,29 +85,51 @@ impl Vmdk {
         Ok(())
     }
 
+    /// Expands [`SCRATCH_TOKEN`] in `descriptor` into the scratch directory.
+    ///
+    /// Returns `None` when there is nothing to expand, so the common case
+    /// pays nothing.
+    fn expand_scratch_token(descriptor: &str, dir: &Path) -> Option<String> {
+        if !descriptor.contains(SCRATCH_TOKEN) {
+            return None;
+        }
+        Some(descriptor.replace(SCRATCH_TOKEN, &dir.to_string_lossy()))
+    }
+
     /// Rejects a descriptor that names an extent outside the scratch
     /// directory.
     ///
     /// The engine resolves an extent name against the descriptor's directory
-    /// with `openat2` and `resolve: 0`, which anchors an absolute name at the
-    /// filesystem root and follows `..` out of the directory, and it opens
-    /// the extent writable. A corpus entry could therefore reach and
-    /// overwrite any file on the host. That is unacceptable in a fuzzer, and
-    /// it is the same reason backing files are not enabled for qcow2.
-    /// Fuzzing that branch safely needs a filesystem sandbox rather than a
-    /// scratch directory.
+    /// with `openat2`, and for an absolute name it anchors at the filesystem
+    /// root without `RESOLVE_BENEATH`, and it opens the extent writable. A
+    /// corpus entry could therefore reach and overwrite any file on the
+    /// host, which is unacceptable in a fuzzer.
     ///
-    /// Only names made entirely of [`Component::Normal`] components are
-    /// allowed: that rejects absolute paths, root and prefix components, `..`
-    /// and `.` alike.
-    fn names_escaping_extent(descriptor: &str) -> bool {
+    /// A relative name is accepted when every component is
+    /// [`Component::Normal`]: that rejects root and prefix components, `..`
+    /// and `.` alike. An absolute name is accepted only when it starts with
+    /// the scratch directory and every component after it is `Normal`, so
+    /// the engine's absolute arm is fuzzed with a name that still cannot
+    /// leave the directory the harness owns.
+    fn names_escaping_extent(descriptor: &str, dir: &Path) -> bool {
         descriptor.lines().any(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if !matches!(parts.len(), 4 | 5) {
                 return false;
             }
             let name = Path::new(parts[3].trim_matches('"'));
-            name.is_absolute() || !name.components().all(|c| matches!(c, Component::Normal(_)))
+            let rest = if name.is_absolute() {
+                match name.strip_prefix(dir) {
+                    Ok(rest) => rest,
+                    Err(_) => return true,
+                }
+            } else {
+                name
+            };
+            // An empty remainder is the scratch directory itself, which is
+            // not an extent.
+            rest.components().next().is_none()
+                || !rest.components().all(|c| matches!(c, Component::Normal(_)))
         })
     }
 }
@@ -152,9 +191,20 @@ impl DiskFormat for Vmdk {
         let len = file
             .read_at(&mut raw, 0)
             .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
-        let descriptor = String::from_utf8_lossy(&raw[..len]);
+        let mut descriptor = String::from_utf8_lossy(&raw[..len]).into_owned();
 
-        if Self::names_escaping_extent(&descriptor) {
+        // The placeholder is expanded in the file itself, because the parser
+        // reads the descriptor from there and the expanded name has to be
+        // the one it resolves.
+        if let Some(expanded) = Self::expand_scratch_token(&descriptor, dir) {
+            file.write_all_at(expanded.as_bytes(), 0)
+                .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
+            file.set_len(expanded.len() as u64)
+                .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
+            descriptor = expanded;
+        }
+
+        if Self::names_escaping_extent(&descriptor, dir) {
             return Err(BlockError::from_kind(BlockErrorKind::UnsupportedFeature));
         }
 
@@ -170,30 +220,77 @@ impl DiskFormat for Vmdk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk_engine::image::image_file;
+    use crate::disk_engine::image::{image_file, scratch_dir};
 
     fn descriptor(name: &str) -> String {
         format!("# Disk DescriptorFile\nversion=1\ncreateType=\"monolithicFlat\"\nRW 2048 FLAT \"{name}\" 0\n")
     }
 
-    // The engine opens extents writable through openat2 with resolve: 0,
-    // which follows `..` out of the scratch directory, so a descriptor that
-    // escapes must never reach it.
+    fn scratch() -> &'static Path {
+        scratch_dir(Vmdk::NAME).expect("scratch directory")
+    }
+
+    // The engine opens extents writable, and for an absolute name it
+    // resolves from the filesystem root without RESOLVE_BENEATH, so a
+    // descriptor that escapes the scratch directory must never reach it.
     #[test]
     fn traversing_extent_names_are_rejected() {
+        let dir = scratch();
         for name in [
-            "../../../../tmp/victim",
-            "..",
-            "./image-flat.vmdk",
-            "sub/../../tmp/victim",
-            "/tmp/victim",
-            "/etc/passwd",
+            "../../../../tmp/victim".to_string(),
+            "..".to_string(),
+            "./image-flat.vmdk".to_string(),
+            "sub/../../tmp/victim".to_string(),
+            "/tmp/victim".to_string(),
+            "/etc/passwd".to_string(),
+            // Absolute, and inside the scratch directory only until the
+            // components after it are followed.
+            format!("{}/../../tmp/victim", dir.display()),
+            // The scratch directory itself is not an extent.
+            dir.display().to_string(),
+            // A directory whose name merely starts with the scratch path.
+            format!("{}-evil/image-flat.vmdk", dir.display()),
         ] {
             assert!(
-                Vmdk::names_escaping_extent(&descriptor(name)),
+                Vmdk::names_escaping_extent(&descriptor(&name), dir),
                 "{name} must be rejected"
             );
         }
+    }
+
+    // The absolute arm of the engine's extent opener is only reachable with
+    // an absolute name, and the only absolute name that is safe to give it
+    // is one inside the scratch directory the harness owns.
+    #[test]
+    fn absolute_names_inside_the_scratch_directory_are_accepted() {
+        let dir = scratch();
+        for name in [
+            format!("{}/image-flat.vmdk", dir.display()),
+            format!("{}/extents/s001.vmdk", dir.display()),
+        ] {
+            assert!(
+                !Vmdk::names_escaping_extent(&descriptor(&name), dir),
+                "{name} must be accepted"
+            );
+        }
+    }
+
+    // A corpus entry cannot know the scratch path, so it writes the
+    // placeholder and the harness expands it. The expansion has to produce a
+    // name the guard then accepts, or the arm stays unreachable.
+    #[test]
+    fn the_scratch_token_expands_to_an_accepted_absolute_name() {
+        let dir = scratch();
+        let raw = descriptor(&format!("{SCRATCH_TOKEN}/image-flat.vmdk"));
+        assert!(
+            Vmdk::names_escaping_extent(&raw, dir),
+            "the unexpanded placeholder is not a valid name"
+        );
+
+        let expanded = Vmdk::expand_scratch_token(&raw, dir).expect("the token must expand");
+        assert!(expanded.contains(&dir.display().to_string()));
+        assert!(!Vmdk::names_escaping_extent(&expanded, dir));
+        assert!(Vmdk::expand_scratch_token("no token here", dir).is_none());
     }
 
     // `magic_ok` decides whether a corpus entry is a descriptor at all, so it
@@ -213,7 +310,7 @@ mod tests {
     fn plain_extent_names_are_accepted() {
         for name in ["image-flat.vmdk", "two-f001.vmdk"] {
             assert!(
-                !Vmdk::names_escaping_extent(&descriptor(name)),
+                !Vmdk::names_escaping_extent(&descriptor(name), scratch()),
                 "{name} must be accepted"
             );
         }
