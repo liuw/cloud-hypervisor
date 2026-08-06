@@ -23,6 +23,17 @@ const L2_SPAN: u64 = crate::disk_engine::formats::qcow2::SMALL_L2_SPAN;
 /// more than that in a single op: with [`MAX_OPS`] at 64, no program made of
 /// ordinary ops can reach 101 distinct tables however its offsets are
 /// chosen.
+///
+/// It stays at 192 even though the small cluster template has only 128 L2
+/// tables, so a longer sweep wraps onto tables it has already walked.
+/// Lowering it to 128 to remove those repeats was measured and made the
+/// target *slower*: 20 000 executions of `disk_qcow2_ops` fell from 307 to
+/// 273 exec/s, and a replay of a fixed 1080 entry corpus rose from 11.1s to
+/// 13.5s. A repeat is cheap - the table is already cached and the cluster
+/// already allocated - while a *distinct* table costs an allocation and an
+/// eviction, and `tables % MAX_SWEEP` maps a whole range of inputs onto
+/// short sweeps only while the modulus exceeds the table count. Wrapping is
+/// therefore where the cheap inputs come from, not waste.
 const MAX_SWEEP: u64 = 192;
 
 /// Largest byte count for a single data op.
