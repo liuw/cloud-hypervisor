@@ -13,6 +13,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path};
 use std::sync::Arc;
+#[cfg(fuzzing)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::warn;
 
@@ -100,15 +102,15 @@ const RESOLVE_BENEATH: u64 = 0x08;
 /// has.
 #[cfg(fuzzing)]
 pub fn set_force_extent_walk(force: bool) {
-    FORCE_EXTENT_WALK.store(force, std::sync::atomic::Ordering::Relaxed);
+    FORCE_EXTENT_WALK.store(force, Ordering::Relaxed);
 }
 
 #[cfg(fuzzing)]
-static FORCE_EXTENT_WALK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FORCE_EXTENT_WALK: AtomicBool = AtomicBool::new(false);
 
 #[cfg(fuzzing)]
 fn force_extent_walk() -> bool {
-    FORCE_EXTENT_WALK.load(std::sync::atomic::Ordering::Relaxed)
+    FORCE_EXTENT_WALK.load(Ordering::Relaxed)
 }
 
 // Splits an untrusted extent `filename` into its `Normal` path components for
