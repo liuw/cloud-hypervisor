@@ -70,7 +70,7 @@ The formats covered today:
 | Format | Image target | Operation target |
 | ------ | ------------ | ---------------- |
 | qcow2 | `disk_qcow2` | `disk_qcow2_ops` |
-| VHDX | `disk_vhdx` | none |
+| VHDX | `disk_vhdx` | `disk_vhdx_ops` |
 | fixed VHD | `disk_vhd` | none |
 | flat VMDK | `disk_vmdk` | none |
 
@@ -78,10 +78,108 @@ The sniffer in front of them all is fuzzed by `disk_detect`, and qcow2 backing
 chains by `disk_qcow2_chain`.
 
 An operation target needs a valid image that the harness can build in process
-and that reads back as zeroes. The `block` crate can create a qcow2 image, but
-it only parses VHDX, VHD and VMDK, so those three formats have no operation
-target. Writing one inside the fuzzer would mean encoding the harness author's
-reading of the format rather than exercising the code under test.
+and that reads back as zeroes, which is what `DiskFormat::template` returns. A
+format without one gets no operation target and so no shadow model, which
+means nothing anywhere can catch it returning the *wrong bytes*: an engine
+that loses or misplaces a guest write passes every other check the framework
+makes.
+
+Fixed VHD deliberately stays without one. `FixedVhdSync` is a bounds check in
+front of `preadv`/`pwritev` on the image file, so a shadow model over it would
+be asserting that the kernel implements `pwritev`, not that the `block` crate
+is correct.
+
+### Operation targets and the shadow model
+
+```
+cargo fuzz run disk_qcow2_ops -j `nproc`
+cargo fuzz run disk_vhdx_ops -j `nproc`
+```
+
+Neither needs `-max_len` or a seed corpus: the input is an operation program,
+not an image.
+
+VHDX is the format that most needs this. It has the most involved write path
+in the tree - BAT lookup, block state transitions, allocation at the end of
+the file, and sector offset arithmetic within the allocated block - and until
+`disk_vhdx_ops` existed none of it had a data correctness oracle. That is not
+hypothetical: the block allocating arm of `vhdx::io::write` used to write the
+payload at the *block base* rather than at the sector's offset within the
+block, so a guest write to any sector but the first of an unallocated block
+was silently misplaced and the data lost. It was found by a hand written two
+operation probe rather than by the fuzzer, precisely because no VHDX operation
+target existed.
+
+VHDX also gets *better* oracle coverage per execution than qcow2 does. It does
+not support resize, so `Op::Resize` always fails and the model is never wiped
+mid program; in `disk_qcow2_ops` a successful resize drops everything the
+model knew and the rest of the program runs unchecked.
+
+Two pieces of the framework exist for these targets:
+
+- `DiskFormat::IO_ALIGNMENT`. The VHDX engine refuses an offset or a length
+  that is not a multiple of the logical sector size. A uniformly random `u16`
+  length is a multiple of 512 in 0.2% of cases, so an unshaped program would
+  be rejected at the door and the model would never see a byte. The executor
+  snaps in range offsets down and lengths up to this value; `OpOffset::Wild`
+  offsets are left alone so the bounds and overflow checks stay reachable.
+- A refused sparse op leaves the model alone. VHDX and VHD reject every
+  `punch_hole` and `write_zeroes` outright, and an op the engine refused
+  changed nothing, so marking its range unknown would let a program blank the
+  model out range by range and check nothing.
+
+A third piece is about throughput rather than correctness. An operation target
+rewrites its template every iteration, and the VHDX template is 8 MiB, so a
+plain `write_all` of it caps `disk_vhdx_ops` at 142 executions a second,
+measured on a loaded 96 way host. `template_memfd` and `template_file` instead
+size the file with `set_len`, which costs nothing and reads back as zeroes,
+and write only the pages that carry data - six of 2048. That is 560
+executions a second, four times as many.
+
+The obvious form of that does not work. Scanning the buffer for zero pages on
+every iteration takes 6.1 ms for 8 MiB where writing it takes 5.9 ms, and the
+target ran at 17 executions a second. What has to go is the scan, not the
+copy: a template is the same buffer every time, so its page map is computed
+once per format and reused. `image_memfd`, which materializes fuzzer input,
+keeps writing it whole - that input is dense and different every time.
+
+#### The VHDX template, and why it is a table
+
+The `block` crate parses VHDX but never writes one, so the template is the
+image `qemu-img create -f vhdx -o subformat=dynamic,block_size=1M t.vhdx 4M`
+produces, stored in `fuzz/src/disk_engine/formats/vhdx.rs` as the offsets and
+bytes of its non-zero runs. The file is 8,388,608 bytes of which 333 are
+non-zero, in eleven runs, so the table is eleven lines and the harness expands
+it into the full image once per process behind a `OnceLock`.
+
+The alternatives were worse. An 8 MiB binary blob is not something upstream
+takes into the tree. Calling `qemu-img` at build time makes the harness need
+`qemu-utils` under OSS-Fuzz and makes the template depend on the qemu version,
+so a crash would stop reproducing when the build host changed. Writing the
+format by hand means two 4 KiB headers, two 64 KiB region tables, a 1 MiB BAT
+and a metadata region: some three hundred lines that would fuzz the harness
+author's reading of the specification rather than the parser under test.
+
+#### The template self test
+
+Every templated format has a `#[test]` that asserts four things about its
+template, and it is a merge condition for adding one:
+
+1. the template opens through the format adapter;
+2. `logical_size()` equals an exact pinned constant;
+3. reading the whole disk returns nothing but zero bytes;
+4. the fixed operation program runs through the executor with the shadow model
+   enabled without panicking.
+
+The failure this guards against is not a template that fails to open, which
+`fuzz_program` panics on within one iteration. It is a template that *opens
+but is subtly wrong* - the wrong size, or one extracted from an image that had
+already been written to. The model is initialised to "all zeroes, this many
+bytes"; if the image disagrees, either every read trips the oracle, which is
+loud, or the disk is not the disk the program addresses and the target quietly
+checks nothing. It then reports a 100% pass rate forever, and neither the
+coverage report, nor the crash count, nor CI can tell that state from a
+healthy one.
 
 Corpus entries for `disk_<format>` are ordinary disk images, so anything
 `qemu-img` can write is a usable seed. `scripts/generate-fuzz-seeds.sh` writes
