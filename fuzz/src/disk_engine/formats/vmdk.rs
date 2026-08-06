@@ -5,7 +5,6 @@
 //! Flat VMDK adapter.
 
 use std::fs::{File, OpenOptions};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::unix::fs::FileExt;
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -155,9 +154,18 @@ impl Vmdk {
             return false;
         }
 
-        let mut hasher = DefaultHasher::new();
-        bytes.hash(&mut hasher);
-        !hasher.finish().is_multiple_of(2)
+        // FNV-1a rather than `DefaultHasher`: std explicitly disclaims
+        // stability of its default hasher across releases, and this hash
+        // decides which of the two resolution paths an input takes. The
+        // whole point of deriving it from the input is that a crash
+        // reproduces from its bytes alone, and OSS-Fuzz re-runs regression
+        // testcases on newer toolchains: a reshuffle would send one down the
+        // other arm and silently close a live bug as fixed. A fixed
+        // algorithm costs no dependency and one line.
+        let mixed = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        !mixed.is_multiple_of(2)
     }
 
     /// Expands [`SCRATCH_TOKEN`] in `descriptor` into the scratch directory.
@@ -409,6 +417,14 @@ mod tests {
             Vmdk::force_walk(a.as_bytes()),
             Vmdk::force_walk(a.as_bytes())
         );
+
+        // Pinned, not merely reproducible in this process: the split has to
+        // survive a toolchain upgrade, or a regression testcase re-run on a
+        // newer compiler would take the other arm and close a live bug.
+        assert!(Vmdk::force_walk(b""), "the FNV-1a basis is odd");
+        assert!(!Vmdk::force_walk(b"a"));
+        assert!(Vmdk::force_walk(b"b"));
+        assert!(!Vmdk::force_walk(b"# Disk DescriptorFile\n"));
 
         let mixed = (0..64u8)
             .map(|i| Vmdk::force_walk(format!("{a}{i}").as_bytes()))
