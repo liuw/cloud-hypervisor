@@ -272,8 +272,12 @@ fn materialize<F: DiskFormat>(bytes: &[u8]) -> std::io::Result<(std::fs::File, O
 /// on every iteration, so only its non-zero pages are written. That is what
 /// makes an operation target over a multi megabyte image affordable: see
 /// [`crate::disk_engine::image::template_memfd`].
+///
+/// The buffer is `'static` because the page map cache holds onto its
+/// identity: see [`crate::disk_engine::image::template_memfd`]. Every
+/// template comes out of a `OnceLock`, so this costs nothing.
 fn materialize_template<F: DiskFormat>(
-    bytes: &[u8],
+    bytes: &'static [u8],
 ) -> std::io::Result<(std::fs::File, Option<PathBuf>)> {
     if F::NEEDS_PATH {
         let (file, path) = template_file(F::NAME, bytes)?;
