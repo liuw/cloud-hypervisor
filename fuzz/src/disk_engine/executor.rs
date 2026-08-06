@@ -54,6 +54,7 @@ pub struct Executor<F: DiskFormat> {
     size: u64,
     model: Option<Model>,
     user_data: u64,
+    sweeps: bool,
     format: PhantomData<F>,
 }
 
@@ -82,11 +83,25 @@ impl<F: DiskFormat> Executor<F> {
             size,
             model,
             user_data: 0,
+            sweeps: false,
             format: PhantomData,
         };
         executor.check_capacity_backing();
 
         Some(executor)
+    }
+
+    /// Lets a `Sweep` op walk its full run of metadata tables.
+    ///
+    /// Off by default, and only worth turning on for an image that has more
+    /// tables than the engine caches: see
+    /// [`DiskFormat::sweeps_metadata_cache`]. A sweep on any other image is
+    /// up to `MAX_SWEEP` writes and as many read backs into a single table,
+    /// which is a large part of an iteration's I/O and cannot evict
+    /// anything, so a disabled sweep still walks one table and stays a live
+    /// op rather than a dead one.
+    pub fn set_sweeps(&mut self, sweeps: bool) {
+        self.sweeps = sweeps;
     }
 
     /// Runs up to [`MAX_OPS`] ops.
@@ -147,6 +162,9 @@ impl<F: DiskFormat> Executor<F> {
     /// place, or dropped without writing back, only shows up when the data
     /// behind it is read again after the cache has moved on.
     fn sweep(&mut self, first: u8, tables: u8, seed: u8) {
+        // A sweep against an image the cache cannot overflow walks one table:
+        // the write and read back still run, the 383 repeats of them do not.
+        let tables = if self.sweeps { tables } else { 0 };
         let offsets: Vec<u64> = Op::sweep_offsets(first, tables, self.size).collect();
         for &offset in &offsets {
             self.write_vec(offset, SWEEP_LEN, seed);
